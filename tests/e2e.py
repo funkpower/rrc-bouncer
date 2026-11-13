@@ -17,6 +17,10 @@ host's own rnsd or any other network. Run through tests/e2e.sh.
   R  an rnsd with transport on for the rrcd phases
   H  rrcd, the reference hub, on R (its own RNS instance and identity)
   RC an RRC client of H under an identity of its own, in the bouncer's room
+  A, B  RRC clients of the bouncer's local hub holding the user's identity
+        (B says HELLO in the same breath as its identify, as NomadNet does)
+  D  an RRC client of H under an identity of its own, in the same room
+  Y  an RRC client of the local hub holding an identity it does not allow
 """
 
 import argparse
@@ -191,21 +195,22 @@ class Run:
         config = rns_config(self.path("rns", name), port)
         self.start(name, [self.python, PEER, "--rnsconfig", config, "--identity", self.identity(identity),
                           "--events", self.path(f"{name}.events"), *extra])
-        if not self.wait_event(name, lambda e: e["event"] == "ready", 60):
+        # Python RNS can take a while to start on a loaded host.
+        if not self.wait_event(name, lambda e: e["event"] == "ready", 180):
             raise Failure(f"{name} did not start")
 
-    def config(self, name, reticulum, announce=False, upstream=UPSTREAM, nick=None):
+    def config(self, name, reticulum, announce=False, upstream=UPSTREAM, nick=None, allowed=()):
         path = self.path(f"{name}.toml")
         with open(path, "w") as f:
             f.write(f'identity = "ids/user"\nstate_dir = "state"\nlog_level = "debug"\n'
                     f"announce = {'true' if announce else 'false'}\n"
-                    f'allowed_identities = []\n\n[reticulum]\n{reticulum}\n\n'
+                    f'allowed_identities = {json.dumps(list(allowed))}\n\n[reticulum]\n{reticulum}\n\n'
                     f'[[hub]]\naddress = "{upstream}"\nrooms = ["lobby"]\n')
             if nick:
                 f.write(f'nick = "{nick}"\n')
         return path
 
-    def rrcd(self, binary, port):
+    def rrcd(self, binary, port, max_rooms=2):
         """Start rrcd H on rnsd R; every file it uses is under the work directory."""
         rns = rns_config(self.path("rns", "H"), port)
         os.makedirs(self.path("rrcd"), exist_ok=True)
@@ -218,12 +223,12 @@ class Run:
             f.write(f'[hub]\nconfigdir = "{rns}"\nidentity_path = "{self.identity("rrcd-hub")}"\n'
                     f'room_registry_path = "{registry}"\nannounce_on_start = true\n'
                     f'hub_name = "{HUB_NAME}"\ngreeting = "e2e"\ninclude_joined_member_list = true\n'
-                    f"max_rooms_per_session = 2\nrate_limit_msgs_per_minute = 120\n"
+                    f"max_rooms_per_session = {max_rooms}\nrate_limit_msgs_per_minute = 120\n"
                     f"ping_interval_s = {RRCD_PING}\nping_timeout_s = {RRCD_TIMEOUT}\n\n"
                     f'[logging]\nlevel = "DEBUG"\nconsole = true\nfile = ""\n')
         self.start("H", [binary, "--config", config, "--identity", self.identity("rrcd-hub"),
                          "--room-registry", registry, "--configdir", rns, "--log-level", "DEBUG"])
-        if not self.wait_log("H", "Hub running at", 30):
+        if not self.wait_log("H", "Hub running at", 120):
             raise Failure("rrcd did not start")
 
     def status(self, upstream):
@@ -368,10 +373,184 @@ def rrcd_phases(run, args, ports, found):
           "the restarted bouncer joins the persisted room set")
     check(run.wait_event("RC", lambda e: len(joins(run, "RC", user)) > seen, 20) is not None,
           "the client sees the bouncer join lobby again")
-    check(run.stop("BR") == 0, "the bouncer stops cleanly")
     run.stop("RC")
+    relay_phases(run, args, port_r, upstream, user, local, config, env, found)
     run.stop("H")
     run.stop("R")
+
+
+def driven(run, name, port, identity, hub, nick, hello_delay=0.5):
+    """An RRC client the test drives with `command`."""
+    run.peer(name, port, identity, "--driven", hub, "--commands", run.path(f"{name}.commands"),
+             "--nick", nick, "--hello-delay", str(hello_delay))
+
+
+def command(run, name, **cmd):
+    with open(run.path(f"{name}.commands"), "a") as f:
+        f.write(json.dumps(cmd) + "\n")
+
+
+def envs(run, name, **match):
+    return [e for e in run.events(name) if e["event"] == "env" and all(e.get(k) == v for k, v in match.items())]
+
+
+def wait_env(run, name, timeout=20, **match):
+    return run.wait_event(name, lambda e: e["event"] == "env" and all(e.get(k) == v for k, v in match.items()),
+                          timeout)
+
+
+def relay_phases(run, args, port_r, upstream, user, local, config, env, found):
+    print("relay: rrcd H allows four rooms; the bouncer joins lobby, side and third", flush=True)
+    before = run.status(upstream)["connects"]
+    run.stop("H")
+    run.rrcd(args.rrcd, port_r, max_rooms=4)
+    hub = run.wait_status(upstream, lambda h: h["connects"] > before
+                          and sorted(h["rooms_joined"]) == ["lobby", "side", "third"], 90)
+    check(sorted(hub["rooms_joined"]) == ["lobby", "side", "third"], "the bouncer is in lobby, side and third")
+    direct = RNS.Identity.from_file(run.identity("direct")).hash.hex()
+
+    print("relay: two clients of the local hub, one of rrcd H", flush=True)
+    driven(run, "A", port_r, "user", local, "a")
+    driven(run, "B", port_r, "user", local, "b", hello_delay=0)
+    driven(run, "D", port_r, "direct", upstream, "dee")
+    welcomes = {name: wait_env(run, name, 40, t=2) for name in ("A", "B", "D")}
+    found["relay_welcomes"] = welcomes
+    check(all(welcomes.values()), "A, B and D get WELCOME")
+    check(welcomes["B"] is not None, "B, which said HELLO in the same breath as its identify, gets WELCOME")
+    hub_id = next(e["hub_identity"] for e in run.events("A") if e["event"] == "link")
+    upstream_id = next(e["hub_identity"] for e in run.events("D") if e["event"] == "link")
+    a, d = welcomes["A"]["body"], welcomes["D"]["body"]
+    check(welcomes["A"]["src"] == hub_id and welcomes["B"]["src"] == hub_id,
+          "the WELCOME's K_SRC is the local hub's identity")
+    check(a["0"] == f"{HUB_NAME} (via rrc-bouncer)", f"the WELCOME names the hub \"{a['0']}\"")
+    check(a["2"] == dict(d.get("2", {}), **{"0": False}) and a["3"] == d["3"] and a["3"]["3"] == 4,
+          f"it carries rrcd's caps (resource_envelope off) and limits: {a['2']} {a['3']}")
+
+    for name in ("A", "B"):
+        command(run, name, op="join", room="lobby")
+        joined = wait_env(run, name, t=11, room="lobby")
+        check(joined is not None and joined["src"] == hub_id and user in (joined["body"] or []),
+              f"{name} joins lobby: JOINED from the local hub, the user in the member list")
+    command(run, "D", op="join", room="lobby")
+    check(wait_env(run, "D", t=11, room="lobby") is not None, "D joins lobby on rrcd H")
+    for name in ("A", "B"):
+        seen = wait_env(run, name, t=11, room="lobby", nick="dee")
+        check(seen is not None and seen["src"] == hub_id and seen["body"] == [direct],
+              f"{name} sees D join, from the local hub")
+
+    print("relay: MSG, ACTION and direct NOTICE in every direction", flush=True)
+    fmt = {"0": "md"}
+    messages = [
+        # (id, sender, command, receivers, K_SRC)
+        ("A", dict(t=20, room="lobby", body="hello from a", fmt=fmt), "ABD", user),
+        ("B", dict(t=22, room="lobby", body="waves"), "ABD", user),
+        ("D", dict(t=20, room="lobby", body="hello from dee"), "ABD", direct),
+        ("D", dict(t=22, room="lobby", body="nods"), "ABD", direct),
+        ("A", dict(t=21, dst=direct, body="psst from a"), "ABD", user),
+        ("D", dict(t=21, dst=user, body="psst from dee"), "AB", direct),
+        ("B", dict(t=21, dst=direct, body="psst from b"), "ABD", user),
+        ("B", dict(t=21, room="lobby", body="a room notice"), "ABD", user),
+    ]
+    sent = []
+    for sender, cmd, receivers, src in messages:
+        ident = os.urandom(8).hex()
+        command(run, sender, op="send", id=ident, **cmd)
+        for name in receivers:
+            wait_env(run, name, 20, id=ident)
+        sent.append((ident, sender, cmd, receivers, src))
+    time.sleep(3)
+    counts = {}
+    for ident, sender, cmd, receivers, src in sent:
+        for name in "ABD":
+            got = envs(run, name, id=ident)
+            counts[f"{sender}->{name} t={cmd['t']} {cmd['body']}"] = len(got)
+            expected = 1 if name in receivers else 0
+            if len(got) != expected:
+                raise Failure(f"{name} got {cmd['body']!r} from {sender} {len(got)} times, not {expected}")
+            if got and (got[0]["src"] != src or got[0]["t"] != cmd["t"] or got[0]["body"] != cmd["body"]):
+                raise Failure(f"{name} got {cmd['body']!r} with K_SRC {got[0]['src']}, t {got[0]['t']}")
+    found["relay_counts"] = counts
+    check(True, f"each client got each envelope once, with its K_ID, type, body and K_SRC ({len(sent)} envelopes)")
+    first = sent[0][0]
+    check(all(envs(run, name, id=first)[0]["fmt"] == fmt for name in "ABD"), "K_FMT came through on A's MSG")
+    check(all(envs(run, sender, id=ident) for ident, sender, cmd, receivers, src in sent if sender in "AB"),
+          "the sender of each MSG, ACTION and NOTICE got its echo")
+
+    print("relay: errors go to the client that caused them", flush=True)
+    nobody = os.urandom(16).hex()
+    command(run, "A", op="send", t=21, dst=nobody, body="to nobody")
+    error = wait_env(run, "A", t=40, body="destination not connected")
+    time.sleep(2)
+    check(error is not None and error["src"] == hub_id and not envs(run, "B", t=40),
+          "a direct NOTICE to an identity not connected: A gets rrcd's ERROR, B does not")
+
+    print("relay: a client joins a new room through the bouncer", flush=True)
+    command(run, "A", op="join", room="Fresh")
+    joined = wait_env(run, "A", t=11, room="fresh")
+    notice = wait_env(run, "A", t=21, room="fresh")
+    check(joined is not None and joined["src"] == hub_id, "A gets JOINED for fresh, from the local hub")
+    check(notice is not None and notice["src"] == hub_id and "fresh" in str(notice["body"]),
+          f"and rrcd's room NOTICE, from the local hub ({notice and notice['body']!r})")
+    check(not envs(run, "B", room="fresh"), "B, not in fresh, sees none of it")
+    hub = run.wait_status(upstream, lambda h: "fresh" in h["rooms_joined"], 10)
+    check("fresh" in hub["rooms_joined"], "status.json: the bouncer is in fresh")
+    with open(run.path("state", "rooms", f"{upstream}.json")) as f:
+        check("fresh" in json.load(f)["rooms"], "fresh is in the room set file")
+    command(run, "A", op="join", room="fifth")
+    error = wait_env(run, "A", t=40, body="too many rooms")
+    check(error is not None and error["src"] == hub_id, "a fifth room: ERROR \"too many rooms\"")
+
+    print("relay: a client parts lobby; the bouncer stays (part_upstream = false)", flush=True)
+    parted_at = time.time()
+    command(run, "A", op="part", room="lobby")
+    parted = wait_env(run, "A", t=13, room="lobby")
+    check(parted is not None and parted["src"] == hub_id and parted["body"] == [user], "A gets PARTED for lobby")
+    time.sleep(3)
+    check(not [e for e in envs(run, "D", t=13) if e["at"] >= parted_at], "D sees no PART")
+    check("lobby" in run.status(upstream)["rooms_joined"], "status.json: the bouncer is still in lobby")
+    ident = os.urandom(8).hex()
+    command(run, "D", op="send", id=ident, t=20, room="lobby", body="still there?")
+    check(wait_env(run, "B", id=ident) is not None, "D's next MSG in lobby reaches B")
+    time.sleep(2)
+    check(not envs(run, "A", id=ident), "and not A")
+    command(run, "D", op="part", room="lobby")
+    seen = wait_env(run, "B", t=13, room="lobby")
+    check(seen is not None and seen["body"] == [direct] and seen["src"] == hub_id, "B sees D part lobby")
+
+    hub = run.wait_status(upstream, lambda h: h.get("clients") == 2, 10)
+    found["relay_status"] = hub
+    check(hub["clients"] == 2 and hub["client_identities"] == [user, user],
+          "status.json: two clients, both the user's identity")
+    check(hub["relayed_in"] >= 6 and hub["relayed_out"] >= 20 and hub["relay_drops"] == 0,
+          f"status.json: {hub['relayed_in']} envelopes in, {hub['relayed_out']} out, no drops")
+    out = run.bouncer("--config", config, "status")
+    found["relay_status_out"] = out.stdout
+    check(f"clients          2 ({user}, {user})" in out.stdout and "relayed          " in out.stdout,
+          "status prints the clients and the envelopes relayed")
+    for name in ("A", "B", "D"):
+        run.stop(name)
+
+    print("relay: an identity that is not allowed", flush=True)
+    stranger = RNS.Identity.from_file(run.identity("stranger")).hash.hex()
+    driven(run, "Y", port_r, "stranger", local, "y")
+    error = wait_env(run, "Y", 40, t=40)
+    closed = run.wait_event("Y", lambda e: e["event"] == "closed", 15)
+    check(error is not None and error["body"] == "identity not allowed on this hub" and error["src"] == hub_id,
+          "the stranger gets ERROR \"identity not allowed on this hub\" from the local hub")
+    check(closed is not None and not envs(run, "Y", t=2), "and its link is closed, without a WELCOME")
+    hub = run.wait_status(upstream, lambda h: h.get("refused_links", 0) >= 1, 10)
+    check(hub["refused_links"] >= 1, "status.json counts the refused link")
+    run.stop("Y")
+    check(run.stop("BR") == 0, "the bouncer stops cleanly")
+    config = run.config("rrcd", f'tcp = "127.0.0.1:{port_r}"', upstream=upstream, nick="bnc", allowed=[stranger])
+    run.start("BR", [args.bouncer, "--config", config, "run"], env=env)
+    run.wait_status(upstream, lambda h: h["state"] == "connected" and "lobby" in h["rooms_joined"], 40)
+    driven(run, "Y2", port_r, "stranger", local, "y")
+    check(wait_env(run, "Y2", 40, t=2) is not None, "with its hash in allowed_identities it gets WELCOME")
+    hub = run.wait_status(upstream, lambda h: h.get("client_identities") == [stranger], 10)
+    check(hub["client_identities"] == [stranger], "status.json lists it as a client")
+    run.stop("Y2")
+    check(run.stop("BR") == 0, "the bouncer stops cleanly")
 
 
 def main():
@@ -449,6 +628,10 @@ def main():
         done, pong, events = ping(run, "X", port_t, "stranger", hub, timeout=12)
         check(pong is None and any(e["event"] == "link" for e in events),
               "a link identified as another identity gets no PONG")
+        linked = next(e["at"] for e in events if e["event"] == "link")
+        check(any(e["event"] == "packet" and e["t"] == 40 for e in events)
+              and any(e["event"] == "closed" and e["at"] < linked + 6 for e in events),
+              "it gets an ERROR and the hub closes its link")
         check(not hub_announces(run.events("W"), hub, False) and not hub_announces(run.events("W"), hub, True),
               "the watcher saw no announce of the hub")
         out = run.bouncer("--config", config, "status")

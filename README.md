@@ -31,8 +31,11 @@ Under development. [DESIGN.md](DESIGN.md) describes how it works and what
 0.1 will do. So far the bouncer reads its config, creates a local hub for each
 upstream hub, prints their addresses (`rrc-bouncer hashes`) and answers path
 requests and PING on them. It links to each upstream hub as you, joins your
-rooms, keeps the link up and reconnects when it drops; `rrc-bouncer status`
-shows each link and its rooms. It does not relay anything to clients yet.
+rooms, keeps the link up and reconnects when it drops. Your clients link to
+the local hub under your identity (or one in `allowed_identities`), join and
+part rooms, and their messages are relayed to the hub and to each other;
+`rrc-bouncer status` shows each link, its rooms and its clients. It keeps no
+history yet.
 
 ## Build
 

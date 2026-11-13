@@ -8,6 +8,12 @@ after the identify (no pause, no retry) and waits for the PONG.
 With --room-client it is an RRC client of a hub: it links, identifies,
 says HELLO, joins --room, answers PING, and links again whenever the link
 closes. Everything it sees goes to --events as JSON lines.
+
+With --driven it is an RRC client driven by the test: it links to the hub
+once, identifies, says HELLO after --hello-delay seconds (0: in the same
+breath as the identify, as NomadNet does), answers PING, and carries out
+the JSON commands appended to --commands (join, part, send). It does not
+link again.
 """
 
 import argparse
@@ -21,8 +27,9 @@ import time
 import cbor2
 import RNS
 
-K_V, K_T, K_ID, K_TS, K_SRC, K_ROOM, K_BODY, K_NICK = 0, 1, 2, 3, 4, 5, 6, 7
-T_HELLO, T_WELCOME, T_JOIN = 1, 2, 10
+K_V, K_T, K_ID, K_TS, K_SRC, K_ROOM, K_BODY, K_NICK, K_DST = 0, 1, 2, 3, 4, 5, 6, 7, 8
+K_FMT = 64
+T_HELLO, T_WELCOME, T_JOIN, T_PART = 1, 2, 10, 12
 T_PING, T_PONG = 30, 31
 
 lock = threading.Lock()
@@ -72,7 +79,8 @@ def ping(args, identity):
         if env.get(K_T) == T_PONG:
             pongs.append(env)
 
-    link = RNS.Link(destination, established_callback=lambda _l: established.set())
+    link = RNS.Link(destination, established_callback=lambda _l: established.set(),
+                    closed_callback=lambda _l: emit(args.events, event="closed"))
     link.set_packet_callback(on_packet)
     if not established.wait(args.timeout):
         emit(args.events, event="no_link")
@@ -181,6 +189,76 @@ def room_session(args, identity, hub, session):
     return True
 
 
+def driven(args, identity):
+    hub = bytes.fromhex(args.driven)
+    end = time.time() + args.timeout
+    if not RNS.Transport.has_path(hub):
+        RNS.Transport.request_path(hub)
+    while not RNS.Transport.has_path(hub):
+        if time.time() > end:
+            emit(args.events, event="no_path")
+            return
+        time.sleep(0.2)
+    hub_identity = RNS.Identity.recall(hub)
+    destination = RNS.Destination(hub_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "rrc", "hub")
+    established, closed = threading.Event(), threading.Event()
+
+    def send(env):
+        RNS.Packet(link, cbor2.dumps(env)).send()
+
+    def on_packet(data, packet):
+        try:
+            env = cbor2.loads(data)
+        except Exception as e:
+            emit(args.events, event="bad_packet", error=str(e))
+            return
+        t = env.get(K_T)
+        emit(args.events, event="env", session=1, t=t, id=plain(env.get(K_ID)), room=env.get(K_ROOM),
+             nick=env.get(K_NICK), src=plain(env.get(K_SRC)), dst=plain(env.get(K_DST)),
+             body=plain(env.get(K_BODY)), fmt=plain(env.get(K_FMT)))
+        if t == T_PING:
+            send(envelope(identity, T_PONG, body=env.get(K_BODY)))
+
+    link = RNS.Link(destination, established_callback=lambda _l: established.set(),
+                    closed_callback=lambda _l: closed.set())
+    link.set_packet_callback(on_packet)
+    if not established.wait(max(1, end - time.time())):
+        emit(args.events, event="no_link")
+        return
+    emit(args.events, event="link", hub_identity=hub_identity.hash.hex())
+    link.identify(identity)
+    if args.hello_delay > 0:
+        time.sleep(args.hello_delay)
+    send(envelope(identity, T_HELLO, body={0: "e2e-driven", 1: 1, 2: {}}, nick=args.nick))
+    done = 0
+    while not closed.wait(0.1):
+        try:
+            with open(args.commands) as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            continue
+        for line in lines[done:]:
+            if not line.strip():
+                continue
+            command = json.loads(line)
+            op = command["op"]
+            if op in ("join", "part"):
+                env = envelope(identity, T_JOIN if op == "join" else T_PART, room=command["room"], nick=args.nick)
+            else:
+                env = envelope(identity, command["t"], room=command.get("room"), body=command.get("body"),
+                               nick=command.get("nick", args.nick))
+                if "dst" in command:
+                    env[K_DST] = bytes.fromhex(command["dst"])
+                if "fmt" in command:
+                    env[K_FMT] = command["fmt"]
+            if "id" in command:
+                env[K_ID] = bytes.fromhex(command["id"])
+            send(env)
+            emit(args.events, event="sent", op=op, id=env[K_ID].hex())
+        done = len(lines)
+    emit(args.events, event="closed", session=1)
+
+
 def room_client(args, identity):
     hub = bytes.fromhex(args.room_client)
     session = 0
@@ -201,6 +279,9 @@ def main():
     parser.add_argument("--room", default="lobby")
     parser.add_argument("--nick", default="client")
     parser.add_argument("--idle", type=float, default=15)
+    parser.add_argument("--driven")
+    parser.add_argument("--commands")
+    parser.add_argument("--hello-delay", type=float, default=0.5)
     args = parser.parse_args()
 
     RNS.Reticulum(args.rnsconfig)
@@ -212,6 +293,8 @@ def main():
         emit(args.events, event="done", code=code)
     if args.room_client:
         room_client(args, identity)
+    if args.driven:
+        driven(args, identity)
     while True:
         time.sleep(1)
 

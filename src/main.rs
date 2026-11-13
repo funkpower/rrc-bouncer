@@ -97,8 +97,28 @@ fn status(settings: &config::Settings, json: bool) -> Result<(), String> {
     for hub in &s.hubs {
         println!("  hub {}  local hub {}", hub.upstream, hub.local_hub);
         print_upstream(&hub.link, running);
+        print_relay(&hub.relay);
     }
     Ok(())
+}
+
+fn print_relay(r: &rrc_bouncer::relay::RelayStatus) {
+    if r.client_identities.is_empty() {
+        println!("    clients          none");
+    } else {
+        println!(
+            "    clients          {} ({})",
+            r.clients,
+            r.client_identities.join(", ")
+        );
+    }
+    println!("    relayed          {} in, {} out", r.relayed_in, r.relayed_out);
+    if r.relay_drops > 0 {
+        println!("    relay drops      {}", r.relay_drops);
+    }
+    if r.refused_links > 0 {
+        println!("    refused links    {}", r.refused_links);
+    }
 }
 
 fn print_upstream(u: &rrc_bouncer::upstream::UpstreamStatus, running: bool) {
