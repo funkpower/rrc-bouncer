@@ -96,8 +96,80 @@ fn status(settings: &config::Settings, json: bool) -> Result<(), String> {
     println!("  announce           {}", if s.announce { "on" } else { "off" });
     for hub in &s.hubs {
         println!("  hub {}  local hub {}", hub.upstream, hub.local_hub);
+        print_upstream(&hub.link, running);
     }
     Ok(())
+}
+
+fn print_upstream(u: &rrc_bouncer::upstream::UpstreamStatus, running: bool) {
+    let name = u.hub_name.as_deref().map_or_else(String::new, |n| format!(" {n:?}"));
+    let version = u
+        .hub_version
+        .as_deref()
+        .map_or_else(String::new, |v| format!(" (version {v})"));
+    let state = match u.state.as_str() {
+        "connected" => format!(
+            "connected to{name}{version}{}",
+            u.last_connected_at
+                .map_or_else(String::new, |t| format!(", since {}", ago(t)))
+        ),
+        "" => "not started".to_string(),
+        other => other.to_string(),
+    };
+    println!(
+        "    upstream         {}",
+        if running {
+            state
+        } else {
+            format!("{state} (when it stopped)")
+        }
+    );
+    let joined = u.rooms.iter().filter(|r| u.rooms_joined.contains(r)).count();
+    println!(
+        "    rooms            {} (joined {joined} of {})",
+        if u.rooms.is_empty() {
+            "none".to_string()
+        } else {
+            u.rooms.join(", ")
+        },
+        u.rooms.len()
+    );
+    let mut missing: Vec<String> = u.rooms_failed.iter().map(|(r, why)| format!("{r} ({why})")).collect();
+    let limit = u.hub_limits.as_ref().map(|l| l.max_rooms_per_session);
+    missing.extend(u.rooms_over_limit.iter().map(|r| match limit {
+        Some(n) => format!("{r} (over the hub's limit of {n} rooms)"),
+        None => format!("{r} (over the hub's room limit)"),
+    }));
+    if !missing.is_empty() {
+        println!("    not joined       {}", missing.join("; "));
+    }
+    println!(
+        "    connects         {} ({} reconnect{}), {} failed attempt{}",
+        u.connects,
+        u.reconnects,
+        if u.reconnects == 1 { "" } else { "s" },
+        u.failed_attempts,
+        if u.failed_attempts == 1 { "" } else { "s" }
+    );
+    if let Some(at) = u.last_disconnected_at {
+        let why = u.last_error.as_deref().map_or_else(String::new, |e| format!(": {e}"));
+        println!("    last disconnect  {}{why}", ago(at));
+    } else if let Some(e) = &u.last_error {
+        println!("    last error       {e}");
+    }
+    if let Some(at) = u.next_attempt_at {
+        println!(
+            "    next attempt     in {} s",
+            (at - bouncer::now()).max(0.0).round() as u64
+        );
+    }
+    if !u.unhandled.is_empty() {
+        let counts: Vec<String> = u.unhandled.iter().map(|(t, n)| format!("{t} {n}")).collect();
+        println!("    not relayed yet  {}", counts.join(", "));
+    }
+    if u.dropped_sends > 0 {
+        println!("    dropped sends    {}", u.dropped_sends);
+    }
 }
 
 fn hashes(settings: &config::Settings) -> Result<(), String> {

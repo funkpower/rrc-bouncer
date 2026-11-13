@@ -10,10 +10,13 @@ use std::time::Duration;
 use ciborium::Value;
 use rns_runtime::prelude::*;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Notify, mpsc, watch};
 
 use crate::config::{RnsAccess, Settings};
 use crate::envelope::{Envelope, MessageType};
 use crate::identity::{HUB_ASPECT, create_private_dir, hub_address, load_identity, load_or_create_hub_identity};
+use crate::rooms::RoomSet;
+use crate::upstream::{self, SharedStatus, Timings, Upstream, UpstreamStatus};
 
 /// How long to wait after starting before the first announce, so
 /// interfaces have come up.
@@ -28,6 +31,10 @@ const UPLINK_CHECK: Duration = Duration::from_secs(10);
 const UPLINK_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// Overrides `UPLINK_REFRESH`, in seconds, for tests/e2e.py.
 const UPLINK_REFRESH_ENV: &str = "RRC_BOUNCER_UPLINK_REFRESH_SECS";
+/// How long the upstream sessions get to close their links at shutdown.
+const SESSION_STOP: Duration = Duration::from_secs(5);
+/// Upstream commands waiting for a session beyond this many hold the sender.
+const COMMAND_QUEUE: usize = 64;
 
 fn uplink_refresh() -> Duration {
     std::env::var(UPLINK_REFRESH_ENV)
@@ -77,6 +84,9 @@ pub fn local_hub_name(upstream: &[u8; 16]) -> String {
 pub struct HubStatus {
     pub upstream: String,
     pub local_hub: String,
+    /// The upstream session (M2).
+    #[serde(flatten)]
+    pub link: UpstreamStatus,
 }
 
 /// `state_dir/status.json`.
@@ -99,6 +109,7 @@ pub fn hubs(settings: &Settings) -> Result<(String, Vec<HubStatus>), String> {
         hubs.push(HubStatus {
             upstream: hex::encode(hub.address),
             local_hub: hex::encode(hub_address(&local.hash)),
+            link: UpstreamStatus::default(),
         });
     }
     Ok((hex::encode(identity.hash), hubs))
@@ -240,19 +251,21 @@ async fn local_hub_events(
     }
 }
 
-async fn announcer(handles: Vec<(DestinationHandle, Vec<u8>)>, interval: Duration) {
+/// Announce each local hub. The app data is the hub's default, which names
+/// the upstream hub once its WELCOME has come.
+async fn announce(handles: &[DestinationHandle]) {
+    for handle in handles {
+        match handle.announce(DestinationAnnounceOptions::default()).await {
+            Ok(()) => tracing::info!("announced hub {}", hex::encode(handle.destination_hash())),
+            Err(e) => tracing::warn!("could not announce hub {}: {e}", hex::encode(handle.destination_hash())),
+        }
+    }
+}
+
+async fn announcer(handles: Vec<DestinationHandle>, interval: Duration) {
     tokio::time::sleep(FIRST_ANNOUNCE_DELAY).await;
     loop {
-        for (handle, app_data) in &handles {
-            let options = DestinationAnnounceOptions {
-                app_data: Some(app_data.clone()),
-                ..DestinationAnnounceOptions::default()
-            };
-            match handle.announce(options).await {
-                Ok(()) => tracing::info!("announced hub {}", hex::encode(handle.destination_hash())),
-                Err(e) => tracing::warn!("could not announce hub {}: {e}", hex::encode(handle.destination_hash())),
-            }
-        }
+        announce(&handles).await;
         tokio::time::sleep(interval).await;
     }
 }
@@ -272,7 +285,7 @@ async fn announcer(handles: Vec<(DestinationHandle, Vec<u8>)>, interval: Duratio
 /// uses to replace its path entry (`Transport.py:2520-2523`).
 async fn uplink_path_responses(
     runtime: &ReticulumHandle,
-    hubs: &[(DestinationHandle, Vec<u8>)],
+    hubs: &[DestinationHandle],
     online: &mut HashSet<u64>,
     refresh: bool,
 ) {
@@ -290,9 +303,8 @@ async fn uplink_path_responses(
         now_online.difference(online).copied().collect()
     };
     for interface in targets {
-        for (handle, app_data) in hubs {
+        for handle in hubs {
             let options = DestinationAnnounceOptions {
-                app_data: Some(app_data.clone()),
                 path_response: true,
                 attached_interface: Some(interface),
                 ..DestinationAnnounceOptions::default()
@@ -325,13 +337,23 @@ fn write_status(settings: &Settings, status: &Status) {
     }
 }
 
+fn show_sessions(status: &mut Status, sessions: &[SharedStatus]) {
+    for (hub, shared) in status.hubs.iter_mut().zip(sessions) {
+        if let Ok(link) = shared.lock() {
+            hub.link = link.clone();
+        }
+    }
+    status.updated_at = now();
+}
+
 pub async fn run(settings: Settings) -> Result<(), String> {
-    let identity = load_identity(&settings.identity)?;
+    let identity = Arc::new(load_identity(&settings.identity)?);
     create_private_dir(&settings.state_dir)?;
     let mut locals = Vec::new();
     for hub in &settings.hubs {
         let local = load_or_create_hub_identity(&settings.hub_identity_path(&hub.address), &identity)?;
-        locals.push((hub.address, local));
+        let rooms = RoomSet::load(&settings.rooms_path(&hub.address), &hub.rooms)?;
+        locals.push((hub, local, rooms));
     }
 
     let shutdown = ShutdownSignal::new();
@@ -340,7 +362,16 @@ pub async fn run(settings: Settings) -> Result<(), String> {
 
     let mut allowed = vec![identity.hash];
     allowed.extend(settings.allowed_identities.iter().copied());
+    let timings = Timings::from_env();
+    let changed = Arc::new(Notify::new());
+    let renamed = Arc::new(Notify::new());
+    let (stop_sessions, sessions_stop) = watch::channel(false);
     let mut tasks = Vec::new();
+    let mut sessions = Vec::new();
+    let mut session_status = Vec::new();
+    // The command senders the relay (M3) will use; held so the sessions'
+    // command channels stay open.
+    let mut commands = Vec::new();
     let mut announced = Vec::new();
     let mut status = Status {
         pid: std::process::id(),
@@ -350,10 +381,10 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         announce: settings.announce,
         hubs: Vec::new(),
     };
-    for (upstream, local) in locals {
+    for (hub, local, rooms) in locals {
+        let upstream = hub.address;
         let hub_identity = local.hash;
         let identities = LinkIdentities::default();
-        let app_data = hub_app_data(&local_hub_name(&upstream));
         let registered = runtime
             .register_destination(
                 local,
@@ -361,7 +392,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
                 DestinationRuntimeOptions {
                     proof_strategy: ProofStrategy::ProveNone,
                     resource_strategy: ResourceStrategy::AcceptNone,
-                    default_app_data: Some(app_data.clone()),
+                    default_app_data: Some(hub_app_data(&local_hub_name(&upstream))),
                     identity_gate: Some(identity_gate(identities.clone())),
                     ..DestinationRuntimeOptions::default()
                 },
@@ -377,8 +408,30 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         status.hubs.push(HubStatus {
             upstream: hex::encode(upstream),
             local_hub: hex::encode(address),
+            link: UpstreamStatus::default(),
         });
-        announced.push((registered.handle.clone(), app_data));
+        announced.push(registered.handle.clone());
+        let shared = SharedStatus::default();
+        let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
+        commands.push(command_tx);
+        sessions.push(tokio::spawn(upstream::run(
+            Upstream {
+                runtime: runtime.clone(),
+                address: upstream,
+                identity: identity.clone(),
+                nick: hub.nick.clone(),
+                rooms,
+                local_hub: registered.handle.clone(),
+                timings,
+                status: shared.clone(),
+                changed: changed.clone(),
+                renamed: renamed.clone(),
+                events: None,
+            },
+            command_rx,
+            sessions_stop.clone(),
+        )));
+        session_status.push(shared);
         tasks.push(tokio::spawn(local_hub_events(
             registered,
             hub_identity,
@@ -406,8 +459,21 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         tokio::select! {
             _ = signals.recv() => break,
             _ = ticker.tick() => {
-                status.updated_at = now();
+                show_sessions(&mut status, &session_status);
                 write_status(&settings, &status);
+            }
+            _ = changed.notified() => {
+                show_sessions(&mut status, &session_status);
+                write_status(&settings, &status);
+            }
+            // A local hub took its upstream hub's name: tell the network
+            // now rather than at the next announce or refresh.
+            _ = renamed.notified() => {
+                if settings.announce {
+                    announce(&announced).await;
+                } else if uplink {
+                    uplink_path_responses(&runtime, &announced, &mut online, true).await;
+                }
             }
             _ = uplink_check.tick(), if uplink => {
                 uplink_path_responses(&runtime, &announced, &mut online, false).await;
@@ -418,13 +484,37 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         }
     }
     tracing::info!("shutting down");
+    // The sessions close their links, so the hubs see the user leave now
+    // rather than at their ping timeout.
+    let _ = stop_sessions.send(true);
+    let stopping = futures_join_all(sessions);
+    if tokio::time::timeout(SESSION_STOP, stopping).await.is_err() {
+        tracing::warn!("upstream sessions did not stop in {}s", SESSION_STOP.as_secs());
+    }
+    drop(commands);
     for task in &tasks {
         task.abort();
     }
-    status.updated_at = now();
+    show_sessions(&mut status, &session_status);
     write_status(&settings, &status);
     runtime.shutdown_and_wait().await;
     Ok(())
+}
+
+/// Wait for every task (aborting the rest if the caller times out).
+async fn futures_join_all(tasks: Vec<tokio::task::JoinHandle<()>>) {
+    struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            for task in &self.0 {
+                task.abort();
+            }
+        }
+    }
+    let _guard = AbortOnDrop(tasks.iter().map(tokio::task::JoinHandle::abort_handle).collect());
+    for task in tasks {
+        let _ = task.await;
+    }
 }
 
 #[cfg(test)]

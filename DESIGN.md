@@ -84,6 +84,7 @@ read them, never copy from them.** The codec here is our own, on `ciborium`.
   user's identity, sends HELLO (name `rrc-bouncer`, ver 1, caps it supports), stores WELCOME
   (hub name, caps, limits), JOINs every room in the hub's room set, answers PING, sends its own PING
   when idle, and reconnects with backoff (5 s doubling to 5 min) when the link drops, then rejoins.
+  Details under [Upstream session](#upstream-session).
 - **Local hub, one per configured hub.** A `rrc.hub` IN destination under its own identity, kept in
   `state_dir/hubs/<upstream hash>.identity` (created on first run), so its address is stable.
   It accepts Links, requires `identify()`, and accepts only identities in `allowed_identities`
@@ -103,7 +104,8 @@ read them, never copy from them.** The codec here is our own, on `ciborium`.
     to the local hub's identity when the upstream envelope's `K_SRC` is the upstream hub's identity.
   - PING from a client: answer PONG locally.
   - Rate: the upstream rate limit is per link and every client shares it. Queue client envelopes and
-    send them upstream no faster than the WELCOME limit allows.
+    send them upstream no faster than the WELCOME limit allows (the upstream session's bucket,
+    below).
 - **Announces.** The bouncer must not spread fake hubs across the network by default
   (`announce = false`). Clients reach it by the hash `hashes` prints. See [Announces](#announces).
 
@@ -193,9 +195,72 @@ rsReticulum (`deps/rsReticulum` at 14241a3), from the code and on a private netw
   rsReticulum sends by itself. `tcp` mode avoids it too. The e2e test prints it as `known`.
 - `announce = true`: normal announces 5 s after start, then every `announce_interval_minutes`,
   with app data `{"proto": "rrc", "v": 1, "hub": NAME}` (cbor2's bytes, checked in a unit test).
-  Path responses carry the same app data (`default_app_data`). Until M2 knows the upstream hub's
-  name, NAME is `rrc-bouncer for <upstream hash>`; M2 switches it to
-  `"<upstream name> (via rrc-bouncer)"` with `DestinationHandle::set_default_app_data`.
+- NAME is `rrc-bouncer for <upstream hash>` until the upstream hub's first WELCOME, then
+  `"<upstream name> (via rrc-bouncer)"`. It is the local hub's `default_app_data`
+  (`DestinationHandle::set_default_app_data`), and announces and path responses are sent without
+  app data of their own, so both carry it. A WELCOME with a new name sets it and, at once, announces
+  the hubs (`announce = true`) or sends the uplink its path responses (`tcp`), so the network does
+  not wait for the next announce or refresh to learn the name. The name is not saved: after a
+  restart it is the placeholder until the WELCOME. e2e phase "rrcd": a client asking rnsd for the
+  local hub's path after the WELCOME gets `e2e hub (via rrc-bouncer)`.
+
+## Upstream session
+
+`src/upstream.rs`: a `Session` that is the protocol with no I/O (envelopes and the time in, what to
+send out; unit-tested), and `run`, the task per hub that owns the link and feeds it.
+
+- **Connect.** `connect_link` to the hub's `rrc.hub` with `identify: true` (path wait 30 s, the
+  whole connect at most 60 s). A failed connect asks for the path again before the next try, in
+  case it went stale. The first try is at once.
+- **HELLO.** Body `{0: "rrc-bouncer", 1: 1, 2: caps}` with the hub's `nick` as `K_NICK`. Caps:
+  `resource_envelope` false until M5 receives Resources; `action` and `direct_notice` true, as
+  the relay (M3) passes both on. rrcd keeps a client's caps without acting on them. No WELCOME in
+  30 s ends the link. A WELCOME is taken once per link; with no body, its limits are rrcd's
+  defaults.
+- **JOIN, one at a time.** The room set is joined in order (config rooms first), the next JOIN
+  only after the last one's answer, because rrcd's errors for a refused JOIN do not always name
+  the room (`too many rooms`, a bad name: no room; `+i`, `+k`, ban: the room). The answer is:
+  - `JOINED` for the room: joined (rrcd sends the joiner its JOINED without a nick; the bouncer is
+    not yet a member, so it cannot be another member's).
+  - `ERROR` naming the room, or naming no room unless it is `rate limited`: the room failed, with
+    the hub's text. It is not tried again on this link.
+  - No answer in 20 s: failed, `no answer from the hub`.
+  - A name over `max_room_name_bytes` fails without being sent. Rooms past
+    `max_rooms_per_session` are not sent either and show as over the limit.
+  Failed and over-limit rooms are tried again on the next link. An `ERROR` naming a room the
+  bouncer is in (a kick: `kicked from <room>`) takes it out of the joined list until the next link
+  or a new JOIN for it from a client (M3).
+- **PART** (M3, `part_upstream = true`): sends PART and takes the room as left on a `PARTED`
+  without a nick (other members' PARTED carry theirs).
+- **PING.** A PING from the hub gets PONG with the same body (rrcd PINGs only if its
+  `ping_interval_s` is set, and drops a link whose PONG is `ping_timeout_s` late). After 120 s with
+  nothing from the hub the bouncer sends PING (body: the time as a float, as rrcd does); no PONG in
+  60 s, or the link closing, ends the link. 120 s keeps an idle link's traffic small and is far
+  inside rrcd's defaults; a Reticulum link that went silent is otherwise noticed only after its
+  keepalive, minutes later.
+- **Reconnect.** After the link ends, wait 5 s, doubling to 5 min, then connect again. A link that
+  was welcomed and stayed up 60 s resets the wait to 5 s; a shorter one does not, so a hub that
+  welcomes and then drops the link at once is not hammered. Every room is joined again on the new
+  link.
+- **Rate.** rrcd's bucket is per link: `rate_limit_msgs_per_minute` tokens, full when the link
+  opens, one token per packet of any type, and a packet into an empty bucket gets
+  `ERROR "rate limited"` and is lost (`session.py` `refill_and_take`, `router.py:80-91`). The
+  session keeps the same bucket (`src/rate.rs`) at 90 % of the limit (240 a minute until the
+  WELCOME) and holds a packet until there is a token instead of losing it. Its own envelopes
+  (PONG, PING, JOIN, PART) go first; client envelopes (M3) wait in a queue of 256 behind them and
+  are sent only once the link is welcomed. A client envelope with the queue full or no link up is
+  dropped and counted (`dropped_sends`).
+- **Hooks for M3/M4.** `Command` (`Send`, `Join`, `Part`) goes in through the channel `run` gets;
+  `UpstreamEvent` (`Up(welcome)`, `Down`, `Envelope(env, Inbound)`) comes out through
+  `Upstream::events`, with backpressure (`send().await`). With no events channel (M2), the
+  envelopes the session does not handle itself (MSG, NOTICE, ERROR it cannot place, …) are logged
+  at debug and counted by type in `unhandled`.
+- **Room set file.** `state_dir/rooms/<upstream hash>.json`, `{"rooms": [...]}`, mode 0600 in a
+  0700 directory, written through a temporary file and a rename. It holds the rooms added while
+  the bouncer runs (a client's JOIN, M3); the config's `rooms` are not copied into it, and the
+  config file is never written. On start the names are normalised as the config's are and the file
+  is written back if that changed it; a file that does not parse stops the start with its path and
+  is left as it is. A config room taken out at run time (M3) comes back on the next start.
 
 ## History
 
@@ -228,8 +293,8 @@ See `contrib/config.example.toml`.
 | `part_upstream` | `false` | A client's PART also parts upstream |
 | `[history] days / max_mb / replay_hours / replay_max` | `30 / 100 / 24 / 100` | Above; `days` and `max_mb` at least 1, `replay_*` 0 turns replay off |
 | `[[hub]] address` | required | The upstream hub's `rrc.hub` destination hash |
-| `[[hub]] rooms` | `[]` | Rooms to be in from the start (more are added by clients' JOINs). Trimmed and lowercased as rrcd does (`service.py:507`), duplicates dropped, an empty name refused |
-| `[[hub]] nick` | none | `K_NICK` the bouncer uses on its own envelopes (JOIN, PART, PING); empty means none |
+| `[[hub]] rooms` | `[]` | Rooms to be in from the start (more are added by clients' JOINs and kept in the room set file). Trimmed and lowercased as rrcd does (`service.py:507`), duplicates dropped, an empty name refused |
+| `[[hub]] nick` | none | `K_NICK` the bouncer uses on its own envelopes (HELLO, JOIN, PART, PING; not PONG, as rrcd's has none); empty means none |
 
 At least one `[[hub]]` is required, and each address may appear once. Unknown keys are refused, so
 a typo is an error rather than a silent default.
@@ -264,9 +329,26 @@ As of M1:
   (`upstream`, `local_hub`), written at start, every minute and at shutdown; later milestones add
   the fields listed above. `status` prints it with the age of the last update.
 
+As of M2:
+
+- `run` also runs the upstream sessions ([Upstream session](#upstream-session)). On SIGTERM it
+  closes the upstream links (at most 5 s) so the hubs see the user leave at once.
+- Each `hubs` entry adds the upstream link: `state` (`connecting`, `linked` before the WELCOME,
+  `connected`, `disconnected`, `waiting`, `stopped`), `hub_name`, `hub_version`, `hub_caps`,
+  `hub_limits`, `rooms` (the room set), `rooms_joined`, `rooms_failed` (room → reason),
+  `rooms_over_limit`, `last_connected_at`, `last_disconnected_at`, `last_error`, `connects`
+  (welcomed links), `reconnects` (welcomed links after the first), `failed_attempts` (links that
+  ended before a WELCOME, or never opened), `next_attempt_at`, `unhandled` (type → count) and
+  `dropped_sends`. A change of state or rooms writes the file at once; the counters go out with
+  the next minute's write. A file without these fields (from M1) still reads.
+- `status` prints, per hub, the link (`connected to "<name>" (version v), since …` or its state and
+  last error), the room set with `joined N of M`, the rooms not joined and why, the connect
+  counts, the next attempt, the envelopes not relayed yet and the dropped sends.
+
 ## Implementation notes
 
-- **Crate layout.** `src/lib.rs` (`config`, `identity`, `envelope`, `bouncer`) and a thin
+- **Crate layout.** `src/lib.rs` (`config`, `identity`, `envelope`, `bouncer`, `upstream`,
+  `rate`, `rooms`) and a thin
   `src/main.rs` (CLI, logging). The library split lets the codec and config be tested and used
   without the binary.
 - **Local hub identities.** `state_dir/hubs/<upstream hash>.identity`, 64 bytes as Python RNS
@@ -292,13 +374,28 @@ As of M1:
   `make_envelope`, `validate_envelope` and `encode` from fixed values and writes them to
   `tests/fixtures/envelopes/*.cbor`. The bytes are committed, so `cargo test` needs no Python;
   the tests decode each one, check its fields, and re-encode it to the same bytes.
-- **End-to-end test.** `tests/e2e.sh` (`RRC_TEST_VENV` = a venv with `rns` and `cbor2`;
-  `RRC_TEST_WORK`, default `/tmp/rrc-bouncer-e2e`) builds the bouncer and runs `tests/e2e.py`:
-  rnsd instances with unique instance names and TCPServerInterfaces on 127.0.0.1, ports 4370-4379,
-  and Python peers (`tests/rrc_peer.py`) that watch announces, request paths, link, identify and
-  PING. It covers the phases cited under [Announces](#announces), the allow-list (a link
-  identified as another identity gets no PONG), a PING sent right behind the identify, `hashes`,
-  `status` and a clean stop. M2 adds rrcd.
+- **End-to-end test.** `tests/e2e.sh` (`RRC_TEST_VENV` = a venv with `rns`, `cbor2` and `rrcd`;
+  `RRC_TEST_WORK`, default `/tmp/rrc-bouncer-e2e`; `--only rrcd` runs the rrcd phases alone)
+  builds the bouncer and runs `tests/e2e.py`: rnsd instances with unique instance names and
+  TCPServerInterfaces on 127.0.0.1, ports 4370-4379, and Python peers (`tests/rrc_peer.py`) that
+  watch announces, request paths, link, identify and PING, or act as an RRC client of a hub. It
+  covers the phases cited under [Announces](#announces), the allow-list (a link identified as
+  another identity gets no PONG), a PING sent right behind the identify, `hashes`, `status` and a
+  clean stop.
+  The rrcd phases run rrcd 0.3.2 on its own RNS instance (config dir, identity, room registry and
+  config all under the work directory, `max_rooms_per_session = 2`, PING every 3 s, timeout 4 s)
+  behind an rnsd, a Python client in `lobby` under an identity of its own, and the bouncer with
+  `rooms = ["lobby"]`, `nick = "bnc"` and a room set file seeded with `[" Side ", "side",
+  "third"]`. They check: the client sees the bouncer's JOINED (nick `bnc`, the user's identity);
+  `status.json` shows the hub's name, `lobby` and `side` joined and `third` over the limit; the file
+  is normalised; rrcd logged the HELLO with nick `bnc`; `status` prints the link; the local hub's
+  path response carries `e2e hub (via rrc-bouncer)`; the link outlives three rrcd ping rounds,
+  answering rrcd's PINGs and sending its own; rrcd stopped (the link closes) and rrcd killed (no
+  PONG) are each followed by a reconnect with backoff and a rejoin the client sees; and after a
+  bouncer restart the persisted room set is joined again.
+  `RRC_BOUNCER_PING_SECS` (the idle PING and the PONG wait) and `RRC_BOUNCER_BACKOFF_SECS` (the
+  first wait; the longest is 60 times it, at most 5 min) shorten the session's timings for the
+  test.
 
 ## Milestones
 
@@ -313,7 +410,7 @@ instance with no interfaces to the outside, so nothing reaches a real network).
    question above and write the answer into this file (done: [Announces](#announces)).
 2. **M2: upstream session.** Link, identify, HELLO/WELCOME, JOIN the room set, PING/PONG,
    reconnect with backoff and rejoin. e2e: the bouncer joins a room on a local rrcd and a Python test
-   client in the same room sees its JOINED.
+   client in the same room sees its JOINED (done: [Upstream session](#upstream-session)).
 3. **M3: local hub and relay.** Accept clients, allow-list, HELLO/WELCOME, JOIN/PART, the relay both
    ways with `K_SRC` rewriting and echo, the shared rate limit. e2e: two clients on the bouncer and
    one directly on rrcd exchange MSG, ACTION and a direct NOTICE in every direction; a client of a

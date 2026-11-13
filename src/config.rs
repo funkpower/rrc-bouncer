@@ -332,6 +332,12 @@ impl Settings {
     pub fn history_dir(&self, upstream: &[u8; 16]) -> PathBuf {
         self.state_dir.join("history").join(hex::encode(upstream))
     }
+    /// The rooms added to `upstream`'s room set at run time.
+    pub fn rooms_path(&self, upstream: &[u8; 16]) -> PathBuf {
+        self.state_dir
+            .join("rooms")
+            .join(format!("{}.json", hex::encode(upstream)))
+    }
     pub fn status_path(&self) -> PathBuf {
         self.state_dir.join("status.json")
     }

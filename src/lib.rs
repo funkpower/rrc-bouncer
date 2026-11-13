@@ -11,3 +11,6 @@ pub mod bouncer;
 pub mod config;
 pub mod envelope;
 pub mod identity;
+pub mod rate;
+pub mod rooms;
+pub mod upstream;
