@@ -1,0 +1,317 @@
+# SPDX-License-Identifier: LicenseRef-Reticulum
+"""End-to-end test of rrc-bouncer on a private Reticulum network.
+
+Starts its own rnsd instances (TCPServerInterface on 127.0.0.1, port
+4370-4379, unique instance names), the bouncer and Python RNS peers, all
+with throwaway identities under the work directory. Nothing touches this
+host's own rnsd or any other network. Run through tests/e2e.sh.
+
+  T  an rnsd with transport on and no shared instance (the bouncer
+     connects to it over TCP)
+  S  an rnsd with a shared instance of its own (the bouncer attaches to it)
+  W  a peer watching rrc.hub announces
+  C  a client holding the user's identity: asks for a path to the local
+     hub, links, identifies, and expects PONG for PING
+  X  a client holding an identity the bouncer does not allow
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+import cbor2
+import RNS
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PEER = os.path.join(HERE, "rrc_peer.py")
+UPSTREAM = "082f8e4293d19281108a5d4faa52dcbe"
+# The bouncer's first announce comes 5 s after start; wait past it.
+QUIET = 10
+
+
+class Failure(Exception):
+    pass
+
+
+def check(condition, what):
+    if not condition:
+        raise Failure(what)
+    print(f"  ok  {what}", flush=True)
+
+
+def free_port(taken=()):
+    for port in range(4370, 4380):
+        if port in taken:
+            continue
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise Failure("no free port in 4370-4379")
+
+
+def wait_port(port, timeout=20):
+    end = time.time() + timeout
+    while time.time() < end:
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                return
+        time.sleep(0.2)
+    raise Failure(f"nothing listening on 127.0.0.1:{port}")
+
+
+def rns_config(path, port, server=False, shared=None, transport=None):
+    os.makedirs(path, exist_ok=True)
+    if server:
+        interface = (f"  [[e2e hub]]\n    type = TCPServerInterface\n    enabled = Yes\n"
+                     f"    listen_ip = 127.0.0.1\n    listen_port = {port}\n")
+    else:
+        interface = (f"  [[e2e uplink]]\n    type = TCPClientInterface\n    enabled = Yes\n"
+                     f"    target_host = 127.0.0.1\n    target_port = {port}\n")
+    name = shared or f"rrcm1-e2e-{os.getpid()}-{os.path.basename(path)}"
+    with open(os.path.join(path, "config"), "w") as f:
+        transport = server if transport is None else transport
+        f.write(f"[reticulum]\n  enable_transport = {'Yes' if transport else 'No'}\n"
+                f"  share_instance = {'Yes' if shared else 'No'}\n"
+                f"  instance_name = {name}\n  panic_on_interface_error = No\n\n"
+                f"[logging]\n  loglevel = {7 if server else 4}\n\n[interfaces]\n{interface}")
+    return path
+
+
+class Run:
+    def __init__(self, work, python, rnsd, binary):
+        self.work, self.python, self.rnsd_bin, self.binary = work, python, rnsd, binary
+        self.procs = {}
+
+    def path(self, *parts):
+        return os.path.join(self.work, *parts)
+
+    def start(self, name, argv):
+        log = open(self.path(f"{name}.log"), "ab")
+        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        self.procs[name] = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=env)
+
+    def stop(self, name, timeout=15):
+        proc = self.procs.pop(name, None)
+        if proc is None or proc.poll() is not None:
+            return proc.returncode if proc else None
+        proc.send_signal(signal.SIGTERM)
+        try:
+            return proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return proc.wait()
+
+    def stop_all(self):
+        for name in list(self.procs):
+            self.stop(name, timeout=5)
+
+    def wait_log(self, name, text, timeout):
+        end = time.time() + timeout
+        while time.time() < end:
+            with open(self.path(f"{name}.log"), "rb") as f:
+                if text in f.read().decode("utf-8", "replace"):
+                    return True
+            proc = self.procs.get(name)
+            if proc is not None and proc.poll() is not None:
+                raise Failure(f"{name} exited ({proc.returncode}) waiting for {text!r}")
+            time.sleep(0.3)
+        return False
+
+    def events(self, name):
+        try:
+            with open(self.path(f"{name}.events")) as f:
+                return [json.loads(line) for line in f if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def wait_event(self, name, predicate, timeout):
+        end = time.time() + timeout
+        while time.time() < end:
+            for event in self.events(name):
+                if predicate(event):
+                    return event
+            proc = self.procs.get(name)
+            if proc is not None and proc.poll() is not None:
+                raise Failure(f"{name} exited ({proc.returncode})")
+            time.sleep(0.3)
+        return None
+
+    def identity(self, name):
+        path = self.path("ids", name)
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            RNS.Identity().to_file(path)
+        return path
+
+    def rnsd(self, name, port, shared=None):
+        config = rns_config(self.path("rns", name), port, server=True, shared=shared)
+        self.start(name, [self.rnsd_bin, "--config", config])
+        wait_port(port)
+
+    def peer(self, name, port, identity, *extra):
+        config = rns_config(self.path("rns", name), port)
+        self.start(name, [self.python, PEER, "--rnsconfig", config, "--identity", self.identity(identity),
+                          "--events", self.path(f"{name}.events"), *extra])
+        if not self.wait_event(name, lambda e: e["event"] == "ready", 20):
+            raise Failure(f"{name} did not start")
+
+    def config(self, name, reticulum, announce=False):
+        path = self.path(f"{name}.toml")
+        with open(path, "w") as f:
+            f.write(f'identity = "ids/user"\nstate_dir = "state"\nlog_level = "debug"\n'
+                    f"announce = {'true' if announce else 'false'}\n"
+                    f'allowed_identities = []\n\n[reticulum]\n{reticulum}\n\n'
+                    f'[[hub]]\naddress = "{UPSTREAM}"\nrooms = ["lobby"]\n')
+        return path
+
+    def bouncer(self, *argv):
+        return subprocess.run([self.binary, *argv], capture_output=True, text=True, timeout=30)
+
+
+def hub_announces(events, hub, path_response):
+    return [e for e in events if e["event"] == "announce" and e["dest"] == hub
+            and e["path_response"] == path_response]
+
+
+def ping(run, name, port, identity, hub, timeout=30):
+    run.peer(name, port, identity, "--ping", hub, "--timeout", str(timeout))
+    done = run.wait_event(name, lambda e: e["event"] == "done", timeout + 10)
+    run.stop(name)
+    events = run.events(name)
+    pong = next((e for e in events if e["event"] == "pong"), None)
+    return done, pong, events
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--work", required=True)
+    parser.add_argument("--python", required=True)
+    parser.add_argument("--rnsd", required=True)
+    parser.add_argument("--bouncer", required=True)
+    args = parser.parse_args()
+    shutil.rmtree(args.work, ignore_errors=True)
+    os.makedirs(args.work)
+    run = Run(args.work, args.python, args.rnsd, args.bouncer)
+    run.identity("user")
+    found = {}
+    try:
+        port_t = free_port()
+        port_s = free_port({port_t})
+        port_d = free_port({port_t, port_s})
+        tcp = f'tcp = "127.0.0.1:{port_t}"'
+        config = run.config("tcp", tcp)
+        out = run.bouncer("--config", config, "hashes")
+        check(out.returncode == 0, f"hashes runs ({out.stderr.strip()})")
+        lines = {k.strip(): v for k, v in (line.rsplit(None, 1) for line in out.stdout.splitlines())}
+        hub = lines["local hub"]
+        check(lines["upstream hub"] == UPSTREAM, "hashes prints the upstream hub")
+        check(lines["identity"] == RNS.Identity.from_file(run.path("ids/user")).hash.hex(),
+              "hashes prints the user's identity hash")
+        check(oct(os.stat(run.path("state/hubs", f"{UPSTREAM}.identity")).st_mode & 0o777) == "0o600",
+              "the hub identity file is mode 0600")
+
+        print("direct: a client connects to the bouncer's own interface, announce = false", flush=True)
+        rns_config(run.path("rns", "D"), port_d, server=True, transport=False)
+        config_d = run.config("direct", 'config_dir = "rns/D"')
+        run.start("BD", [args.bouncer, "--config", config_d, "run"])
+        check(run.wait_log("BD", f"local hub {hub}", 20), "the bouncer registers the hub")
+        wait_port(port_d)
+        done, pong, events = ping(run, "C0", port_d, "user", hub)
+        found["direct_client_events"] = events
+        check(any(e["event"] == "path" for e in events),
+              "rsReticulum answers a path request for its never-announced hub")
+        check(hub_announces(events, hub, True) and not hub_announces(events, hub, False),
+              "the answer is a path response, not an announce")
+        check(pong is not None, "the hub answers PING with PONG on an identified link")
+        check(pong["body_matches"] and pong["src_is_hub"], "PONG echoes the body and carries the hub's identity")
+        check(run.stop("BD") == 0, "the bouncer stops cleanly on SIGTERM")
+
+        print("tcp: the bouncer connects to rnsd T, announce = false", flush=True)
+        run.rnsd("T", port_t)
+        run.peer("W", port_t, "watcher")
+        run.start("B", [args.bouncer, "--config", config, "run"])
+        check(run.wait_log("B", f"local hub {hub} for upstream hub {UPSTREAM}", 20), "the bouncer registers the hub")
+        check(run.wait_log("B", "sent the uplink a path response", 20), "the bouncer tells rnsd T where the hub is")
+        time.sleep(QUIET)
+        done, pong, events = ping(run, "C", port_t, "user", hub)
+        found["tcp_client_events"] = events
+        check(any(e["event"] == "path" for e in events), "rnsd T answers a path request for the hub")
+        check(hub_announces(events, hub, True) and not hub_announces(events, hub, False),
+              "the answer is a path response, not an announce")
+        check(pong is not None, "the hub answers PING with PONG on an identified link")
+        check(pong["body_matches"] and pong["src_is_hub"], "PONG echoes the body and carries the hub's identity")
+        check(run.wait_log("B", "identified as", 5), "the bouncer saw the link identify")
+        done, pong, events = ping(run, "X", port_t, "stranger", hub, timeout=12)
+        check(pong is None and any(e["event"] == "link" for e in events),
+              "a link identified as another identity gets no PONG")
+        check(not hub_announces(run.events("W"), hub, False) and not hub_announces(run.events("W"), hub, True),
+              "the watcher saw no announce of the hub")
+        out = run.bouncer("--config", config, "status")
+        check(out.returncode == 0 and hub in out.stdout, "status shows the running hub")
+        check(run.stop("B") == 0, "the bouncer stops cleanly on SIGTERM")
+        out = run.bouncer("--config", config, "hashes")
+        check(hub in out.stdout, "the hub address is the same on the next run")
+
+        print("tcp: announce = true", flush=True)
+        config = run.config("tcp-announce", tcp, announce=True)
+        run.start("BA", [args.bouncer, "--config", config, "run"])
+        app_data = cbor2.dumps({"proto": "rrc", "v": 1, "hub": f"rrc-bouncer for {UPSTREAM}"}).hex()
+        event = run.wait_event("W", lambda e: e["event"] == "announce" and e["dest"] == hub
+                               and not e["path_response"], 20)
+        check(event is not None, "the watcher sees the hub announce")
+        check(event["app_data"] == app_data, "the announce carries rrcd's app data")
+        run.stop("BA")
+        run.stop("W")
+        run.stop("T")
+
+        print("shared: the bouncer attaches to rnsd S's shared instance, announce = false", flush=True)
+        instance = f"rrcm1-e2e-{os.getpid()}-S"
+        run.rnsd("S", port_s, shared=instance)
+        run.peer("W2", port_s, "watcher")
+        config = run.config("shared", f'shared_instance = true\ninstance_name = "{instance}"')
+        run.start("BS", [args.bouncer, "--config", config, "run"])
+        check(run.wait_log("BS", f"local hub {hub}", 20), "the bouncer attaches and registers the hub")
+        time.sleep(QUIET)
+        done, pong, events = ping(run, "C2", port_s, "user", hub)
+        found["shared_client_events"] = events
+        check(pong is not None, "a client on rnsd S reaches the hub (path request, link, PING/PONG)")
+        check(not hub_announces(run.events("W2"), hub, False), "the watcher on rnsd S saw no announce of the hub")
+
+        print("shared: rnsd S restarts", flush=True)
+        run.stop("S")
+        restarted = time.time()
+        run.rnsd("S", port_s, shared=instance)
+        time.sleep(20)
+        after = [e for e in run.events("W2") if e["at"] >= restarted]
+        leaked = hub_announces(after, hub, False)
+        found["announces_after_restart"] = after
+        if leaked:
+            print("  known  after the shared instance came back, the hub was announced to the network", flush=True)
+        else:
+            print("  ok  no announce of the hub after the shared instance came back", flush=True)
+        done, pong, events = ping(run, "C3", port_s, "user", hub)
+        check(pong is not None, "the hub is reachable again after rnsd S restarted")
+        check(run.stop("BS") == 0, "the bouncer stops cleanly")
+    except Failure as e:
+        print(f"FAIL  {e}", flush=True)
+        print(f"logs: {args.work}", flush=True)
+        return 1
+    finally:
+        run.stop_all()
+        with open(run.path("found.json"), "w") as f:
+            json.dump(found, f, indent=1)
+    print(f"passed (logs: {args.work})", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

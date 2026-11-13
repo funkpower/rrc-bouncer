@@ -28,7 +28,9 @@ rooms is kept, and a client that joins a room gets what it missed.
 ## Status
 
 Under development. [DESIGN.md](DESIGN.md) describes how it works and what
-0.1 will do.
+0.1 will do. So far the bouncer reads its config, creates a local hub for each
+upstream hub, prints their addresses (`rrc-bouncer hashes`) and answers path
+requests and PING on them; it does not link upstream or relay anything yet.
 
 ## Build
 
@@ -39,6 +41,16 @@ git clone --recursive <this repository> rrc-bouncer
 cd rrc-bouncer
 cargo build --release      # target/release/rrc-bouncer
 ```
+
+## Test
+
+```
+cargo test
+RRC_TEST_VENV=/path/to/venv tests/e2e.sh   # venv with: pip install rns cbor2
+```
+
+The end-to-end test runs its own rnsd instances on 127.0.0.1 (ports
+4370-4379) and never uses the host's own.
 
 ## License
 

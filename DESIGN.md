@@ -105,11 +105,69 @@ read them, never copy from them.** The codec here is our own, on `ciborium`.
   - Rate: the upstream rate limit is per link and every client shares it. Queue client envelopes and
     send them upstream no faster than the WELCOME limit allows.
 - **Announces.** The bouncer must not spread fake hubs across the network by default
-  (`announce = false`). Clients reach it by the hash `hashes` prints; a path request from a client on
-  the same transport node must still resolve. **Verify in M1 whether rsReticulum answers a path
-  request for a local destination that never announced.** If it does not, announce once at start and
-  then only in answer to path requests, and document it. `announce = true` with
-  `announce_interval_minutes` turns on normal announces with the app data above.
+  (`announce = false`). Clients reach it by the hash `hashes` prints. See [Announces](#announces).
+
+## Announces
+
+With `announce = false` (the default) the local hubs are never announced to the network; a client
+reaches one by its hash, through a path request. M1 settled whether that works with the pinned
+rsReticulum (`deps/rsReticulum` at 14241a3), from the code and on a private network on 127.0.0.1
+(`tests/e2e.sh`, Python RNS 1.6.0 for rnsd and the clients).
+
+- **rsReticulum answers a path request for a local IN destination that has never announced.**
+  `rns-transport/src/actor/outbound.rs:566` (`handle_inbound_path_request`) finds the destination
+  in `local_destinations` (:625) and sends its link manager
+  `DestinationEvent::AnnounceRequested { path_response: true, tag, attached_interface }`
+  (:631-640); `rns-runtime/src/link_manager.rs:2086-2094` answers with an announce of context
+  `PATH_RESPONSE`, carrying the destination's `default_app_data`, on the interface the request came
+  in on (unit test `path_response_announces_carry_default_app_data`, link_manager.rs:7952). In the
+  e2e phase "direct", a client connected straight to a TCPServerInterface of the bouncer's asked
+  for a path to the never-announced hub: the bouncer logged `answering path request — destination
+  is local`, the client got the hub as a path response (no announce), linked, identified, and got
+  PONG for PING.
+- **A transport node between them passes a request for an unknown destination on only in some
+  interface modes.** Python rnsd forwards it when the request came in on an interface in mode
+  `gateway`, `access_point`, `roaming` or `internal`, or from one of its own shared-instance
+  clients (`RNS/Transport.py` `path_request`, `should_search_for_unknown`;
+  `Interface.DISCOVER_PATHS_FOR`). A client on a `full`-mode interface of the rnsd the bouncer
+  uses never reaches a hub that rnsd has not heard of: in M1, before the bouncer sent anything in
+  `tcp` mode, the client's path request through rnsd went unanswered for 30 s.
+- **So the bouncer makes sure its own rnsd knows the path, without announcing.** A path response
+  is not rebroadcast by transport nodes (`Transport.py:2603`), so it goes one hop.
+  - `shared_instance`: rsReticulum does it. Registering a destination with a shared instance sends
+    the instance a path-response announce (`rns-transport/src/actor/mod.rs:803-830`, logged as
+    `auto-announce triggered for shared instance registration`), as Python RNS does for its own
+    shared-instance clients. rnsd keeps the path, passes the path response on to its other local
+    clients only (`Transport.py:2627-2647`), and answers path requests from any interface itself
+    (e2e phase "shared": `Answering path request for <hub> … path is known`, PING/PONG through it,
+    and a watcher on rnsd saw no announce).
+  - `tcp`: the bouncer sends a path response for each hub on the uplink whenever it comes online
+    (checked every 10 s through `interface_stats`), so at start and after every reconnect. e2e
+    phase "tcp": rnsd answers the client's path request from its path table, the client links and
+    gets PONG, and a watcher on the same rnsd saw no announce.
+  - `config_dir`: nothing is sent. The hub answers the path requests that reach it; the user's
+    interfaces decide how far one gets (for example `mode = gateway` on the transport node's
+    interface for clients). Path responses on every interface of an arbitrary config would put the
+    hub on radio and other links nobody asked for.
+- **Known issue in `shared_instance` mode: when rnsd restarts, rsReticulum announces the hubs to
+  the network.** On reconnecting to the shared instance it asks every local destination for a
+  *normal* announce (`SharedConnectionRestored` → `request_announces_from_local_destinations`,
+  `rns-transport/src/actor/mod.rs:1004-1010,1444-1462`, `AnnounceRequest::normal`; with no
+  announce handler the link manager sends it as it is, link_manager.rs:2089-2091), and rnsd
+  rebroadcasts a normal announce from a local client at once. Python RNS sends a path response in
+  that place (`Transport.shared_connection_reappeared`, `Transport.py:4203-4207`). Seen in e2e
+  phase "shared: rnsd S restarts": rnsd logged `Rebroadcasting announce for <hub> with hop count 0`
+  and a watcher on another interface received a normal announce of the hub with its app data. The
+  runtime has no hook to stop it (`register_destination` sets no announce handler). The fix belongs
+  in rsReticulum (`path_response: true` on restore); until the pinned version has it,
+  `announce = false` holds in `shared_instance` mode only until the shared instance restarts, and
+  `tcp` mode is the one to use where that matters. The e2e test prints it as `known`, and as `ok`
+  once it stops happening.
+- `announce = true`: normal announces 5 s after start, then every `announce_interval_minutes`,
+  with app data `{"proto": "rrc", "v": 1, "hub": NAME}` (cbor2's bytes, checked in a unit test).
+  Path responses carry the same app data (`default_app_data`). Until M2 knows the upstream hub's
+  name, NAME is `rrc-bouncer for <upstream hash>`; M2 switches it to
+  `"<upstream name> (via rrc-bouncer)"` with `DestinationHandle::set_default_app_data`.
 
 ## History
 
@@ -133,23 +191,71 @@ See `contrib/config.example.toml`.
 | Key | Default | Meaning |
 |---|---|---|
 | `identity` | required | The user's Reticulum identity file (64 bytes) |
-| `state_dir` | required | Local hub identities, room sets, history, `status.json`, generated Reticulum config |
+| `state_dir` | required | Local hub identities, room sets, history, `status.json`, generated Reticulum config; created mode 0700 |
 | `log_level` | `info` | As lxmf-bouncer |
 | `[reticulum]` | | `shared_instance` / `instance_name` / `tcp` / `config_dir`, exactly as lxmf-bouncer (copy its code) |
 | `announce` | `false` | Announce the local hubs |
-| `announce_interval_minutes` | `360` | With `announce = true` |
+| `announce_interval_minutes` | `360` | With `announce = true`; at least 1 |
 | `allowed_identities` | `[]` | Identity hashes allowed to use the local hubs besides the user's |
 | `part_upstream` | `false` | A client's PART also parts upstream |
-| `[history] days / max_mb / replay_hours / replay_max` | `30 / 100 / 24 / 100` | Above |
+| `[history] days / max_mb / replay_hours / replay_max` | `30 / 100 / 24 / 100` | Above; `days` and `max_mb` at least 1, `replay_*` 0 turns replay off |
 | `[[hub]] address` | required | The upstream hub's `rrc.hub` destination hash |
-| `[[hub]] rooms` | `[]` | Rooms to be in from the start (more are added by clients' JOINs) |
-| `[[hub]] nick` | none | `K_NICK` the bouncer uses on its own envelopes (JOIN, PART, PING) |
+| `[[hub]] rooms` | `[]` | Rooms to be in from the start (more are added by clients' JOINs). Trimmed and lowercased as rrcd does (`service.py:507`), duplicates dropped, an empty name refused |
+| `[[hub]] nick` | none | `K_NICK` the bouncer uses on its own envelopes (JOIN, PART, PING); empty means none |
+
+At least one `[[hub]]` is required, and each address may appear once. Unknown keys are refused, so
+a typo is an error rather than a silent default.
 
 ## Commands
 
 As lxmf-bouncer: `run` (default), `status [--json]` (from `state_dir/status.json`, written every
 minute: upstream link state per hub, rooms, clients linked, history size, envelopes relayed),
 `hashes` (the user's identity hash and, per upstream hub, the local hub address to put in clients).
+
+As of M1:
+
+- `hashes` prints `identity <hash>`, then per hub `upstream hub <hash>` and, indented,
+  `local hub <hash>`. It creates a missing hub identity, so the address it prints is the one `run`
+  will use.
+- `run` loads the identities, starts Reticulum, registers one local hub per upstream, answers path
+  requests (above), logs links as they are established, identified and closed, and answers PING
+  with PONG (body echoed, `K_SRC` the local hub's identity) on links identified as an allowed
+  identity. Everything else is ignored until M2/M3. SIGTERM or SIGINT stops it.
+- `status.json` holds `pid`, `started_at`, `updated_at`, `identity_hash`, `announce` and `hubs`
+  (`upstream`, `local_hub`), written at start, every minute and at shutdown; later milestones add
+  the fields listed above. `status` prints it with the age of the last update.
+
+## Implementation notes
+
+- **Crate layout.** `src/lib.rs` (`config`, `identity`, `envelope`, `bouncer`) and a thin
+  `src/main.rs` (CLI, logging). The library split lets the codec and config be tested and used
+  without the binary.
+- **Local hub identities.** `state_dir/hubs/<upstream hash>.identity`, 64 bytes as Python RNS
+  writes them, mode 0600 (rns-identity's atomic write) in a 0700 directory. A file that does not
+  load is an error and is left alone, never overwritten. A hub identity equal to the user's is
+  refused: the hub's identity in `K_SRC` is what tells its envelopes from the user's.
+- **Envelope codec** (`src/envelope.rs`, on `ciborium`). The body and every unknown key are kept as
+  the raw CBOR item they arrived as, so they are passed on byte for byte: cbor2 writes floats as
+  float64 and a re-encode through `ciborium::Value` would shorten them (`PING` bodies are floats).
+  Encoding writes the known keys in rrcd's `make_envelope` order (0, 1, 2, 3, 4, 8, 5, 6, 7), then
+  unknown keys in the order they arrived; an envelope rrcd made comes out byte for byte the same.
+  Decoding is strict where rrcd's `validate_envelope` is, and in two places beyond it: the top
+  level must be one map with nothing after it, and a key that appears twice is refused (cbor2 would
+  keep the last). Keys must be unsigned integers, `K_V` must be 1, `K_V`/`K_T`/`K_ID`/`K_TS`/`K_SRC`
+  must be present and every known key must have its type. Unknown message types decode and pass
+  through. Nesting deeper than 64 is refused. Typed views of the HELLO (including the legacy nick at
+  body key 64), WELCOME (missing limits fall back to rrcd's defaults) and RESOURCE_ENVELOPE bodies
+  sit on top.
+- **Fixtures.** `tests/fixtures/make_envelopes.py` builds 19 envelopes with rrcd 0.3.2's own
+  `make_envelope`, `validate_envelope` and `encode` from fixed values and writes them to
+  `tests/fixtures/envelopes/*.cbor`. The bytes are committed, so `cargo test` needs no Python;
+  the tests decode each one, check its fields, and re-encode it to the same bytes.
+- **End-to-end test.** `tests/e2e.sh` (`RRC_TEST_VENV` = a venv with `rns` and `cbor2`;
+  `RRC_TEST_WORK`, default `/tmp/rrc-bouncer-e2e`) builds the bouncer and runs `tests/e2e.py`:
+  rnsd instances with unique instance names and TCPServerInterfaces on 127.0.0.1, ports 4370-4379,
+  and Python peers (`tests/rrc_peer.py`) that watch announces, request paths, link, identify and
+  PING. It covers the phases cited under [Announces](#announces), the allow-list (a link
+  identified as another identity gets no PONG), `hashes`, `status` and a clean stop. M2 adds rrcd.
 
 ## Milestones
 
@@ -161,7 +267,7 @@ instance with no interfaces to the outside, so nothing reaches a real network).
 1. **M1: foundations.** Config (with tests), identity loading, the Reticulum runtime and its three
    attachment modes (lift from lxmf-bouncer), the envelope codec (round-trip tests against envelopes
    produced by rrcd's own `envelope.py`), local hub identities, `hashes`. Answer the path request
-   question above and write the answer into this file.
+   question above and write the answer into this file (done: [Announces](#announces)).
 2. **M2: upstream session.** Link, identify, HELLO/WELCOME, JOIN the room set, PING/PONG,
    reconnect with backoff and rejoin. e2e: the bouncer joins a room on a local rrcd and a Python test
    client in the same room sees its JOINED.
