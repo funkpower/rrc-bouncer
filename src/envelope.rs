@@ -43,11 +43,13 @@ pub enum MessageType {
     Pong,
     Error,
     ResourceEnvelope,
-    Unknown(u64),
+    /// Any other CBOR integer, negative ones included (rrcd accepts any
+    /// integer type): CBOR's range is -2^64 to 2^64-1.
+    Unknown(i128),
 }
 
 impl MessageType {
-    pub fn from_u64(t: u64) -> Self {
+    pub fn from_int(t: i128) -> Self {
         match t {
             1 => Self::Hello,
             2 => Self::Welcome,
@@ -66,7 +68,7 @@ impl MessageType {
         }
     }
 
-    pub fn as_u64(self) -> u64 {
+    pub fn as_int(self) -> i128 {
         match self {
             Self::Hello => 1,
             Self::Welcome => 2,
@@ -244,7 +246,7 @@ impl Envelope {
             read += 1;
             match key {
                 K_V => v = Some(uint(item, "v")?),
-                K_T => t = Some(uint(item, "t")?),
+                K_T => t = Some(signed_int(item, "t")?),
                 K_ID => id = Some(byte_string(item, "id")?),
                 K_TS => ts = Some(uint(item, "ts")?),
                 K_SRC => src = Some(byte_string(item, "src")?),
@@ -263,7 +265,7 @@ impl Envelope {
             Some(RRC_VERSION) => {}
             Some(other) => return err(format!("version {other}")),
         }
-        env.t = MessageType::from_u64(t.ok_or_else(|| DecodeError("no type".into()))?);
+        env.t = MessageType::from_int(t.ok_or_else(|| DecodeError("no type".into()))?);
         env.id = id.ok_or_else(|| DecodeError("no id".into()))?;
         env.ts = ts.ok_or_else(|| DecodeError("no timestamp".into()))?;
         env.src = src.ok_or_else(|| DecodeError("no source".into()))?;
@@ -285,7 +287,7 @@ impl Envelope {
         write_head(&mut out, 0, K_V);
         write_head(&mut out, 0, RRC_VERSION);
         write_head(&mut out, 0, K_T);
-        write_head(&mut out, 0, self.t.as_u64());
+        write_int(&mut out, self.t.as_int());
         write_head(&mut out, 0, K_ID);
         write_bytes(&mut out, 2, &self.id);
         write_head(&mut out, 0, K_TS);
@@ -443,6 +445,14 @@ fn uint(item: &[u8], field: &str) -> Result<u64, DecodeError> {
     }
 }
 
+/// A CBOR integer of either sign.
+fn signed_int(item: &[u8], field: &str) -> Result<i128, DecodeError> {
+    match parse(item, field)? {
+        Value::Integer(i) => Ok(i128::from(i)),
+        _ => err(format!("{field} is not an integer")),
+    }
+}
+
 fn byte_string(item: &[u8], field: &str) -> Result<Vec<u8>, DecodeError> {
     match parse(item, field)? {
         Value::Bytes(b) => Ok(b),
@@ -454,6 +464,15 @@ fn text(item: &[u8], field: &str) -> Result<String, DecodeError> {
     match parse(item, field)? {
         Value::Text(t) => Ok(t),
         _ => err(format!("{field} is not a text string")),
+    }
+}
+
+/// A CBOR integer of either sign; `value` must be in CBOR's range.
+fn write_int(out: &mut Vec<u8>, value: i128) {
+    if value < 0 {
+        write_head(out, 1, u64::try_from(-1 - value).unwrap_or(u64::MAX));
+    } else {
+        write_head(out, 0, u64::try_from(value).unwrap_or(u64::MAX));
     }
 }
 
@@ -901,6 +920,26 @@ mod tests {
     }
 
     #[test]
+    fn negative_and_huge_types_pass_through() {
+        // rrcd's validate_envelope takes any integer as K_T.
+        for t in [-1i128, -24, -25, -1000, -(1i128 << 64), (1i128 << 64) - 1] {
+            let env = Envelope::new(MessageType::Unknown(t), &USER);
+            let bytes = env.encode();
+            let back = Envelope::decode(&bytes).unwrap();
+            assert_eq!(back.t, MessageType::Unknown(t));
+            assert_eq!(back.encode(), bytes);
+        }
+        // cbor2.dumps({0: 1, 1: -5, 2: b"\x01", 3: 7, 4: b"\x02"})
+        let bytes = hex::decode("a5000101240241010307044102").unwrap();
+        let env = Envelope::decode(&bytes).unwrap();
+        assert_eq!(env.t, MessageType::Unknown(-5));
+        assert_eq!(env.encode(), bytes);
+        // Still an integer, though: the same with K_T "x".
+        let text_type = hex::decode("a500010161780241010307044102").unwrap();
+        assert!(Envelope::decode(&text_type).is_err());
+    }
+
+    #[test]
     fn a_float_body_keeps_its_width() {
         // cbor2 writes every float as 64 bits; ciborium would shrink 1.5 to
         // 16. The body is kept as it came, so a PONG echoes the PING exactly.
@@ -951,7 +990,7 @@ mod tests {
         assert_eq!(env.id.len(), 8);
         assert!(env.ts > TS - 1_000_000_000);
         assert_eq!(Envelope::decode(&env.encode()).unwrap(), env);
-        let mut big = Envelope::new(MessageType::Unknown(u64::MAX), &[0u8; 300]);
+        let mut big = Envelope::new(MessageType::Unknown(u64::MAX.into()), &[0u8; 300]);
         big.ts = u64::MAX;
         big.extra.push((u64::from(u32::MAX) + 1, Raw::from_value(&Value::Null)));
         assert_eq!(Envelope::decode(&big.encode()).unwrap(), big);
@@ -1011,7 +1050,8 @@ mod tests {
         }
         assert!(Envelope::decode(&set(K_V, int(2))).is_err());
         assert!(Envelope::decode(&set(K_T, Value::Text("20".into()))).is_err());
-        assert!(Envelope::decode(&set(K_T, Value::Integer((-1).into()))).is_err());
+        // rrcd takes a negative type (any integer), unlike a negative ts.
+        assert!(Envelope::decode(&set(K_T, Value::Integer((-1).into()))).is_ok());
         assert!(Envelope::decode(&set(K_ID, Value::Text("id".into()))).is_err());
         assert!(Envelope::decode(&set(K_TS, Value::Integer((-5).into()))).is_err());
         assert!(Envelope::decode(&set(K_TS, Value::Float(1.0))).is_err());

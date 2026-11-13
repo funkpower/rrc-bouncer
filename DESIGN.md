@@ -141,10 +141,24 @@ rsReticulum (`deps/rsReticulum` at 14241a3), from the code and on a private netw
     clients only (`Transport.py:2627-2647`), and answers path requests from any interface itself
     (e2e phase "shared": `Answering path request for <hub> … path is known`, PING/PONG through it,
     and a watcher on rnsd saw no announce).
-  - `tcp`: the bouncer sends a path response for each hub on the uplink whenever it comes online
-    (checked every 10 s through `interface_stats`), so at start and after every reconnect. e2e
-    phase "tcp": rnsd answers the client's path request from its path table, the client links and
-    gets PONG, and a watcher on the same rnsd saw no announce.
+  - `tcp`: the bouncer sends a path response for each hub on the uplink when it comes online
+    (checked every 10 s through `interface_stats`), and again on every online uplink every 5
+    minutes. e2e phase "tcp": rnsd answers the client's path request from its path table, the
+    client links and gets PONG, and a watcher on the same rnsd saw no announce.
+  - The refresh is needed because rnsd drops a path nobody has used after `UNUSED_PATH_LINGER`
+    (1.75 h with transport) or `UNUSED_PATH_LINGER_LEAF` (12 min without), counted from the last
+    path table update (`Transport.py:228-229,1145-1148`); answering a path request does not count
+    as use. Five minutes is under both. It also covers an rnsd restart or a reconnect that falls
+    between two 10 s checks, which never shows as offline. Each refresh is a new path response:
+    sent without a tag, rsReticulum builds it afresh (`create_announce_at`,
+    `rns-identity/src/destination.rs:976-1060`) with new random bytes and the current time in its
+    random blob, and rnsd replaces a path entry when the blob is new and its emission time is later
+    than the entry's (`Transport.py:2520-2523`), which resets the linger (`:2726`). e2e phases
+    "tcp: rnsd TL drops never-used paths" and "tcp: the bouncer refreshes the path" run rnsd with
+    the linger set to 12 s (`tests/rnsd_linger.py`) and the bouncer's refresh set to 4 s
+    (`RRC_BOUNCER_UPLINK_REFRESH_SECS`, for tests): with no refresh rnsd logs `Removing never used
+    path` after the linger; with it, every refresh shows as a path table update, the path stays for
+    three linger times, and a client then gets the path and PONG.
   - `config_dir`: nothing is sent. The hub answers the path requests that reach it; the user's
     interfaces decide how far one gets (for example `mode = gateway` on the transport node's
     interface for clients). Path responses on every interface of an arbitrary config would put the
@@ -163,6 +177,20 @@ rsReticulum (`deps/rsReticulum` at 14241a3), from the code and on a private netw
   `announce = false` holds in `shared_instance` mode only until the shared instance restarts, and
   `tcp` mode is the one to use where that matters. The e2e test prints it as `known`, and as `ok`
   once it stops happening.
+- **Known issue in `shared_instance` mode: when the bouncer restarts and rnsd does not, rnsd may
+  announce the hubs to the network.** When rnsd answers a path request for a hub from its path
+  table and the path came from a local client, it records the request in
+  `pending_local_path_requests` (`Transport.py:3788-3797`) and clears it only when a local client
+  sends a path response for that hub. The registration path response of the restarted bouncer is
+  that path response: rnsd puts it in the announce table without `block_rebroadcasts` and with no
+  attached interface (`Transport.py:2627-2647`), and the retransmit loop sends it as a normal
+  announce on every interface (`:920-951`). Seen in e2e phase "shared: the bouncer restarts, rnsd
+  S stays up" (after a client had asked rnsd S for the path): rnsd logged `Rebroadcasting announce
+  for <hub> with hop count 0` and the watcher received a normal announce of the hub. It happens
+  once per restart, and only if a client asked rnsd for a hub's path since the bouncer last
+  registered it. It is Python RNS behaviour that any shared-instance client restarting would see;
+  the bouncer cannot avoid it short of not sending the registration path response, which
+  rsReticulum sends by itself. `tcp` mode avoids it too. The e2e test prints it as `known`.
 - `announce = true`: normal announces 5 s after start, then every `announce_interval_minutes`,
   with app data `{"proto": "rrc", "v": 1, "hub": NAME}` (cbor2's bytes, checked in a unit test).
   Path responses carry the same app data (`default_app_data`). Until M2 knows the upstream hub's
@@ -221,6 +249,17 @@ As of M1:
   requests (above), logs links as they are established, identified and closed, and answers PING
   with PONG (body echoed, `K_SRC` the local hub's identity) on links identified as an allowed
   identity. Everything else is ignored until M2/M3. SIGTERM or SIGINT stops it.
+- A packet that follows a client's `identify()` is handled as from that identity, never dropped as
+  unidentified. The local hub does not take a link's identity from the `links_identified` event:
+  that is a separate channel from `link_packets`, read in no fixed order against it, and sent with
+  `try_send` on a bounded channel, so it can be late or dropped. It registers an
+  `identity_gate` (`IdentityGatePolicy`), which rsReticulum calls on the link manager's task while
+  it handles the LinkIdentify packet (`rns-runtime/src/link_manager.rs:2956-2977`), before it
+  handles the link's next packet and puts it on `link_packets` (`:1277-1279`); the gate records
+  the identity in a map the hub reads when a packet arrives. What this relies on: one link
+  manager task per destination handles that destination's inbound link packets one at a time in
+  order. The e2e clients send their PING in the same TCP segment as the identify; before the gate,
+  about one in six of those PINGs went unanswered.
 - `status.json` holds `pid`, `started_at`, `updated_at`, `identity_hash`, `announce` and `hubs`
   (`upstream`, `local_hub`), written at start, every minute and at shutdown; later milestones add
   the fields listed above. `status` prints it with the age of the last update.
@@ -231,8 +270,11 @@ As of M1:
   `src/main.rs` (CLI, logging). The library split lets the codec and config be tested and used
   without the binary.
 - **Local hub identities.** `state_dir/hubs/<upstream hash>.identity`, 64 bytes as Python RNS
-  writes them, mode 0600 (rns-identity's atomic write) in a 0700 directory. A file that does not
-  load is an error and is left alone, never overwritten. A hub identity equal to the user's is
+  writes them, mode 0600 in a 0700 directory. A new one is written to a temporary file and
+  hard-linked into place, so it appears whole, and when two processes (`hashes` and `run`) create
+  it at once the second finds the link taken and loads the first one's. `state_dir` and `hubs/`
+  are set to 0700 at every start, also when they already exist. A file that does not load is an
+  error and is left alone, never overwritten. A hub identity equal to the user's is
   refused: the hub's identity in `K_SRC` is what tells its envelopes from the user's.
 - **Envelope codec** (`src/envelope.rs`, on `ciborium`). The body and every unknown key are kept as
   the raw CBOR item they arrived as, so they are passed on byte for byte: cbor2 writes floats as
@@ -243,7 +285,7 @@ As of M1:
   level must be one map with nothing after it, and a key that appears twice is refused (cbor2 would
   keep the last). Keys must be unsigned integers, `K_V` must be 1, `K_V`/`K_T`/`K_ID`/`K_TS`/`K_SRC`
   must be present and every known key must have its type. Unknown message types decode and pass
-  through. Nesting deeper than 64 is refused. Typed views of the HELLO (including the legacy nick at
+  through; `K_T` is any CBOR integer, negative included, as rrcd takes it. Nesting deeper than 64 is refused. Typed views of the HELLO (including the legacy nick at
   body key 64), WELCOME (missing limits fall back to rrcd's defaults) and RESOURCE_ENVELOPE bodies
   sit on top.
 - **Fixtures.** `tests/fixtures/make_envelopes.py` builds 19 envelopes with rrcd 0.3.2's own
@@ -255,7 +297,8 @@ As of M1:
   rnsd instances with unique instance names and TCPServerInterfaces on 127.0.0.1, ports 4370-4379,
   and Python peers (`tests/rrc_peer.py`) that watch announces, request paths, link, identify and
   PING. It covers the phases cited under [Announces](#announces), the allow-list (a link
-  identified as another identity gets no PONG), `hashes`, `status` and a clean stop. M2 adds rrcd.
+  identified as another identity gets no PONG), a PING sent right behind the identify, `hashes`,
+  `status` and a clean stop. M2 adds rrcd.
 
 ## Milestones
 

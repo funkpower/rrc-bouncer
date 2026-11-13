@@ -2,13 +2,15 @@
 """A Python Reticulum peer for tests/e2e.py.
 
 It watches `rrc.hub` announces (path responses included) and, with --ping,
-asks for a path to a hub, links to it, identifies, and sends PING envelopes
-until a PONG comes back. Everything it sees goes to --events as JSON lines.
+asks for a path to a hub, links to it, identifies, sends one PING right
+after the identify (no pause, no retry) and waits for the PONG. Everything
+it sees goes to --events as JSON lines.
 """
 
 import argparse
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -72,13 +74,22 @@ def ping(args, identity):
         emit(args.events, event="no_link")
         return 1
     emit(args.events, event="link")
-    link.identify(identity)
+    # The PING goes out right behind the identify, as an RRC client's HELLO
+    # does, in the same TCP segment (TCP_CORK), so the hub receives both at
+    # once; it must not handle the PING before it knows the link's identity.
     body = 12345.678901
+    env = {K_V: 1, K_T: T_PING, K_ID: os.urandom(8), K_TS: int(time.time() * 1000),
+           K_SRC: identity.hash, K_BODY: body}
+    sock = getattr(link.attached_interface, "socket", None)
+    cork = sock is not None and hasattr(socket, "TCP_CORK")
+    if cork:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 1)
+    link.identify(identity)
+    RNS.Packet(link, cbor2.dumps(env)).send()
+    if cork:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, 0)
     while time.time() - start < args.timeout and not pongs:
-        env = {K_V: 1, K_T: T_PING, K_ID: os.urandom(8), K_TS: int(time.time() * 1000),
-               K_SRC: identity.hash, K_BODY: body}
-        RNS.Packet(link, cbor2.dumps(env)).send()
-        time.sleep(1)
+        time.sleep(0.1)
     if pongs:
         pong = pongs[0]
         emit(args.events, event="pong", body_matches=pong.get(K_BODY) == body,

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: LicenseRef-Reticulum
 //! Starting Reticulum and running the local hubs.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ciborium::Value;
@@ -20,6 +21,21 @@ const FIRST_ANNOUNCE_DELAY: Duration = Duration::from_secs(5);
 const STATUS_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the uplink is checked for having (re)connected.
 const UPLINK_CHECK: Duration = Duration::from_secs(10);
+/// How often the path responses on the uplink are sent again. Python rnsd
+/// drops a path nobody has used after 12 minutes on an instance without
+/// transport and 1.75 hours with it (`UNUSED_PATH_LINGER_LEAF`,
+/// `UNUSED_PATH_LINGER`), and answering a path request does not count as use.
+const UPLINK_REFRESH: Duration = Duration::from_secs(5 * 60);
+/// Overrides `UPLINK_REFRESH`, in seconds, for tests/e2e.py.
+const UPLINK_REFRESH_ENV: &str = "RRC_BOUNCER_UPLINK_REFRESH_SECS";
+
+fn uplink_refresh() -> Duration {
+    std::env::var(UPLINK_REFRESH_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map_or(UPLINK_REFRESH, Duration::from_secs)
+}
 
 pub fn now() -> f64 {
     std::time::SystemTime::now()
@@ -133,31 +149,64 @@ async fn start_reticulum(settings: &Settings, shutdown: ShutdownSignal) -> Resul
     Ok(runtime)
 }
 
+/// The identity each link of a local hub identified as, filled in by the
+/// hub's identity gate.
+type LinkIdentities = Arc<Mutex<HashMap<[u8; 16], [u8; 16]>>>;
+
+/// The identity gate of a local hub. rsReticulum calls it on the link
+/// manager's task while it handles a link's LinkIdentify packet, before it
+/// handles any later packet on that link (`IdentityGatePolicy`,
+/// `rns-runtime/src/destination_runtime.rs:88-93`, called from
+/// `link_manager.rs:2973-2977`). So when a packet reaches `local_hub_events`
+/// the link's identity is already here, whatever order the separate
+/// `links_identified` and `link_packets` channels are read in; the
+/// `links_identified` event is only logged (it is sent with `try_send` on a
+/// bounded channel and can be dropped). Every identity is let through; a
+/// link of another identity gets no answers.
+fn identity_gate(identities: LinkIdentities) -> IdentityGatePolicy {
+    IdentityGatePolicy::new(move |link, identity| {
+        if let Ok(mut map) = identities.lock() {
+            map.insert(link, identity);
+        }
+        true
+    })
+}
+
+fn link_identity(identities: &LinkIdentities, link: &[u8; 16]) -> Option<[u8; 16]> {
+    identities.lock().ok().and_then(|map| map.get(link).copied())
+}
+
 /// A local hub's link events. Until the relay exists it only logs links
 /// and answers PING from the user's own clients.
-async fn local_hub_events(mut hub: RegisteredDestination, hub_identity: [u8; 16], allowed: Vec<[u8; 16]>) {
+async fn local_hub_events(
+    mut hub: RegisteredDestination,
+    hub_identity: [u8; 16],
+    allowed: Vec<[u8; 16]>,
+    identities: LinkIdentities,
+) {
     let tag = hex::encode(hub.handle.destination_hash());
-    let mut identified: Vec<([u8; 16], [u8; 16])> = Vec::new();
     let events = &mut hub.events;
     loop {
         tokio::select! {
+            // Established and identified before packets, so the log reads
+            // in order (the PING answer does not depend on it, see
+            // `identity_gate`). Closed after packets: rsReticulum queues a
+            // link's last packets before its close event, and they are
+            // still handled.
+            biased;
             Some(link) = events.links_established.recv() => {
                 tracing::info!("hub {tag}: link {} established", hex::encode(link));
             }
             Some((link, identity)) = events.links_identified.recv() => {
-                let known = allowed.contains(&identity);
                 tracing::info!(
                     "hub {tag}: link {} identified as {}{}",
                     hex::encode(link),
                     hex::encode(identity),
-                    if known { "" } else { " (not allowed)" }
+                    if allowed.contains(&identity) { "" } else { " (not allowed)" }
                 );
-                if known {
-                    identified.push((link, identity));
-                }
             }
             Some((data, link)) = events.link_packets.recv() => {
-                if !identified.iter().any(|(l, _)| *l == link) {
+                if !link_identity(&identities, &link).is_some_and(|id| allowed.contains(&id)) {
                     tracing::debug!("hub {tag}: ignored a packet on a link not identified as an allowed identity");
                     continue;
                 }
@@ -175,7 +224,9 @@ async fn local_hub_events(mut hub: RegisteredDestination, hub_identity: [u8; 16]
                 }
             }
             Some(link) = events.links_closed.recv() => {
-                identified.retain(|(l, _)| *l != link);
+                if let Ok(mut map) = identities.lock() {
+                    map.remove(&link);
+                }
                 tracing::info!("hub {tag}: link {} closed", hex::encode(link));
             }
             Some(_) = events.packets.recv() => {}
@@ -207,15 +258,23 @@ async fn announcer(handles: Vec<(DestinationHandle, Vec<u8>)>, interval: Duratio
 }
 
 /// Tell the rnsd the bouncer connects to (`tcp` mode) where the local hubs
-/// are, with a path response on each interface that has just come online. A
-/// path response is not passed on by transport nodes, so it reaches that
-/// rnsd and nothing beyond; the rnsd then answers path requests for the hubs
-/// from its own path table, which it does not do for destinations it has
-/// never heard of.
+/// are, with a path response for each hub on the uplink. A path response is
+/// not passed on by transport nodes, so it reaches that rnsd and nothing
+/// beyond; the rnsd then answers path requests for the hubs from its own path
+/// table, which it does not do for destinations it has never heard of.
+///
+/// Sent on each interface that has come online since the last check and,
+/// with `refresh`, on every online interface. The refresh keeps rnsd's path
+/// from being dropped as never used, and covers an rnsd restart or reconnect
+/// that happened between two checks. Each path response is built afresh (no
+/// tag, so rsReticulum does not reuse a cached one): a new random blob with
+/// the current time in it, which rnsd takes as a more recent emission and
+/// uses to replace its path entry (`Transport.py:2520-2523`).
 async fn uplink_path_responses(
     runtime: &ReticulumHandle,
     hubs: &[(DestinationHandle, Vec<u8>)],
-    online: &mut std::collections::HashSet<u64>,
+    online: &mut HashSet<u64>,
+    refresh: bool,
 ) {
     let stats = match runtime.interface_stats().await {
         Ok(stats) => stats,
@@ -224,20 +283,25 @@ async fn uplink_path_responses(
             return;
         }
     };
-    let now_online: std::collections::HashSet<u64> =
-        stats.interfaces.iter().filter(|i| i.online).map(|i| i.id).collect();
-    for interface in now_online.difference(online) {
+    let now_online: HashSet<u64> = stats.interfaces.iter().filter(|i| i.online).map(|i| i.id).collect();
+    let targets: Vec<u64> = if refresh {
+        now_online.iter().copied().collect()
+    } else {
+        now_online.difference(online).copied().collect()
+    };
+    for interface in targets {
         for (handle, app_data) in hubs {
             let options = DestinationAnnounceOptions {
                 app_data: Some(app_data.clone()),
                 path_response: true,
-                attached_interface: Some(*interface),
+                attached_interface: Some(interface),
                 ..DestinationAnnounceOptions::default()
             };
             match handle.announce(options).await {
                 Ok(()) => tracing::info!(
-                    "sent the uplink a path response for hub {}",
-                    hex::encode(handle.destination_hash())
+                    "sent the uplink a path response for hub {}{}",
+                    hex::encode(handle.destination_hash()),
+                    if refresh { " (refresh)" } else { "" }
                 ),
                 Err(e) => tracing::warn!(
                     "could not send a path response for hub {}: {e}",
@@ -288,6 +352,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     };
     for (upstream, local) in locals {
         let hub_identity = local.hash;
+        let identities = LinkIdentities::default();
         let app_data = hub_app_data(&local_hub_name(&upstream));
         let registered = runtime
             .register_destination(
@@ -297,6 +362,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
                     proof_strategy: ProofStrategy::ProveNone,
                     resource_strategy: ResourceStrategy::AcceptNone,
                     default_app_data: Some(app_data.clone()),
+                    identity_gate: Some(identity_gate(identities.clone())),
                     ..DestinationRuntimeOptions::default()
                 },
             )
@@ -317,6 +383,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             registered,
             hub_identity,
             allowed.clone(),
+            identities,
         )));
     }
     let uplink = !settings.announce && matches!(settings.rns, RnsAccess::Tcp { .. });
@@ -330,7 +397,11 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     let mut ticker = tokio::time::interval(STATUS_INTERVAL);
     ticker.tick().await;
     let mut uplink_check = tokio::time::interval(UPLINK_CHECK);
-    let mut online = std::collections::HashSet::new();
+    let mut uplink_refresh = tokio::time::interval(uplink_refresh());
+    // The first refresh is due one interval after start; the online edge
+    // covers the start.
+    uplink_refresh.reset();
+    let mut online = HashSet::new();
     loop {
         tokio::select! {
             _ = signals.recv() => break,
@@ -339,7 +410,10 @@ pub async fn run(settings: Settings) -> Result<(), String> {
                 write_status(&settings, &status);
             }
             _ = uplink_check.tick(), if uplink => {
-                uplink_path_responses(&runtime, &announced, &mut online).await;
+                uplink_path_responses(&runtime, &announced, &mut online, false).await;
+            }
+            _ = uplink_refresh.tick(), if uplink => {
+                uplink_path_responses(&runtime, &announced, &mut online, true).await;
             }
         }
     }

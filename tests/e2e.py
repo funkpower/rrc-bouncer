@@ -8,6 +8,7 @@ host's own rnsd or any other network. Run through tests/e2e.sh.
 
   T  an rnsd with transport on and no shared instance (the bouncer
      connects to it over TCP)
+  TL T again, with never-used paths dropped after LINGER seconds
   S  an rnsd with a shared instance of its own (the bouncer attaches to it)
   W  a peer watching rrc.hub announces
   C  a client holding the user's identity: asks for a path to the local
@@ -30,9 +31,14 @@ import RNS
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PEER = os.path.join(HERE, "rrc_peer.py")
+RNSD_LINGER = os.path.join(HERE, "rnsd_linger.py")
 UPSTREAM = "082f8e4293d19281108a5d4faa52dcbe"
 # The bouncer's first announce comes 5 s after start; wait past it.
 QUIET = 10
+# The never-used path linger of rnsd TL, and the bouncer's refresh interval
+# against it (both seconds).
+LINGER = 12
+REFRESH = 4
 
 
 class Failure(Exception):
@@ -94,9 +100,9 @@ class Run:
     def path(self, *parts):
         return os.path.join(self.work, *parts)
 
-    def start(self, name, argv):
+    def start(self, name, argv, env=None):
         log = open(self.path(f"{name}.log"), "ab")
-        env = dict(os.environ, PYTHONUNBUFFERED="1")
+        env = dict(os.environ, PYTHONUNBUFFERED="1", **(env or {}))
         self.procs[name] = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=env)
 
     def stop(self, name, timeout=15):
@@ -113,6 +119,10 @@ class Run:
     def stop_all(self):
         for name in list(self.procs):
             self.stop(name, timeout=5)
+
+    def log(self, name):
+        with open(self.path(f"{name}.log"), "rb") as f:
+            return f.read().decode("utf-8", "replace")
 
     def wait_log(self, name, text, timeout):
         end = time.time() + timeout
@@ -152,9 +162,13 @@ class Run:
             RNS.Identity().to_file(path)
         return path
 
-    def rnsd(self, name, port, shared=None):
+    def rnsd(self, name, port, shared=None, linger=None):
         config = rns_config(self.path("rns", name), port, server=True, shared=shared)
-        self.start(name, [self.rnsd_bin, "--config", config])
+        if linger is None:
+            self.start(name, [self.rnsd_bin, "--config", config])
+        else:
+            self.start(name, [self.python, RNSD_LINGER, "--config", config],
+                       env={"RRC_TEST_PATH_LINGER": str(linger)})
         wait_port(port)
 
     def peer(self, name, port, identity, *extra):
@@ -207,6 +221,7 @@ def main():
         port_t = free_port()
         port_s = free_port({port_t})
         port_d = free_port({port_t, port_s})
+        port_l = free_port({port_t, port_s, port_d})
         tcp = f'tcp = "127.0.0.1:{port_t}"'
         config = run.config("tcp", tcp)
         out = run.bouncer("--config", config, "hashes")
@@ -233,6 +248,13 @@ def main():
               "the answer is a path response, not an announce")
         check(pong is not None, "the hub answers PING with PONG on an identified link")
         check(pong["body_matches"] and pong["src_is_hub"], "PONG echoes the body and carries the hub's identity")
+        # Each client sends its one PING in the same TCP segment as its
+        # identify; a hub that handled a packet before the link's identity
+        # dropped about one in six.
+        pongs = sum(ping(run, f"C0{i}", port_d, "user", hub, timeout=10)[1] is not None for i in range(5))
+        check(pongs == 5, f"{pongs}/5 more clients get PONG for a PING sent right behind the identify")
+        check("ignored a packet on a link not identified" not in run.log("BD"),
+              "the hub dropped no packet of an identified link")
         check(run.stop("BD") == 0, "the bouncer stops cleanly on SIGTERM")
 
         print("tcp: the bouncer connects to rnsd T, announce = false", flush=True)
@@ -273,6 +295,38 @@ def main():
         run.stop("W")
         run.stop("T")
 
+        print(f"tcp: rnsd TL drops never-used paths after {LINGER} s", flush=True)
+        removed = f"Removing never used path to <{hub}>"
+        run.rnsd("TL", port_l, linger=LINGER)
+        check(run.wait_log("TL", f"Unused path linger time is {float(LINGER)}s", 10), f"rnsd TL lingers {LINGER} s")
+        config = run.config("tcp-linger", f'tcp = "127.0.0.1:{port_l}"')
+        run.start("BL0", [args.bouncer, "--config", config, "run"],
+                  env={"RRC_BOUNCER_UPLINK_REFRESH_SECS": "3600"})
+        check(run.wait_log("BL0", "sent the uplink a path response", 20), "the bouncer tells rnsd TL where the hub is")
+        check(run.wait_log("TL", removed, LINGER + 15),
+              "without a refresh, rnsd TL drops the path once the linger is over")
+        run.stop("BL0")
+        print(f"tcp: the bouncer refreshes the path every {REFRESH} s", flush=True)
+        run.start("BL", [args.bouncer, "--config", config, "run"],
+                  env={"RRC_BOUNCER_UPLINK_REFRESH_SECS": str(REFRESH)})
+        check(run.wait_log("BL", "sent the uplink a path response", 20), "the bouncer tells rnsd TL where the hub is")
+        removals = run.log("TL").count(removed)
+        updates = run.log("TL").count(f"Destination <{hub}>")
+        time.sleep(3 * LINGER)
+        refreshes = run.log("BL").count("(refresh)")
+        found["tl_refreshes"] = refreshes
+        found["tl_path_updates"] = run.log("TL").count(f"Destination <{hub}>") - updates
+        check(refreshes >= 3 * LINGER // REFRESH - 1, f"the bouncer sent {refreshes} refreshes in {3 * LINGER} s")
+        check(found["tl_path_updates"] >= refreshes,
+              f"rnsd TL took every refresh as a newer path ({found['tl_path_updates']} path table updates)")
+        check(run.log("TL").count(removed) == removals,
+              f"rnsd TL kept the path for {3 * LINGER} s, {3 * LINGER // LINGER} linger times")
+        done, pong, events = ping(run, "CL", port_l, "user", hub)
+        check(any(e["event"] == "path" for e in events) and pong is not None,
+              "a client still gets a path through rnsd TL, links and gets PONG")
+        check(run.stop("BL") == 0, "the bouncer stops cleanly")
+        run.stop("TL")
+
         print("shared: the bouncer attaches to rnsd S's shared instance, announce = false", flush=True)
         instance = f"rrcm1-e2e-{os.getpid()}-S"
         run.rnsd("S", port_s, shared=instance)
@@ -285,6 +339,29 @@ def main():
         found["shared_client_events"] = events
         check(pong is not None, "a client on rnsd S reaches the hub (path request, link, PING/PONG)")
         check(not hub_announces(run.events("W2"), hub, False), "the watcher on rnsd S saw no announce of the hub")
+
+        print("shared: the bouncer restarts, rnsd S stays up", flush=True)
+        # C2's path request was answered by rnsd S from its path table,
+        # which left the hub in S's pending_local_path_requests
+        # (Transport.py:3788-3797); S clears that only when a local client
+        # sends a path response for the hub, as the bouncer does when it
+        # registers again (Transport.py:2627-2647).
+        check(run.stop("BS") == 0, "the bouncer stops cleanly")
+        log_from = len(run.log("S"))
+        restarted = time.time()
+        run.start("BS", [args.bouncer, "--config", config, "run"])
+        check(run.wait_log("BS", f"local hub {hub}", 20), "the bouncer attaches again")
+        time.sleep(20)
+        after = [e for e in run.events("W2") if e["at"] >= restarted]
+        leaked = hub_announces(after, hub, False)
+        found["announces_after_bouncer_restart"] = after
+        found["s_log_after_bouncer_restart"] = [line for line in run.log("S")[log_from:].splitlines() if hub in line]
+        if leaked:
+            print("  known  after the bouncer attached again, rnsd S announced the hub to the network", flush=True)
+        else:
+            print("  ok  no announce of the hub after the bouncer attached again", flush=True)
+        done, pong, events = ping(run, "C4", port_s, "user", hub)
+        check(pong is not None, "the hub is reachable after the bouncer restarted")
 
         print("shared: rnsd S restarts", flush=True)
         run.stop("S")
