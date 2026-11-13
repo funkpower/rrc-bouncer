@@ -1,0 +1,40 @@
+# rrc-bouncer configuration. Relative paths are relative to this file; ~/ is
+# the home directory.
+
+# Your Reticulum identity (64 bytes): the one your RRC clients use, so the
+# hubs keep knowing you by it. Keep it private (chmod 600).
+identity = "~/.local/share/rrc-bouncer/identity"
+state_dir = "~/.local/share/rrc-bouncer"
+log_level = "info"
+
+# Announce the bouncer's local hubs. Off: clients reach them by the hashes
+# `rrc-bouncer hashes` prints, and nothing advertises them on the network.
+announce = false
+# announce_interval_minutes = 360
+
+# Identity hashes (not addresses) allowed to use the local hubs besides yours.
+allowed_identities = []
+
+# A client's PART also leaves the room upstream. Off: the bouncer stays in
+# the room and keeps its history; only that client's view of it ends.
+part_upstream = false
+
+[reticulum]
+# Exactly one of: attach to this host's rnsd shared instance, connect to an
+# rnsd TCPServerInterface, or use a complete Reticulum config directory.
+shared_instance = true
+# instance_name = "default"
+# tcp = "127.0.0.1:4242"
+# config_dir = "~/.config/rrc-bouncer/reticulum"
+
+[history]
+days = 30
+max_mb = 100
+replay_hours = 24
+replay_max = 100
+
+# One table per upstream hub.
+[[hub]]
+address = "082f8e4293d19281108a5d4faa52dcbe"
+rooms = ["lobby"]
+nick = "yournick"

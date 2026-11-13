@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: LicenseRef-Reticulum
+# systemd user unit. Install:
+#   cp rrc-bouncer.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now rrc-bouncer
+#   loginctl enable-linger "$USER"   # keep it running while logged out
+# Logs: journalctl --user -u rrc-bouncer
+
+[Unit]
+Description=rrc-bouncer: one RRC identity for several RRC clients, with history
+# With shared_instance = true the bouncer needs rnsd running first; it
+# exits (and is restarted) while rnsd is down.
+After=rnsd.service network-online.target
+Wants=rnsd.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rrc-bouncer --config %h/.config/rrc-bouncer/config.toml run
+Restart=always
+RestartSec=15
+# The history and identity are private.
+UMask=0077
+
+[Install]
+WantedBy=default.target
