@@ -199,11 +199,12 @@ class Run:
         if not self.wait_event(name, lambda e: e["event"] == "ready", 180):
             raise Failure(f"{name} did not start")
 
-    def config(self, name, reticulum, announce=False, upstream=UPSTREAM, nick=None, allowed=()):
+    def config(self, name, reticulum, announce=False, upstream=UPSTREAM, nick=None, allowed=(), part_upstream=False):
         path = self.path(f"{name}.toml")
         with open(path, "w") as f:
             f.write(f'identity = "ids/user"\nstate_dir = "state"\nlog_level = "debug"\n'
                     f"announce = {'true' if announce else 'false'}\n"
+                    f"part_upstream = {'true' if part_upstream else 'false'}\n"
                     f'allowed_identities = {json.dumps(list(allowed))}\n\n[reticulum]\n{reticulum}\n\n'
                     f'[[hub]]\naddress = "{upstream}"\nrooms = ["lobby"]\n')
             if nick:
@@ -425,6 +426,10 @@ def relay_phases(run, args, port_r, upstream, user, local, config, env, found):
     check(a["0"] == f"{HUB_NAME} (via rrc-bouncer)", f"the WELCOME names the hub \"{a['0']}\"")
     check(a["2"] == dict(d.get("2", {}), **{"0": False}) and a["3"] == d["3"] and a["3"]["3"] == 4,
           f"it carries rrcd's caps (resource_envelope off) and limits: {a['2']} {a['3']}")
+    for name in ("A", "B"):
+        greeting = wait_env(run, name, 10, t=21, body="e2e")
+        check(greeting is not None and greeting["src"] == hub_id and greeting["room"] is None,
+              f"{name}, linked after the bouncer's WELCOME, gets rrcd's greeting \"e2e\" from the local hub")
 
     for name in ("A", "B"):
         command(run, name, op="join", room="lobby")
@@ -446,9 +451,9 @@ def relay_phases(run, args, port_r, upstream, user, local, config, env, found):
         ("B", dict(t=22, room="lobby", body="waves"), "ABD", user),
         ("D", dict(t=20, room="lobby", body="hello from dee"), "ABD", direct),
         ("D", dict(t=22, room="lobby", body="nods"), "ABD", direct),
-        ("A", dict(t=21, dst=direct, body="psst from a"), "ABD", user),
+        ("A", dict(t=21, dst=direct, body="psst from a"), "BD", user),
         ("D", dict(t=21, dst=user, body="psst from dee"), "AB", direct),
-        ("B", dict(t=21, dst=direct, body="psst from b"), "ABD", user),
+        ("B", dict(t=21, dst=direct, body="psst from b"), "AD", user),
         ("B", dict(t=21, room="lobby", body="a room notice"), "ABD", user),
     ]
     sent = []
@@ -473,8 +478,12 @@ def relay_phases(run, args, port_r, upstream, user, local, config, env, found):
     check(True, f"each client got each envelope once, with its K_ID, type, body and K_SRC ({len(sent)} envelopes)")
     first = sent[0][0]
     check(all(envs(run, name, id=first)[0]["fmt"] == fmt for name in "ABD"), "K_FMT came through on A's MSG")
-    check(all(envs(run, sender, id=ident) for ident, sender, cmd, receivers, src in sent if sender in "AB"),
-          "the sender of each MSG, ACTION and NOTICE got its echo")
+    check(all(envs(run, sender, id=ident) for ident, sender, cmd, receivers, src in sent
+              if sender in "AB" and "dst" not in cmd),
+          "the sender of each room MSG, ACTION and NOTICE got its echo")
+    nicks = {envs(run, "D", id=ident)[0]["nick"] for ident, sender, cmd, receivers, src in sent if sender in "AB"}
+    found["relay_nicks_at_d"] = sorted(nicks, key=str)
+    check(nicks == {"bnc"}, "A (K_NICK a) and B (K_NICK b) both reach D as nick bnc")
 
     print("relay: errors go to the client that caused them", flush=True)
     nobody = os.urandom(16).hex()
@@ -483,6 +492,31 @@ def relay_phases(run, args, port_r, upstream, user, local, config, env, found):
     time.sleep(2)
     check(error is not None and error["src"] == hub_id and not envs(run, "B", t=40),
           "a direct NOTICE to an identity not connected: A gets rrcd's ERROR, B does not")
+    good = os.urandom(8).hex()
+    command(run, "A", op="send", t=20, room="nosuch", body="anyone?")
+    command(run, "B", op="send", id=good, t=20, room="lobby", body="all good")
+    error = wait_env(run, "A", t=40, body="no such room")
+    check(wait_env(run, "B", id=good) is not None and wait_env(run, "D", id=good) is not None,
+          "B's MSG to lobby, sent alongside, reaches B and D")
+    time.sleep(2)
+    check(error is not None and error["room"] == "nosuch" and not envs(run, "B", t=40),
+          "A's MSG to nosuch at the same time: A alone gets \"no such room\"")
+
+    print("relay: command replies go to the client that gave the command", flush=True)
+    command(run, "A", op="send", t=20, body="/list")
+    command(run, "B", op="send", t=20, body="/who lobby")
+    lists = ("No public rooms registered", "Registered public rooms:")
+    is_list = lambda e: e["t"] == 21 and isinstance(e["body"], str) and e["body"].startswith(lists)
+    is_who = lambda e: e["t"] == 21 and isinstance(e["body"], str) and e["body"].startswith("members in lobby: ")
+    a_list = run.wait_event("A", lambda e: e["event"] == "env" and is_list(e), 20)
+    b_who = run.wait_event("B", lambda e: e["event"] == "env" and is_who(e), 20)
+    time.sleep(2)
+    found["relay_commands"] = {"A": a_list and a_list["body"], "B": b_who and b_who["body"]}
+    check(a_list is not None and a_list["src"] == hub_id and a_list["room"] is None,
+          f"A gets the /list reply ({a_list and a_list['body']!r})")
+    check(b_who is not None and b_who["src"] == hub_id, f"B gets the /who reply ({b_who and b_who['body']!r})")
+    check(not [e for e in envs(run, "A") if is_who(e)] and not [e for e in envs(run, "B") if is_list(e)],
+          "neither gets the other's reply")
 
     print("relay: a client joins a new room through the bouncer", flush=True)
     command(run, "A", op="join", room="Fresh")
@@ -527,6 +561,8 @@ def relay_phases(run, args, port_r, upstream, user, local, config, env, found):
     found["relay_status_out"] = out.stdout
     check(f"clients          2 ({user}, {user})" in out.stdout and "relayed          " in out.stdout,
           "status prints the clients and the envelopes relayed")
+    check(not [e for name in "ABD" for e in run.events(name) if e["event"] == "error"],
+          "the driven clients raised nothing")
     for name in ("A", "B", "D"):
         run.stop(name)
 
@@ -550,6 +586,56 @@ def relay_phases(run, args, port_r, upstream, user, local, config, env, found):
     hub = run.wait_status(upstream, lambda h: h.get("client_identities") == [stranger], 10)
     check(hub["client_identities"] == [stranger], "status.json lists it as a client")
     run.stop("Y2")
+    check(run.stop("BR") == 0, "the bouncer stops cleanly")
+    part_upstream_phases(run, args, port_r, upstream, user, local, env, found, hub_id)
+
+
+def part_upstream_phases(run, args, port_r, upstream, user, local, env, found, hub_id):
+    print("relay: part_upstream = true", flush=True)
+    config = run.config("rrcd", f'tcp = "127.0.0.1:{port_r}"', upstream=upstream, nick="bnc", part_upstream=True)
+    run.start("BR", [args.bouncer, "--config", config, "run"], env=env)
+    run.wait_status(upstream, lambda h: h["state"] == "connected" and "lobby" in h["rooms_joined"], 40)
+    driven(run, "A2", port_r, "user", local, "a")
+    driven(run, "D2", port_r, "direct", upstream, "dee")
+    check(wait_env(run, "A2", 40, t=2) and wait_env(run, "D2", 40, t=2), "A2 and D2 get WELCOME")
+    command(run, "D2", op="join", room="lobby")
+    command(run, "A2", op="join", room="lobby")
+    check(wait_env(run, "D2", t=11, room="lobby") and wait_env(run, "A2", t=11, room="lobby"),
+          "A2 (local hub) and D2 (rrcd H) are in lobby")
+    command(run, "A2", op="part", room="lobby")
+    parted = wait_env(run, "A2", t=13, room="lobby")
+    seen = wait_env(run, "D2", t=13, room="lobby")
+    check(parted is not None and parted["src"] == hub_id, "A2 gets PARTED for lobby")
+    check(seen is not None and seen["body"] == [user], "D2 sees the bouncer part lobby")
+    rejoin_at = time.time()
+    command(run, "A2", op="join", room="lobby")
+    joined = run.wait_event("A2", lambda e: e["event"] == "env" and e["t"] == 11 and e["room"] == "lobby"
+                            and e["at"] >= rejoin_at, 40)
+    check(joined is not None and joined["src"] == hub_id, "A2 joins lobby again at once: JOINED")
+    check(run.wait_event("D2", lambda e: e["event"] == "env" and e["t"] == 11 and e["room"] == "lobby"
+                         and e["body"] == [user] and e["at"] >= rejoin_at, 20) is not None,
+          "and the JOIN went upstream: D2 sees the bouncer join lobby")
+    ident = os.urandom(8).hex()
+    command(run, "D2", op="send", id=ident, t=20, room="lobby", body="welcome back")
+    check(wait_env(run, "A2", id=ident) is not None, "A2 gets lobby's traffic again")
+    run.stop("D2")
+
+    print("relay: a JOIN while rrcd H is down", flush=True)
+    run.stop("H")
+    down = run.wait_status(upstream, lambda h: h["state"] != "connected", 30)
+    check(down["state"] != "connected", f"the bouncer saw the link go ({down['last_error']})")
+    time.sleep(1)
+    command(run, "A2", op="join", room="side")
+    error = wait_env(run, "A2", t=40, room="side")
+    check(error is not None and error["body"] == "hub not connected: side not joined" and error["src"] == hub_id,
+          f"A2's JOIN of side: ERROR {error and error['body']!r}, room side")
+    run.rrcd(args.rrcd, port_r, max_rooms=4)
+    run.wait_status(upstream, lambda h: h["state"] == "connected" and "side" in h["rooms_joined"], 90)
+    command(run, "A2", op="join", room="side")
+    check(wait_env(run, "A2", 40, t=11, room="side") is not None, "with rrcd H back, the JOIN of side gets JOINED")
+    errors = [e for e in run.events("A2") if e["event"] == "error"] + [e for e in run.events("D2") if e["event"] == "error"]
+    check(not errors, "the driven clients raised nothing")
+    run.stop("A2")
     check(run.stop("BR") == 0, "the bouncer stops cleanly")
 
 

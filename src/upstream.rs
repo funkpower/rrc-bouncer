@@ -6,6 +6,7 @@
 //! task that owns the link, keeps it up, and feeds the session.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -292,6 +293,11 @@ impl Session {
 
     fn is_joined(&self, room: &str) -> bool {
         self.rooms.joined.iter().any(|r| r == room)
+    }
+
+    /// Whether the bouncer is in `room` on this link and not leaving it.
+    pub fn is_in(&self, room: &str) -> bool {
+        self.is_joined(room) && !self.is_parting(room)
     }
 
     fn is_parting(&self, room: &str) -> bool {
@@ -592,10 +598,71 @@ impl Session {
 /// the session: send with `try_send`, and count and report a full channel
 /// as a dropped send.
 pub const COMMAND_QUEUE: usize = 1024;
-/// The size of the channel an upstream session sends events into. The
-/// session sends with `try_send` and counts what does not fit in
-/// `dropped_events`; it never waits for the receiver.
+/// How many events may wait for the relay before the session drops
+/// traffic events (see [`EventSender`]).
 pub const EVENT_QUEUE: usize = 4096;
+
+/// The sending half of the channel from an upstream session to its relay.
+/// It never blocks. State events (`Up`, `Down`, and the session's room
+/// changes: JoinConfirmed, JoinFailed, PartConfirmed, Removed) always go,
+/// so the relay's view of the session cannot fall out of step with it.
+/// Traffic events (relayed envelopes, hub ERRORs, dropped sends) are
+/// dropped, and counted in `dropped_events`, while `EVENT_QUEUE` events
+/// wait.
+#[derive(Debug, Clone)]
+pub struct EventSender {
+    tx: mpsc::UnboundedSender<UpstreamEvent>,
+    backlog: Arc<AtomicUsize>,
+}
+
+/// The relay's half of [`EventSender`]'s channel.
+#[derive(Debug)]
+pub struct EventReceiver {
+    rx: mpsc::UnboundedReceiver<UpstreamEvent>,
+    backlog: Arc<AtomicUsize>,
+}
+
+pub fn event_channel() -> (EventSender, EventReceiver) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    (
+        EventSender {
+            tx,
+            backlog: backlog.clone(),
+        },
+        EventReceiver { rx, backlog },
+    )
+}
+
+impl EventSender {
+    /// Send an event; false if it was a traffic event dropped for the
+    /// backlog (or the relay is gone).
+    pub fn send(&self, event: UpstreamEvent) -> bool {
+        if !event.is_state() && self.backlog.load(Ordering::Relaxed) >= EVENT_QUEUE {
+            return false;
+        }
+        self.backlog.fetch_add(1, Ordering::Relaxed);
+        if self.tx.send(event).is_err() {
+            self.backlog.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+}
+
+impl EventReceiver {
+    pub async fn recv(&mut self) -> Option<UpstreamEvent> {
+        let event = self.rx.recv().await?;
+        self.backlog.fetch_sub(1, Ordering::Relaxed);
+        Some(event)
+    }
+
+    pub fn try_recv(&mut self) -> Option<UpstreamEvent> {
+        let event = self.rx.try_recv().ok()?;
+        self.backlog.fetch_sub(1, Ordering::Relaxed);
+        Some(event)
+    }
+}
 
 /// What the rest of the bouncer can ask of an upstream session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -627,6 +694,24 @@ pub enum UpstreamEvent {
     /// A client envelope from [`Command::Send`] that was not sent, and why;
     /// its `id` is the client's.
     SendDropped { envelope: Envelope, reason: String },
+}
+
+impl UpstreamEvent {
+    /// Whether the event changes what the relay knows of the session's
+    /// state (it is never dropped, see [`EventSender`]).
+    pub fn is_state(&self) -> bool {
+        match self {
+            Self::Up { .. } | Self::Down => true,
+            Self::Envelope(_, inbound) => matches!(
+                inbound,
+                Inbound::JoinConfirmed(_)
+                    | Inbound::JoinFailed { .. }
+                    | Inbound::PartConfirmed(_)
+                    | Inbound::Removed { .. }
+            ),
+            Self::SendDropped { .. } => false,
+        }
+    }
 }
 
 /// The hub's caps and limits as status.json shows them.
@@ -755,9 +840,8 @@ pub struct Upstream {
     /// Woken when the local hub's name changes.
     pub renamed: Arc<Notify>,
     /// The relay's channel (None: events are only counted, as
-    /// `unhandled`). Make it with `EVENT_QUEUE`; the session never waits
-    /// on it.
-    pub events: Option<mpsc::Sender<UpstreamEvent>>,
+    /// `unhandled`), from [`event_channel`]; the session never waits on it.
+    pub events: Option<EventSender>,
 }
 
 /// How a link ended.
@@ -805,10 +889,11 @@ impl Upstream {
         self.update(|s| s.rooms = rooms);
     }
 
-    /// Hand the relay an event without waiting: a full channel drops it.
+    /// Hand the relay an event without waiting: a traffic event finding
+    /// `EVENT_QUEUE` events waiting is dropped.
     fn emit(&self, event: UpstreamEvent) {
         let Some(events) = &self.events else { return };
-        if let Err(mpsc::error::TrySendError::Full(_)) = events.try_send(event) {
+        if !events.send(event) {
             let mut dropped = 0;
             self.tally(|s| {
                 s.dropped_events += 1;
@@ -919,6 +1004,8 @@ impl Upstream {
             started,
         );
         let mut welcomed_at: Option<Instant> = None;
+        // The hub's identity hash, from its WELCOME.
+        let mut hub: Option<Vec<u8>> = None;
         // rrcd's bucket for a link is full when the link comes up and holds
         // its default until the WELCOME says otherwise.
         let mut bucket = TokenBucket::new(Limits::default().rate_limit_msgs_per_minute, started);
@@ -1003,6 +1090,7 @@ impl Upstream {
                                 welcomed_at = Some(Instant::now());
                                 bucket.set_limit(welcome.limits.rate_limit_msgs_per_minute, Instant::now());
                                 self.welcomed(&welcome).await;
+                                hub = Some(env.src.clone());
                                 self.emit(UpstreamEvent::Up { welcome, hub: env.src.clone() });
                             }
                             Inbound::JoinConfirmed(room) => tracing::info!("upstream {tag}: joined {room}"),
@@ -1045,6 +1133,14 @@ impl Upstream {
                         self.add_room(&room);
                         if let Some(room) = crate::config::normalize_room(&room) {
                             session.want(&room);
+                            // The hub has the bouncer in the room already:
+                            // the relay gets its answer at once.
+                            if session.is_in(&room)
+                                && let Some(hub) = &hub
+                            {
+                                let joined = Envelope::new(MessageType::Joined, hub).with_room(&room);
+                                self.emit(UpstreamEvent::Envelope(joined, Inbound::JoinConfirmed(room)));
+                            }
                         }
                         self.show_rooms(session.rooms());
                     }
@@ -1806,5 +1902,24 @@ mod tests {
         assert_eq!(status, UpstreamStatus::default());
         assert_eq!(type_name(MessageType::Msg), "MSG");
         assert_eq!(type_name(MessageType::Unknown(99)), "t99");
+    }
+
+    #[test]
+    fn the_event_channel_drops_traffic_but_never_state() {
+        let (tx, mut rx) = event_channel();
+        let traffic = || UpstreamEvent::Envelope(from_hub(MessageType::Msg).with_room("lobby"), Inbound::Relay);
+        for _ in 0..EVENT_QUEUE {
+            assert!(tx.send(traffic()));
+        }
+        assert!(!tx.send(traffic()));
+        assert!(tx.send(UpstreamEvent::Down));
+        let joined = from_hub(MessageType::Joined).with_room("lobby");
+        assert!(tx.send(UpstreamEvent::Envelope(joined, Inbound::JoinConfirmed("lobby".into()))));
+        let mut n = 0;
+        while rx.try_recv().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, EVENT_QUEUE + 2);
+        assert!(tx.send(traffic()));
     }
 }

@@ -37,6 +37,10 @@ part rooms, and their messages are relayed to the hub and to each other;
 `rrc-bouncer status` shows each link, its rooms and its clients. It keeps no
 history yet.
 
+Set `nick` on each `[[hub]]`. The hub takes the nick of every message it gets,
+and all your clients share one link, so without it your nick on the hub
+changes to whichever client spoke last.
+
 ## Build
 
 Needs Rust 1.89 or newer. rsReticulum is a git submodule.

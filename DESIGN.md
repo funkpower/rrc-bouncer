@@ -97,8 +97,9 @@ read them, never copy from them.** The codec here is our own, on `ciborium`.
   - PART: by default the bouncer stays in the room upstream and only the client's view ends
     (`part_upstream = false`, as ZNC detaches). With `part_upstream = true`, a PART from any client
     parts upstream and removes the room from the set.
-  - MSG, ACTION, NOTICE (with or without `K_DST`): pass upstream unchanged (same `K_ID`, `K_NICK`,
-    unknown keys), record it in history, and relay it to the other clients in that room.
+  - MSG, ACTION, NOTICE (with or without `K_DST`): pass upstream unchanged (same `K_ID`, unknown
+    keys; `K_NICK` the hub's `nick` when one is set), and relay the hub's echo to every client in
+    that room; history records the echo.
   - Envelopes from upstream: record room traffic in history, then relay to every client linked to
     this local hub that is in the room (or, for a direct NOTICE, to every client). Rewrite `K_SRC`
     to the local hub's identity when the upstream envelope's `K_SRC` is the upstream hub's identity.
@@ -283,14 +284,22 @@ send out; unit-tested), and `run`, the task per hub that owns the link and feeds
   reason }`, the envelope as the client sent it (so its `K_ID` names it).
 - **Events and commands (the contract with the relay, M3).** The session task never waits on the
   relay.
-  - Events: `Upstream::events` is an `mpsc` channel of `EVENT_QUEUE` (4096). The session sends
-    with `try_send`; a full channel drops the event, counts it in `dropped_events` and logs a
-    warning at the 1st, 2nd, 4th, 8th, … drop. Events: `Up { welcome, hub }` (`hub` the hub's
-    identity hash, from the link), `Down`,
-    `Envelope(env, Inbound)` for everything the session does not handle itself (`Relay`,
+  - Events: `Upstream::events` is an unbounded `mpsc` channel with a count of the events in it
+    (`upstream::event_channel`). Sending never waits. Traffic (`Envelope(_, Relay)`,
+    `Envelope(_, HubError)`, `SendDropped`) is dropped once `EVENT_QUEUE` (4096) events wait,
+    counted in `dropped_events` with a warning at the 1st, 2nd, 4th, 8th, … drop. State events
+    (`Up`, `Down`, and `Envelope` with `JoinConfirmed`, `JoinFailed`, `PartConfirmed` or
+    `Removed`) are never dropped, so the relay's view of the rooms cannot drift from the
+    session's; they are few (one per JOIN, PART, kick or link), so the channel stays bounded in
+    practice. Events: `Up { welcome, hub }` (`hub` the hub's identity hash, from the link),
+    `Down`, `Envelope(env, Inbound)` for everything the session does not handle itself (`Relay`,
     `JoinConfirmed`, `JoinFailed`, `PartConfirmed`, `Removed`, `HubError`), and `SendDropped`.
     With no events channel (M2), the `Relay` and `HubError` envelopes are logged at debug and
     counted by type in `unhandled`.
+  - A `Command::Join` for a room the session is in (joined and not being left) is answered at
+    once with `Envelope(JOINED, JoinConfirmed)`: a JOINED from the hub's identity with the room
+    and no body, so the relay keeps the member list it has. rrcd would answer a second JOIN on
+    the same link with a JOINED too, but the session does not send one.
   - Commands: `Command` (`Send`, `Join`, `Part`) goes in through an `mpsc` channel of
     `COMMAND_QUEUE` (1024). The relay must send with `try_send`, never `send().await`, so a slow
     or reconnecting session cannot stall the clients of that hub; a full channel drops the
@@ -333,89 +342,190 @@ of time in, commands to the upstream session and envelopes for client links out)
 - **PING** is answered with PONG by the local hub, body echoed, before HELLO too: the M1 local hub
   did so, and a client may PING to check a fresh link. This differs from rrcd, which wants HELLO
   first. PONGs from clients are ignored.
-- **JOIN.** The room name is checked as rrcd checks it (missing, empty after normalising, longer
-  than `max_room_name_bytes`), with rrcd's error texts.
-  - A room the bouncer is in upstream: answered at once with a JOINED from the local hub, carrying
-    the room's member list (identity hashes, one per upstream link, kept from the upstream JOINED
-    and the JOINED/PARTED that follow) when the hub sends member lists.
-  - Otherwise, at `max_rooms_per_session` rooms joined: `ERROR` `"too many rooms"`.
+- **JOIN.** Checked in rrcd's order (`router.py` `_handle_join`, `service.py` `_norm_room`), with
+  rrcd's texts, none naming a room unless said:
+  - No room, or an empty string: `"JOIN requires room name"`.
+  - A room the bouncer is in upstream: answered at once with a JOINED from the local hub (below).
+  - The room set (the session's room set and joined rooms in `status`, with the rooms clients'
+    JOINs added that the session has not taken yet) has `max_rooms_per_session` rooms and this is
+    not one of them, or the session holds it over the limit (`rooms_over_limit`):
+    `"too many rooms"`, naming the room (normalised) when it has a name. rrcd counts the rooms
+    of the link; the room set is what the session will try to join on it.
+  - Normalising: `"room name must not be empty"` (whitespace only), `"room name too long: <n>
+    bytes > <max> bytes"`.
+  - No upstream session (between `Down` and `Up`): `"hub not connected: <room> not joined"`,
+    naming the room, and the room set is not changed. That holds for a room already in the room
+    set too: the client is told now instead of waiting for a link that may be minutes away, and
+    can JOIN again.
   - Otherwise `Command::Join` goes to the session, which adds the room to the room set file and
-    joins it; the client waits. The hub's JOINED goes to every client waiting for that room (with
-    `K_SRC` rewritten, below); a refusal (`ERROR` naming the room) goes to them as it is, and a
-    room the client's JOIN added leaves the room set again, so it is not tried at every connect.
+    joins it; the client waits. The JOINED (the hub's, or the session's own for a room it is in)
+    goes to every client waiting for that room; a refusal (`ERROR` naming the room) goes to them
+    as it is, and a room the client's JOIN added leaves the room set again, so it is not tried at
+    every connect. A full command queue: `ERROR` `"the bouncer is busy: try the JOIN again"`,
+    counted in `relay_drops`. When the session goes down, every client still waiting gets
+    `"hub not connected: <room> not joined"`, and the rooms clients added that were never joined
+    leave the room set.
+  - The JOINED a client gets is the local hub's: `K_SRC` the local hub, and, when the hub sends
+    member lists, the members (identity hashes) kept from the upstream JOINED and the JOINED and
+    PARTED that follow. The list is a set, each identity once in the order it came: rrcd lists one
+    hash per link and sends a PARTED only when an identity's last link leaves, so a list with
+    repeats could never be emptied. The user comes first, then the others in order, as many as
+    keep the envelope within one link packet (`LINK_MDU`, 431 bytes, about 20 members); rrcd
+    itself puts no cap on its member list.
   - M4 replays history right after the JOINED: `Relay::replay`.
-  - A command queue that is full: `ERROR` `"the bouncer is busy: try the JOIN again"`, counted in
-    `relay_drops`.
-- **PART.** Answered with PARTED (body the parting identity when the hub sends member lists),
-  whether the client was in the room or not, as rrcd does. With `part_upstream = false` (the
-  default) the bouncer stays in the room upstream and only that client's view ends; the other
-  clients and the upstream room see nothing. With `part_upstream = true` the room goes:
-  `Command::Part` to the session, and PARTED to every other client in the room.
-- **MSG, ACTION, NOTICE.** Passed upstream unchanged (`K_ID`, `K_TS`, `K_NICK`, `K_FMT` and every
-  unknown key, byte for byte) as `Command::Send`, counted in `relayed_in`. A full command queue
-  drops it with `ERROR` `"not sent to the hub: the bouncer's queue is full"` to the sender; a
+- **PART.** Checked as rrcd does: no room or an empty string is `"PART requires room name"`, then
+  the name is normalised. Answered with PARTED (body the parting identity when the hub sends
+  member lists), whether the client was in the room or not, as rrcd does.
+  - `part_upstream = false` (the default): the bouncer stays in the room upstream and only that
+    client's view ends; the other clients and the upstream room see nothing.
+  - `part_upstream = true`, from a client in the room (joined or waiting for it): `Command::Part`
+    to the session, PARTED to every other client in the room, and the relay takes the room as
+    left at once, as the session does whether the hub answers or not, so a JOIN right after goes
+    upstream again. A PART from a client not in the room is answered with PARTED and nothing else.
+- **MSG, ACTION, NOTICE.** A MSG or NOTICE whose text body, trimmed, starts with `/` is a slash
+  command, whatever its room or `K_DST`, as rrcd decides before anything else (`router.py`
+  `_handle_message`). The others are checked as rrcd checks them before it looks at a room's
+  state, in its order, and refused locally with rrcd's text (no room named): MSG or ACTION with
+  no room or an empty one, `"message requires room name"`; a text body over `max_msg_body_bytes`,
+  `"message too large: <n> bytes > <max> bytes"`; a NOTICE with `K_DST` and a room,
+  `"direct notice must not include room"`; a room that does not normalise, the room name texts. A
+  NOTICE with neither room nor `K_DST` is dropped without a word, as rrcd drops it. What passes
+  goes upstream as `Command::Send`, counted in `relayed_in`: `K_ID`, `K_TS`, `K_FMT` and every
+  unknown key byte for byte, and `K_NICK` replaced by the hub's `nick` when one is configured
+  (the session's HELLO and JOIN carry it too). rrcd sets the session's nick from every MSG,
+  ACTION and NOTICE, so with no `nick` configured each client's own `K_NICK` goes up as it is and
+  the bouncer's nick upstream changes with whichever client spoke last. A full command queue drops
+  the envelope with `ERROR` `"not sent to the hub: the bouncer's queue is full"` to the sender; a
   `SendDropped` from the session ([Upstream session](#upstream-session)) gives the sender
   `"not sent to the hub: <reason>"`. The upstream session's token bucket is the one rate limit all
   clients share.
-- **Echo and once-only delivery.** Each client must see each envelope once, its own included
-  (weechat-rrc and rBrowser2 draw a line only when the hub echoes it), and must not see what the
-  hub refused.
-  - Room envelopes: the relay shows a client's envelope to no one when it sends it. rrcd sends a
-    room envelope to every member of the room, the sending link included, so the bouncer's own
-    link gets every client's envelope back, with its `K_ID`, `K_FMT` and other keys and `K_SRC`
-    the user. That copy is relayed to every client in the room, the sender included. So each
-    client gets it exactly once, the sender's copy is its echo, and an envelope the hub refuses
-    (rate limited, `+m`, too large) is shown nowhere. The cost is a round trip before the sender
-    sees its line, which a direct client of rrcd pays too. Relaying to the other clients at once
-    and echoing locally would show refused envelopes, and dropping the hub's copy by `K_ID` would
-    need a list of ids in flight; neither buys anything.
+- **Echo and once-only delivery.** Each client sees each envelope once, and the sender of a
+  refused envelope is told.
+  - Room envelopes: rrcd sends a room envelope to every member of the room, the sending link
+    included, so the bouncer's own link gets every client's envelope back, with its `K_ID`,
+    `K_FMT` and other keys and `K_SRC` the user. The relay sends nothing to anyone when a client
+    sends, and relays that echo to every client in the room, the sender included. The other
+    clients show it once. weechat-rrc (`rrc.c:792`), rBrowser2 (`rrc.py:1606-1608`, `1859`) and
+    NomadNet (`RRC.py:667-671`, `1153`) draw their own MSG and ACTION when they send it and drop
+    the hub's echo by its `K_ID`, so the sender shows it once too, at once, with no round trip;
+    a line the hub refuses (`+m`, rate limited) still shows in the sender's own client, as it
+    does for a direct client of rrcd, and the ERROR follows it. Relaying to the other clients at
+    once instead would show them lines the hub refused.
   - Direct NOTICE (`K_DST`, no room): rrcd sends it only to its destination, with no echo. When
-    the relay passes one upstream it gives a copy with `K_SRC` the user to every client of the
-    local hub, the sender included, so the user's other clients see what was said. No copy when
-    it is addressed to the user (the hub sends that one back to the bouncer's link, and it is
-    relayed like any direct NOTICE), when it carries a room (rrcd refuses it), or while there is
-    no upstream session. A direct NOTICE the hub then refuses (`destination not connected`) has
-    been shown already; the sender also gets the ERROR.
-- **Envelopes from upstream.** JOINED and PARTED of others update the member lists. Every envelope
-  is passed to `Relay::record` (M4 history) and then sent to:
-  - with a room: every client in that room;
+    the relay passes one upstream it gives a copy with `K_SRC` the user to the user's other
+    clients, not the sender, which drew its own; so the user's other clients see what was said.
+    No copy when it is addressed to the user (the hub sends that one back to the bouncer's link,
+    and it is relayed to every client like any direct NOTICE), when it is a slash command, when
+    it carries a room (refused above), or while there is no upstream session. A direct NOTICE the
+    hub then refuses (`destination not connected`) has been shown already; the sender also gets
+    the ERROR.
+- **Envelopes from upstream.** `K_SRC` is rewritten from the upstream hub's identity to the local
+  hub's, so a client can tell the hub's own envelopes from the user's; every other `K_SRC` is
+  passed on as it is. Counted per client in `relayed_out`, with the local hub's own answers
+  (WELCOME, JOINED, PARTED, ERROR). JOINED and PARTED of others update the member lists. They go
+  to:
+  - with a room: every client in that room. A NOTICE from the hub naming a room is first checked
+    against the room's join and the commands waiting (below).
   - with `K_DST` and no room (a direct NOTICE to the user): every client;
-  - with neither: a NOTICE within 10 s (`COMMAND_REPLY_WINDOW`) of a client's slash command goes
-    to that client (rrcd answers commands with room-less NOTICEs to the issuing link); anything
-    else goes to every client.
-  `K_SRC` is rewritten from the upstream hub's identity to the local hub's, so a client can tell
-  the hub's own envelopes from the user's; every other `K_SRC` is passed on as it is. Counted per
-  client in `relayed_out`, with the local hub's own answers (WELCOME, JOINED, PARTED, ERROR).
+  - a NOTICE from the hub with neither: the greeting while it is being taken (below), else the
+    answer to the oldest command waiting (below), else every client;
+  - anything else with neither: every client.
   A hub kicking the bouncer from a room (`Removed`) is passed to the clients in it, who leave it.
+- **Greeting.** rrcd follows its WELCOME with the `greeting` as room-less NOTICEs from the hub,
+  one per line. At `Up` the relay forgets the last greeting and, for 10 s (`GREETING_WINDOW`),
+  takes room-less, `K_DST`-less NOTICEs from the hub as the greeting: each goes to every welcomed
+  client and is kept (at most 16, `MAX_GREETING`). Any other envelope from the hub (the JOINED
+  that answers the session's first JOIN comes next), or a client's command going upstream, ends
+  it. A client's HELLO is answered with the WELCOME and then the kept greeting, `K_SRC` the local
+  hub, as a client of rrcd gets it. A greeting rrcd sends as a Resource (over 512 bytes, with
+  resources on) is not relayed until M5.
+- **Commands.** rrcd answers a slash command on the link it came from, with one NOTICE per line of
+  the reply (`commands.py` `emit_notice`; `/list` and `/who` send one, with no room), or with an
+  ERROR; some (`/mode`, `/topic`) also tell the room with a NOTICE naming it. Replies carry no
+  `K_ID`, so the relay keeps the commands it sent upstream in order (`pending_commands`, at most
+  1024), as the hub answers them in order on the one link:
+  - A room-less NOTICE from the hub, outside the greeting, answers the oldest command waiting and
+    goes to its client alone; that command is done.
+  - A NOTICE from the hub naming a room answers the oldest command waiting if that command named
+    the same room (normalised): it goes to that client and to every client in the room, and the
+    command is done. Otherwise it is the room's: every client in the room, and history.
+  - The NOTICE rrcd sends after every JOINED (`room <r>: <registered>; mode=<m>; topic=<t>`) is
+    not a command's answer: a NOTICE with that text within 10 s of the room being joined goes to
+    the room.
+  - An ERROR answering a command (below) answers the oldest command waiting, if it names no room
+    or the command's room.
+  - A command waits at most 75 s (`ANSWER_WAIT`: the session may hold it 60 s, `CLIENT_HOLD`, and
+    the hub answers within seconds). A command dropped by the session (`SendDropped`) is done.
+  A reply of several NOTICEs is taken as several answers: the first NOTICE goes to the command's
+  client, the rest to the next commands waiting, or to every client when none is. rrcd's own
+  commands answer with one NOTICE each; a multi-line reply and a later command waiting at the
+  same time can send the later lines to the wrong client.
 - **ERROR routing.** rrcd's ERRORs carry no `K_ID`, so the relay keeps the last 1024 client
-  envelopes it sent upstream (`sent`: id, link, room, kind) and blames one:
+  envelopes it sent upstream that are not commands (`sent`: id, link, type, room, kind) and finds
+  the one an ERROR answers by its text (`error_answers`, every text rrcd 0.3.2 sends):
   - `SendDropped` names its envelope by `K_ID`: the ERROR goes to that envelope's sender.
-  - A hub ERROR's text gives the kind of envelope it answers, from rrcd's texts: direct NOTICE
-    (`destination not connected`, ...), slash command (`unrecognized command`) or room envelope
-    (`no such room`, `banned from room`, `room is moderated (+m)`, ...); texts any of them may get
-    (`rate limited`, `message too large: ...`) give none. With a room in the ERROR, only envelopes for
-    that room fit.
-  - Room envelopes leave the list at their echo, so the oldest that fits is the one the hub is
-    answering. Direct NOTICEs and commands are answered only when refused, so they leave by age
-    (15 s, `ANSWER_WAIT`; room envelopes 120 s, `ECHO_WAIT`, as the session may hold them 60 s),
-    and the newest that fits is the likeliest. The blamed envelope leaves the list.
-  - No envelope fits: the ERROR goes to every client, so it is never lost.
+  - A room envelope for the ERROR's room (normalised): `no such room`, `no outside messages (+n)`,
+    `banned from room`, `room is moderated (+m)`. The oldest that fits: room envelopes leave the
+    list at their echo, so the oldest left is the one the hub is answering.
+  - A room envelope with no room: `message requires room name`. Any MSG or ACTION: `message too
+    large: …`. The oldest. (The relay refuses both itself, so the hub sends them only for a limit
+    that changed.)
+  - A direct NOTICE: `destination not connected`, `direct notice must not include room`, `direct
+    notice requires destination identity`. The newest: direct NOTICEs are answered only when
+    refused, so they leave the list only by age.
+  - A command (above): `unrecognized command`, `not authorized`, `not authorized (+t)`, `only the
+    room founder can register`, `only the room founder can unregister`, `invite failed: …`.
+  - The session's own JOIN, PART or HELLO: `JOIN requires room name`, `too many rooms`,
+    `invite-only (+i)`, `bad key (+k)`, `PART requires room name`, `send HELLO first`, `room name
+    …`. Logged; no client gets it (the session handles a refused JOIN, below the relay).
+  - Every client: `rate limited`, `bad message: …`, the resource errors, `kicked from <r>` and
+    `banned from <r>` that are not the bouncer's removal, and any text not listed. rrcd's
+    `rate limited` names no envelope, and the session cannot tell which of its packets the hub
+    dropped (one of its own, or a client's), so every client is told and no entry leaves the
+    list.
+  - The blamed envelope leaves the list. No envelope fits: the ERROR goes to every client, so it
+    is never lost.
+  - Entries leave by age: a room envelope 120 s after it was sent (`ECHO_WAIT`; the session may
+    hold it 60 s) when the bouncer is in its room or about to be, and 75 s (`ANSWER_WAIT`) for a
+    room envelope to a room outside the room set (it gets no echo) or a direct NOTICE.
+  - When the session goes down, every entry and waiting command is marked stale: nothing sent on
+    the old link is answered on the next, so no ERROR is blamed on it, but a `SendDropped` for it
+    (the session reports what it still held) still reaches its sender. A client link that closes
+    takes its entries with it.
 - **RESOURCE_ENVELOPE**, either way, is logged and dropped until M5 relays Resources; the WELCOME's
   cap `0` tells clients not to send one.
+- **The task.** `relay::run` selects over the client links' events, the session's events and a 1 s
+  tick, unbiased, so a busy source (a chatty room, a flood of client packets) cannot starve the
+  others.
+  - rsReticulum queues a link's last packets before its close event, on separate channels, so on
+    a close the task first takes every link establishment and every packet already queued, then
+    closes the link.
+  - An identity from the gate for a link no longer in the gate's map (it closed before the
+    identity was read) is ignored, so a closed link is not brought back.
+  - Each send to a client link is given 2 s (`SEND_TIMEOUT`); one that takes longer is given up,
+    counted in `relay_drops` and logged, so a client link that does not drain cannot hold up the
+    other clients or the session's events.
+- **History hooks (M4).** `Relay::record` is called with every envelope the hub sends to a room as
+  a whole: room MSG, ACTION and NOTICE (the hub's room NOTICEs included, not a command's answer
+  to one client), other members' JOINED and PARTED, and the ERROR that removes the bouncer from
+  the room (kick, ban). It is not called for direct NOTICEs, room-less NOTICEs (greeting, command
+  answers), ERRORs answering a client, or the bouncer's own JOINED and PARTED (the session's).
+  The hub's echo of a client's envelope is a room envelope like any other, so each client
+  envelope is recorded once, as the hub delivered it. `Relay::replay` is called after each JOINED
+  a client gets.
 - **Status.** Each `hubs` entry in `status.json` adds `clients`, `client_identities` (one per
   link, sorted), `refused_links`, `relayed_in`, `relayed_out` and `relay_drops`. A change of
   clients writes the file at once.
 - **Limitations.**
   - A client's JOIN key (`+k`) is not passed upstream: the session joins with none.
-  - A JOIN waits with no answer when the session cannot join the room (over its own room limit);
-    the client sees the room when it is joined.
   - A JOIN answered locally is not followed by the room status NOTICE rrcd sends after a JOIN.
   - Clients of the same local hub see no JOINED or PARTED for each other: upstream they are one
     link.
   - Clients are not told when the upstream link goes down; their envelopes get `SendDropped`
     ERRORs.
-  - An ERROR that names no kind goes to the newest client envelope that fits, which with two
-    clients sending at once may be the wrong one.
+  - Two direct NOTICEs in flight from two clients: a refusal goes to the newer one's sender.
+  - The greeting is taken by time and position; a hub that sends some other room-less NOTICE
+    within 10 s of its WELCOME, before anything else, has it kept as greeting too.
 
 ## History
 
@@ -449,7 +559,7 @@ See `contrib/config.example.toml`.
 | `[history] days / max_mb / replay_hours / replay_max` | `30 / 100 / 24 / 100` | Above; `days` and `max_mb` at least 1, `replay_*` 0 turns replay off |
 | `[[hub]] address` | required | The upstream hub's `rrc.hub` destination hash |
 | `[[hub]] rooms` | `[]` | Rooms to be in from the start (more are added by clients' JOINs and kept in the room set file). Trimmed and lowercased as rrcd does (`service.py:507`), duplicates dropped, an empty name refused |
-| `[[hub]] nick` | none | `K_NICK` the bouncer uses on its own envelopes (HELLO, JOIN, PART, PING; not PONG, as rrcd's has none); empty means none |
+| `[[hub]] nick` | none | `K_NICK` the bouncer uses on its own envelopes (HELLO, JOIN, PART, PING; not PONG, as rrcd's has none) and puts on every client MSG, ACTION and NOTICE it sends upstream; empty means none, and then each client's own nick goes up, so the bouncer's nick on the hub changes with whichever client spoke last |
 
 At least one `[[hub]]` is required, and each address may appear once. Unknown keys are refused, so
 a typo is an error rather than a silent default.
@@ -563,15 +673,24 @@ As of M3:
   4`, two driven Python clients A and B under the user's identity on the local hub (B says HELLO
   in the same breath as its identify, as NomadNet does) and one, D, directly on rrcd under an
   identity of its own, all in `lobby`. They check: A and B get the WELCOME with the upstream's
-  name `(via rrc-bouncer)` and its caps and limits (`resource_envelope` off); each JOIN gets a
+  name `(via rrc-bouncer)` and its caps and limits (`resource_envelope` off), then rrcd's greeting
+  (`K_SRC` the local hub, no room), B though it linked after the greeting was sent; each JOIN gets a
   JOINED with the member list; MSG, ACTION and direct NOTICE from A, B and D, each reaching every
   client exactly once with its original `K_ID`, `K_FMT` kept, `K_SRC` the user or D, and the
-  sender's echo; a direct NOTICE to an identity that is not connected gives an ERROR to its sender
+  sender's echo, a direct NOTICE from A or B reaching the other and D but not its sender; D sees
+  the nick `bnc` on everything A and B send; A's MSG to a room that does not exist and B's MSG to
+  `lobby`, sent together, give the ERROR to A alone while B gets its echo; A's `/list` and B's
+  `/who lobby`, sent together, each get their own answer and nothing of the other's; a direct NOTICE to an identity that is not connected gives an ERROR to its sender
   only; a JOIN of a new room joins upstream, gets the room's NOTICE with `K_SRC` the local hub and
   is saved in the room set file; a JOIN over the limit gets `too many rooms`; A's PART leaves the
   bouncer in the room (D sees no PART, B still gets D's MSG and A does not); `status.json` and
   `status` show the clients and the relayed counts; a client of another identity gets ERROR and
-  is closed, and after a restart with that identity in `allowed_identities` it is welcomed.
+  is closed, and after a restart with that identity in `allowed_identities` it is welcomed; no
+  driven client logs an error handling what it got.
+  A `part_upstream = true` phase follows: A's PART gives A a PARTED and D a PARTED of the user; A's
+  JOIN right after joins upstream again (D sees the JOINED); D's MSG reaches A; with rrcd stopped, a
+  JOIN gets `hub not connected: side not joined`, and once rrcd is back and the session has
+  rejoined, the same JOIN is answered with a JOINED.
   The phases' start waits are generous (Python peers 180 s, rrcd 120 s) so a loaded host does not
   fail them.
   `RRC_BOUNCER_PING_SECS` (the idle PING and the PONG wait) and `RRC_BOUNCER_BACKOFF_SECS` (the

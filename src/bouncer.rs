@@ -16,7 +16,7 @@ use crate::config::{RnsAccess, Settings};
 use crate::identity::{HUB_ASPECT, create_private_dir, hub_address, load_identity, load_or_create_hub_identity};
 use crate::relay::{self, LinkIdentities, LocalHub, Relay, RelayConfig, RelayStatus, SharedRelayStatus};
 use crate::rooms::RoomSet;
-use crate::upstream::{self, COMMAND_QUEUE, EVENT_QUEUE, SharedStatus, Timings, Upstream, UpstreamStatus};
+use crate::upstream::{self, COMMAND_QUEUE, SharedStatus, Timings, Upstream, UpstreamStatus};
 
 /// How long to wait after starting before the first announce, so
 /// interfaces have come up.
@@ -332,13 +332,14 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         let shared = SharedStatus::default();
         let relay_status = SharedRelayStatus::default();
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
-        let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
+        let (event_tx, event_rx) = upstream::event_channel();
         let relay = Relay::new(RelayConfig {
             hub_identity,
             user: identity.hash,
             upstream,
             allowed: allowed.clone(),
             part_upstream: settings.part_upstream,
+            nick: hub.nick.clone(),
             commands: command_tx,
             session: shared.clone(),
             status: relay_status.clone(),

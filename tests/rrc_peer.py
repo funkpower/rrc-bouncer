@@ -23,6 +23,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 
 import cbor2
 import RNS
@@ -206,7 +207,7 @@ def driven(args, identity):
     def send(env):
         RNS.Packet(link, cbor2.dumps(env)).send()
 
-    def on_packet(data, packet):
+    def handle(data):
         try:
             env = cbor2.loads(data)
         except Exception as e:
@@ -219,6 +220,12 @@ def driven(args, identity):
         if t == T_PING:
             send(envelope(identity, T_PONG, body=env.get(K_BODY)))
 
+    def on_packet(data, packet):
+        try:
+            handle(data)
+        except Exception:
+            emit(args.events, event="error", error=traceback.format_exc())
+
     link = RNS.Link(destination, established_callback=lambda _l: established.set(),
                     closed_callback=lambda _l: closed.set())
     link.set_packet_callback(on_packet)
@@ -230,31 +237,41 @@ def driven(args, identity):
     if args.hello_delay > 0:
         time.sleep(args.hello_delay)
     send(envelope(identity, T_HELLO, body={0: "e2e-driven", 1: 1, 2: {}}, nick=args.nick))
+
+    def carry_out(line):
+        command = json.loads(line)
+        op = command["op"]
+        if op in ("join", "part"):
+            env = envelope(identity, T_JOIN if op == "join" else T_PART, room=command["room"], nick=args.nick)
+        else:
+            env = envelope(identity, command["t"], room=command.get("room"), body=command.get("body"),
+                           nick=command.get("nick", args.nick))
+            if "dst" in command:
+                env[K_DST] = bytes.fromhex(command["dst"])
+            if "fmt" in command:
+                env[K_FMT] = command["fmt"]
+        if "id" in command:
+            env[K_ID] = bytes.fromhex(command["id"])
+        send(env)
+        emit(args.events, event="sent", op=op, id=env[K_ID].hex())
+
+    # Only whole lines are read: the test may be halfway through writing
+    # the last one.
     done = 0
     while not closed.wait(0.1):
         try:
             with open(args.commands) as f:
-                lines = f.read().splitlines()
+                text = f.read()
         except FileNotFoundError:
             continue
+        lines = text[:text.rfind("\n") + 1].splitlines()
         for line in lines[done:]:
             if not line.strip():
                 continue
-            command = json.loads(line)
-            op = command["op"]
-            if op in ("join", "part"):
-                env = envelope(identity, T_JOIN if op == "join" else T_PART, room=command["room"], nick=args.nick)
-            else:
-                env = envelope(identity, command["t"], room=command.get("room"), body=command.get("body"),
-                               nick=command.get("nick", args.nick))
-                if "dst" in command:
-                    env[K_DST] = bytes.fromhex(command["dst"])
-                if "fmt" in command:
-                    env[K_FMT] = command["fmt"]
-            if "id" in command:
-                env[K_ID] = bytes.fromhex(command["id"])
-            send(env)
-            emit(args.events, event="sent", op=op, id=env[K_ID].hex())
+            try:
+                carry_out(line)
+            except Exception:
+                emit(args.events, event="error", error=traceback.format_exc())
         done = len(lines)
     emit(args.events, event="closed", session=1)
 
