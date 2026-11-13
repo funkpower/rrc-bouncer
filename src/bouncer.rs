@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: LicenseRef-Reticulum
 //! Starting Reticulum and running the local hubs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ciborium::Value;
@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::config::{RnsAccess, Settings};
-use crate::envelope::{Envelope, MessageType};
 use crate::identity::{HUB_ASPECT, create_private_dir, hub_address, load_identity, load_or_create_hub_identity};
+use crate::relay::{self, LinkIdentities, LocalHub, Relay, RelayConfig, RelayStatus, SharedRelayStatus};
 use crate::rooms::RoomSet;
-use crate::upstream::{self, COMMAND_QUEUE, SharedStatus, Timings, Upstream, UpstreamStatus};
+use crate::upstream::{self, COMMAND_QUEUE, EVENT_QUEUE, SharedStatus, Timings, Upstream, UpstreamStatus};
 
 /// How long to wait after starting before the first announce, so
 /// interfaces have come up.
@@ -88,6 +88,9 @@ pub struct HubStatus {
     /// The upstream session (M2).
     #[serde(flatten)]
     pub link: UpstreamStatus,
+    /// The local hub's clients (M3).
+    #[serde(flatten)]
+    pub relay: RelayStatus,
 }
 
 /// `state_dir/status.json`.
@@ -111,6 +114,7 @@ pub fn hubs(settings: &Settings) -> Result<(String, Vec<HubStatus>), String> {
             upstream: hex::encode(hub.address),
             local_hub: hex::encode(hub_address(&local.hash)),
             link: UpstreamStatus::default(),
+            relay: RelayStatus::default(),
         });
     }
     Ok((hex::encode(identity.hash), hubs))
@@ -159,97 +163,6 @@ async fn start_reticulum(settings: &Settings, shutdown: ShutdownSignal) -> Resul
         tracing::warn!("interface {name} failed to start: {reason}");
     }
     Ok(runtime)
-}
-
-/// The identity each link of a local hub identified as, filled in by the
-/// hub's identity gate.
-type LinkIdentities = Arc<Mutex<HashMap<[u8; 16], [u8; 16]>>>;
-
-/// The identity gate of a local hub. rsReticulum calls it on the link
-/// manager's task while it handles a link's LinkIdentify packet, before it
-/// handles any later packet on that link (`IdentityGatePolicy`,
-/// `rns-runtime/src/destination_runtime.rs:88-93`, called from
-/// `link_manager.rs:2973-2977`). So when a packet reaches `local_hub_events`
-/// the link's identity is already here, whatever order the separate
-/// `links_identified` and `link_packets` channels are read in; the
-/// `links_identified` event is only logged (it is sent with `try_send` on a
-/// bounded channel and can be dropped). Every identity is let through; a
-/// link of another identity gets no answers.
-fn identity_gate(identities: LinkIdentities) -> IdentityGatePolicy {
-    IdentityGatePolicy::new(move |link, identity| {
-        if let Ok(mut map) = identities.lock() {
-            map.insert(link, identity);
-        }
-        true
-    })
-}
-
-fn link_identity(identities: &LinkIdentities, link: &[u8; 16]) -> Option<[u8; 16]> {
-    identities.lock().ok().and_then(|map| map.get(link).copied())
-}
-
-/// A local hub's link events. Until the relay exists it only logs links
-/// and answers PING from the user's own clients.
-async fn local_hub_events(
-    mut hub: RegisteredDestination,
-    hub_identity: [u8; 16],
-    allowed: Vec<[u8; 16]>,
-    identities: LinkIdentities,
-) {
-    let tag = hex::encode(hub.handle.destination_hash());
-    let events = &mut hub.events;
-    loop {
-        tokio::select! {
-            // Established and identified before packets, so the log reads
-            // in order (the PING answer does not depend on it, see
-            // `identity_gate`). Closed after packets: rsReticulum queues a
-            // link's last packets before its close event, and they are
-            // still handled.
-            biased;
-            Some(link) = events.links_established.recv() => {
-                tracing::info!("hub {tag}: link {} established", hex::encode(link));
-            }
-            Some((link, identity)) = events.links_identified.recv() => {
-                tracing::info!(
-                    "hub {tag}: link {} identified as {}{}",
-                    hex::encode(link),
-                    hex::encode(identity),
-                    if allowed.contains(&identity) { "" } else { " (not allowed)" }
-                );
-            }
-            Some((data, link)) = events.link_packets.recv() => {
-                if !link_identity(&identities, &link).is_some_and(|id| allowed.contains(&id)) {
-                    tracing::debug!("hub {tag}: ignored a packet on a link not identified as an allowed identity");
-                    continue;
-                }
-                match Envelope::decode(&data) {
-                    Ok(env) if env.t == MessageType::Ping => {
-                        // The hub's own envelopes carry its identity in K_SRC.
-                        let mut pong = Envelope::new(MessageType::Pong, &hub_identity);
-                        pong.body = env.body;
-                        if let Err(e) = hub.handle.send_link_packet(link, pong.encode()).await {
-                            tracing::warn!("hub {tag}: could not answer PING: {e}");
-                        }
-                    }
-                    Ok(env) => tracing::debug!("hub {tag}: {:?} not handled yet", env.t),
-                    Err(e) => tracing::debug!("hub {tag}: {e}"),
-                }
-            }
-            Some(link) = events.links_closed.recv() => {
-                if let Ok(mut map) = identities.lock() {
-                    map.remove(&link);
-                }
-                tracing::info!("hub {tag}: link {} closed", hex::encode(link));
-            }
-            Some(_) = events.packets.recv() => {}
-            Some(_) = events.link_packet_proofs.recv() => {}
-            Some(_) = events.resource_completions.recv() => {}
-            Some(_) = events.resource_proofs.recv() => {}
-            Some(_) = events.resource_events.recv() => {}
-            Some(_) = events.channel_messages.recv() => {}
-            else => break,
-        }
-    }
 }
 
 /// Announce each local hub. The app data is the hub's default, which names
@@ -338,10 +251,13 @@ fn write_status(settings: &Settings, status: &Status) {
     }
 }
 
-fn show_sessions(status: &mut Status, sessions: &[SharedStatus]) {
-    for (hub, shared) in status.hubs.iter_mut().zip(sessions) {
-        if let Ok(link) = shared.lock() {
+fn show_sessions(status: &mut Status, sessions: &[(SharedStatus, SharedRelayStatus)]) {
+    for (hub, (session, relay)) in status.hubs.iter_mut().zip(sessions) {
+        if let Ok(link) = session.lock() {
             hub.link = link.clone();
+        }
+        if let Ok(relay) = relay.lock() {
+            hub.relay = relay.clone();
         }
     }
     status.updated_at = now();
@@ -372,10 +288,6 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     let mut tasks = Vec::new();
     let mut sessions = Vec::new();
     let mut session_status = Vec::new();
-    // The command senders the relay (M3) will use (with `try_send`; see
-    // `upstream::COMMAND_QUEUE`); held so the sessions' command channels
-    // stay open.
-    let mut commands = Vec::new();
     let mut announced = Vec::new();
     let mut status = Status {
         pid: std::process::id(),
@@ -389,6 +301,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         let upstream = hub.address;
         let hub_identity = local.hash;
         let identities = LinkIdentities::default();
+        let (identified_tx, identified_rx) = mpsc::unbounded_channel();
         let registered = runtime
             .register_destination(
                 local,
@@ -397,7 +310,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
                     proof_strategy: ProofStrategy::ProveNone,
                     resource_strategy: ResourceStrategy::AcceptNone,
                     default_app_data: Some(hub_app_data(&local_hub_name(&upstream))),
-                    identity_gate: Some(identity_gate(identities.clone())),
+                    identity_gate: Some(relay::identity_gate(identities.clone(), identified_tx)),
                     ..DestinationRuntimeOptions::default()
                 },
             )
@@ -413,11 +326,23 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             upstream: hex::encode(upstream),
             local_hub: hex::encode(address),
             link: UpstreamStatus::default(),
+            relay: RelayStatus::default(),
         });
         announced.push(registered.handle.clone());
         let shared = SharedStatus::default();
+        let relay_status = SharedRelayStatus::default();
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
-        commands.push(command_tx);
+        let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE);
+        let relay = Relay::new(RelayConfig {
+            hub_identity,
+            user: identity.hash,
+            upstream,
+            allowed: allowed.clone(),
+            part_upstream: settings.part_upstream,
+            commands: command_tx,
+            session: shared.clone(),
+            status: relay_status.clone(),
+        });
         sessions.push(tokio::spawn(upstream::run(
             Upstream {
                 runtime: runtime.clone(),
@@ -430,18 +355,20 @@ pub async fn run(settings: Settings) -> Result<(), String> {
                 status: shared.clone(),
                 changed: changed.clone(),
                 renamed: renamed.clone(),
-                events: None,
+                events: Some(event_tx),
             },
             command_rx,
             sessions_stop.clone(),
         )));
-        session_status.push(shared);
-        tasks.push(tokio::spawn(local_hub_events(
+        session_status.push((shared, relay_status));
+        tasks.push(tokio::spawn(relay::run(LocalHub {
             registered,
-            hub_identity,
-            allowed.clone(),
             identities,
-        )));
+            identified: identified_rx,
+            events: event_rx,
+            relay,
+            changed: changed.clone(),
+        })));
     }
     let uplink = !settings.announce && matches!(settings.rns, RnsAccess::Tcp { .. });
     if settings.announce {
@@ -495,7 +422,6 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     if tokio::time::timeout(SESSION_STOP, stopping).await.is_err() {
         tracing::warn!("upstream sessions did not stop in {}s", SESSION_STOP.as_secs());
     }
-    drop(commands);
     for task in &tasks {
         task.abort();
     }

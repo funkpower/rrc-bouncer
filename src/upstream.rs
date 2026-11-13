@@ -160,10 +160,11 @@ pub enum Inbound {
     /// rrcd took the bouncer out of a room (`kicked from <room>`, or
     /// `banned from <room>` for a ban that removes members).
     Removed { room: String, reason: String },
-    /// Any other ERROR. Most answer a client's envelope (M3 routes it to
-    /// the client that caused it); the room state does not change.
+    /// Any other ERROR. Most answer a client's envelope (the relay routes
+    /// it to the client that most likely caused it); the room state does
+    /// not change.
     HubError(String),
-    /// Everything for the relay (M3) and history (M4): MSG, NOTICE, ACTION,
+    /// Everything for the relay and history (M4): MSG, NOTICE, ACTION,
     /// other members' JOINED and PARTED, types this codec does not know.
     Relay,
 }
@@ -597,7 +598,7 @@ pub const COMMAND_QUEUE: usize = 1024;
 pub const EVENT_QUEUE: usize = 4096;
 
 /// What the rest of the bouncer can ask of an upstream session.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Send a client's envelope upstream, sharing the session's rate limit.
     /// With no link it is dropped; while the link waits for its WELCOME, or
@@ -616,8 +617,9 @@ pub enum Command {
 /// What an upstream session tells the rest of the bouncer.
 #[derive(Debug, Clone)]
 pub enum UpstreamEvent {
-    /// The hub welcomed the session.
-    Up(Welcome),
+    /// The hub welcomed the session. `hub` is the hub's identity hash
+    /// (the WELCOME's K_SRC), which the hub's own envelopes carry.
+    Up { welcome: Welcome, hub: Vec<u8> },
     /// The link went.
     Down,
     /// An envelope from the hub, and what the session made of it.
@@ -752,8 +754,9 @@ pub struct Upstream {
     pub changed: Arc<Notify>,
     /// Woken when the local hub's name changes.
     pub renamed: Arc<Notify>,
-    /// None until the relay (M3) consumes them. Make it with
-    /// `EVENT_QUEUE`; the session never waits on it.
+    /// The relay's channel (None: events are only counted, as
+    /// `unhandled`). Make it with `EVENT_QUEUE`; the session never waits
+    /// on it.
     pub events: Option<mpsc::Sender<UpstreamEvent>>,
 }
 
@@ -1000,14 +1003,14 @@ impl Upstream {
                                 welcomed_at = Some(Instant::now());
                                 bucket.set_limit(welcome.limits.rate_limit_msgs_per_minute, Instant::now());
                                 self.welcomed(&welcome).await;
-                                self.emit(UpstreamEvent::Up(welcome));
+                                self.emit(UpstreamEvent::Up { welcome, hub: env.src.clone() });
                             }
                             Inbound::JoinConfirmed(room) => tracing::info!("upstream {tag}: joined {room}"),
                             Inbound::JoinFailed { room, reason } => tracing::warn!("upstream {tag}: could not join {room}: {reason}"),
                             Inbound::PartConfirmed(room) => tracing::info!("upstream {tag}: left {room}"),
                             Inbound::Removed { room, reason } => tracing::warn!("upstream {tag}: out of {room}: {reason}"),
                             Inbound::HubError(reason) => tracing::warn!("upstream {tag}: hub error: {reason} (room={:?})", env.room),
-                            Inbound::Relay => tracing::debug!("upstream {tag}: {:?} room={:?} not relayed yet", env.t, env.room),
+                            Inbound::Relay => tracing::debug!("upstream {tag}: {:?} room={:?}", env.t, env.room),
                         }
                         if !matches!(inbound, Inbound::Handled | Inbound::Welcomed) {
                             if self.events.is_some() {

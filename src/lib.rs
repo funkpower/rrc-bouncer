@@ -12,5 +12,6 @@ pub mod config;
 pub mod envelope;
 pub mod identity;
 pub mod rate;
+pub mod relay;
 pub mod rooms;
 pub mod upstream;
