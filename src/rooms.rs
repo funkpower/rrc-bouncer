@@ -5,6 +5,8 @@
 //! rooms added while the bouncer runs (a client's JOIN, from M3), which are
 //! kept in `state_dir/rooms/<upstream hash>.json` as `{"rooms": [...]}`.
 //! The file holds only the added rooms; the config file stays the user's.
+//! A config room taken out at run time is kept out until the process
+//! restarts (or a JOIN for it), without touching the config file.
 
 use std::path::{Path, PathBuf};
 
@@ -24,6 +26,8 @@ pub struct RoomSet {
     path: PathBuf,
     config: Vec<String>,
     added: Vec<String>,
+    /// Config rooms taken out since start; in memory only.
+    parted: Vec<String>,
 }
 
 fn push_unique(list: &mut Vec<String>, room: String) {
@@ -46,6 +50,7 @@ impl RoomSet {
             path: path.to_path_buf(),
             config: config_rooms,
             added: Vec::new(),
+            parted: Vec::new(),
         };
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -67,20 +72,25 @@ impl RoomSet {
         Ok(set)
     }
 
-    /// Every room, the configured ones first.
+    /// Every room, the configured ones first, without the config rooms
+    /// taken out since start.
     pub fn rooms(&self) -> Vec<String> {
-        let mut all = self.config.clone();
-        for room in &self.added {
-            push_unique(&mut all, room.clone());
+        let mut all = Vec::new();
+        for room in self.config.iter().chain(&self.added) {
+            if !self.parted.contains(room) {
+                push_unique(&mut all, room.clone());
+            }
         }
         all
     }
 
     pub fn contains(&self, room: &str) -> bool {
-        self.config.iter().chain(&self.added).any(|r| r == room)
+        !self.parted.iter().any(|r| r == room) && self.config.iter().chain(&self.added).any(|r| r == room)
     }
 
-    /// Add a room and save the file. False if the set already had it.
+    /// Add a room and save the file. A config room taken out since start
+    /// is back, and the file is not written for it. False if the set
+    /// already had it.
     pub fn add(&mut self, room: &str) -> Result<bool, String> {
         let Some(room) = normalize_room(room) else {
             return Ok(false);
@@ -88,24 +98,33 @@ impl RoomSet {
         if self.contains(&room) {
             return Ok(false);
         }
+        let was_parted = self.parted.len();
+        self.parted.retain(|r| *r != room);
+        if self.parted.len() != was_parted && (self.is_configured(&room) || self.added.contains(&room)) {
+            return Ok(true);
+        }
         self.added.push(room);
         self.save()?;
         Ok(true)
     }
 
-    /// Take a room out of the file. A room from the config file cannot be
-    /// taken out here: it comes back on the next start.
+    /// Take a room out of the set. An added room is taken out of the file;
+    /// a config room is kept out until the process restarts. False if the
+    /// set did not have it.
     pub fn remove(&mut self, room: &str) -> Result<bool, String> {
         let Some(room) = normalize_room(room) else {
             return Ok(false);
         };
+        let present = self.contains(&room);
+        if self.is_configured(&room) {
+            push_unique(&mut self.parted, room.clone());
+        }
         let before = self.added.len();
         self.added.retain(|r| *r != room);
-        if self.added.len() == before {
-            return Ok(false);
+        if self.added.len() != before {
+            self.save()?;
         }
-        self.save()?;
-        Ok(true)
+        Ok(present)
     }
 
     pub fn is_configured(&self, room: &str) -> bool {
@@ -126,10 +145,30 @@ impl RoomSet {
     }
 }
 
-/// Write `data` to `path` through a temporary file (mode 0600) and a rename.
+/// Write `data` to `path` through a temporary file (mode 0600), a rename
+/// and a sync of the directory, so the new contents survive a crash. A
+/// failed write leaves no temporary file behind.
 fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
     let tmp = path.with_extension("tmp");
+    let result = write_and_rename(&tmp, path, data);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn write_and_rename(tmp: &Path, path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -137,10 +176,10 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&tmp)?;
+    let mut file = options.open(tmp)?;
     file.write_all(data)?;
     file.sync_all()?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(tmp, path)
 }
 
 #[cfg(test)]
@@ -179,9 +218,54 @@ mod tests {
         }
         let mut again = again;
         assert!(again.remove("Side").unwrap());
-        assert!(!again.remove("lobby").unwrap());
+        assert!(!again.remove("side").unwrap());
         assert!(again.is_configured("lobby"));
         assert_eq!(RoomSet::load(&path, &config()).unwrap().rooms(), ["lobby", "dev"]);
+    }
+
+    #[test]
+    fn a_parted_config_room_stays_out_until_restart_or_a_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rooms").join("x.json");
+        let mut set = RoomSet::load(&path, &config()).unwrap();
+        assert!(set.remove("Lobby").unwrap());
+        assert!(!set.remove("lobby").unwrap());
+        assert_eq!(set.rooms(), ["dev"]);
+        assert!(!set.contains("lobby"));
+        // Nothing was written for it, and a new start has it again.
+        assert!(!path.exists());
+        assert_eq!(RoomSet::load(&path, &config()).unwrap().rooms(), ["lobby", "dev"]);
+        // A JOIN brings it back in its place, still without a write.
+        assert!(set.add("lobby").unwrap());
+        assert_eq!(set.rooms(), ["lobby", "dev"]);
+        assert!(!path.exists());
+        // A room both in the config and the file: parting takes it out of
+        // both, and it stays out of the file after a restart.
+        assert!(set.add("side").unwrap());
+        std::fs::write(&path, r#"{"rooms": ["dev", "side"]}"#).unwrap();
+        let mut set = RoomSet::load(&path, &config()).unwrap();
+        assert!(set.remove("dev").unwrap());
+        assert_eq!(set.rooms(), ["lobby", "side"]);
+        let file: RoomsFile = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(file.rooms, ["side"]);
+        assert!(set.add("dev").unwrap());
+        assert_eq!(set.rooms(), ["lobby", "dev", "side"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // The target is a directory that is not empty: the rename fails.
+        let path = dir.path().join("x.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), "").unwrap();
+        assert!(write_private(&path, b"{}").is_err());
+        assert!(!dir.path().join("x.tmp").exists());
+        let ok = dir.path().join("y.json");
+        write_private(&ok, b"{}").unwrap();
+        assert_eq!(std::fs::read(&ok).unwrap(), b"{}");
+        assert!(!dir.path().join("y.tmp").exists());
     }
 
     #[test]

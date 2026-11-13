@@ -135,6 +135,11 @@ fn print_upstream(u: &rrc_bouncer::upstream::UpstreamStatus, running: bool) {
         u.rooms.len()
     );
     let mut missing: Vec<String> = u.rooms_failed.iter().map(|(r, why)| format!("{r} ({why})")).collect();
+    missing.extend(
+        u.rooms_retrying
+            .iter()
+            .map(|(r, why)| format!("{r} (trying again: {why})")),
+    );
     let limit = u.hub_limits.as_ref().map(|l| l.max_rooms_per_session);
     missing.extend(u.rooms_over_limit.iter().map(|r| match limit {
         Some(n) => format!("{r} (over the hub's limit of {n} rooms)"),
@@ -169,6 +174,9 @@ fn print_upstream(u: &rrc_bouncer::upstream::UpstreamStatus, running: bool) {
     }
     if u.dropped_sends > 0 {
         println!("    dropped sends    {}", u.dropped_sends);
+    }
+    if u.dropped_events > 0 {
+        println!("    dropped events   {}", u.dropped_events);
     }
 }
 

@@ -39,11 +39,20 @@ pub const CAPS: Caps = Caps {
 pub struct Timings {
     /// No WELCOME this long after the HELLO: the link is dropped.
     pub welcome_timeout: Duration,
-    /// No JOINED or ERROR this long after a JOIN: the room is marked failed.
+    /// No JOINED or ERROR this long after a JOIN: the JOIN is sent again
+    /// later.
     pub join_timeout: Duration,
+    /// The wait before the first retry of a JOIN that got no answer or was
+    /// rate limited; it doubles for each of the `JOIN_FAST_RETRIES`.
+    pub join_retry: Duration,
+    /// The wait between retries after those, for the life of the link.
+    pub join_retry_slow: Duration,
+    /// No PARTED this long after a PART: the room is taken as left.
+    pub part_timeout: Duration,
     /// Nothing heard from the hub this long: the bouncer sends a PING.
     pub ping_idle: Duration,
-    /// No PONG this long after the bouncer's PING: the link is dropped.
+    /// No PONG this long after the bouncer's PING: it PINGs once more, and
+    /// no PONG this long after that drops the link.
     pub pong_timeout: Duration,
     /// The first wait before connecting again.
     pub backoff_initial: Duration,
@@ -58,6 +67,9 @@ impl Default for Timings {
         Self {
             welcome_timeout: Duration::from_secs(30),
             join_timeout: Duration::from_secs(20),
+            join_retry: Duration::from_secs(5),
+            join_retry_slow: Duration::from_secs(300),
+            part_timeout: Duration::from_secs(20),
             ping_idle: Duration::from_secs(120),
             pong_timeout: Duration::from_secs(60),
             backoff_initial: Duration::from_secs(5),
@@ -66,6 +78,11 @@ impl Default for Timings {
         }
     }
 }
+
+/// Retries of a JOIN at the doubling wait before the slow one.
+pub const JOIN_FAST_RETRIES: u32 = 3;
+/// PINGs the bouncer sends without a PONG before it drops the link.
+const PING_TRIES: u32 = 2;
 
 /// Sets both `ping_idle` and `pong_timeout`, in seconds.
 const PING_ENV: &str = "RRC_BOUNCER_PING_SECS";
@@ -128,20 +145,23 @@ impl Backoff {
 /// What the session made of an envelope from the hub.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound {
-    /// PING, PONG, a repeated WELCOME: nothing for anyone else.
+    /// PING, PONG, a repeated WELCOME, a late PARTED for a room already
+    /// taken as left: nothing for anyone else.
     Handled,
     /// The WELCOME: the session is up.
     Welcomed,
     /// The hub's answer to the bouncer's JOIN.
     JoinConfirmed(String),
-    /// An ERROR answering the bouncer's JOIN.
+    /// rrcd refused the bouncer's JOIN (+i, +k, banned, a bad name, too
+    /// many rooms): not tried again on this link.
     JoinFailed { room: String, reason: String },
     /// The hub's answer to the bouncer's PART.
     PartConfirmed(String),
-    /// An ERROR about a room the bouncer is in, which rrcd sends to a
-    /// member it has kicked: the bouncer is no longer in the room.
+    /// rrcd took the bouncer out of a room (`kicked from <room>`, or
+    /// `banned from <room>` for a ban that removes members).
     Removed { room: String, reason: String },
-    /// Any other ERROR.
+    /// Any other ERROR. Most answer a client's envelope (M3 routes it to
+    /// the client that caused it); the room state does not change.
     HubError(String),
     /// Everything for the relay (M3) and history (M4): MSG, NOTICE, ACTION,
     /// other members' JOINED and PARTED, types this codec does not know.
@@ -169,8 +189,31 @@ impl std::fmt::Display for Dead {
 pub struct RoomsView {
     pub wanted: Vec<String>,
     pub joined: Vec<String>,
+    /// Rooms rrcd refused on this link, with its text.
     pub failed: BTreeMap<String, String>,
+    /// Rooms whose JOIN got no answer or was rate limited, with why; they
+    /// are tried again.
+    pub retrying: BTreeMap<String, String>,
     pub over_limit: Vec<String>,
+}
+
+/// rrcd's texts for an ERROR answering a JOIN that names no room
+/// (`router.py` `_handle_join`; the name checks are `service.py`
+/// `_norm_room`, whose texts all start "room name").
+fn join_refusal_without_room(text: &str) -> bool {
+    text == "JOIN requires room name" || text == "too many rooms" || text.starts_with("room name")
+}
+
+/// rrcd's texts for an ERROR naming the room that refuse a JOIN.
+fn join_refusal_with_room(text: &str) -> bool {
+    matches!(text, "invite-only (+i)" | "bad key (+k)" | "banned from room")
+}
+
+/// A JOIN retry: how many have been sent and when the next may go.
+#[derive(Debug, Clone, Copy)]
+struct Retry {
+    attempts: u32,
+    next_at: Instant,
 }
 
 /// One upstream session, from HELLO until the link goes.
@@ -182,10 +225,12 @@ pub struct Session {
     welcome: Option<Welcome>,
     hello_at: Instant,
     last_heard: Instant,
-    ping_sent: Option<Instant>,
+    /// The last PING the bouncer sent and how many in a row lack a PONG.
+    ping_sent: Option<(Instant, u32)>,
     rooms: RoomsView,
     pending_join: Option<(String, Instant)>,
-    parting: Vec<String>,
+    retries: BTreeMap<String, Retry>,
+    parting: Vec<(String, Instant)>,
     outbox: Vec<Envelope>,
 }
 
@@ -206,6 +251,7 @@ impl Session {
                 ..RoomsView::default()
             },
             pending_join: None,
+            retries: BTreeMap::new(),
             parting: Vec::new(),
             outbox: Vec::new(),
         };
@@ -243,25 +289,75 @@ impl Session {
         std::mem::take(&mut self.outbox)
     }
 
+    fn is_joined(&self, room: &str) -> bool {
+        self.rooms.joined.iter().any(|r| r == room)
+    }
+
+    fn is_parting(&self, room: &str) -> bool {
+        self.parting.iter().any(|(r, _)| r == room)
+    }
+
+    fn is_pending(&self, room: &str) -> bool {
+        self.pending_join.as_ref().is_some_and(|(r, _)| r == room)
+    }
+
+    /// Whether a client envelope for `room` may go now. Until the WELCOME
+    /// nothing may; after it, an envelope for a room of the room set waits
+    /// until the room is joined, unless the hub will not have the bouncer
+    /// in it on this link (refused, over the limit), when the hub's answer
+    /// is for the client. Envelopes for other rooms, or none, go at once.
+    pub fn may_send(&self, room: Option<&str>) -> bool {
+        if self.welcome.is_none() {
+            return false;
+        }
+        let Some(room) = room.and_then(crate::config::normalize_room) else {
+            return true;
+        };
+        !self.rooms.wanted.contains(&room)
+            || self.is_joined(&room)
+            || self.rooms.failed.contains_key(&room)
+            || self.rooms.over_limit.contains(&room)
+    }
+
     /// Stay in `room` from now on (it is joined at the next `tick`).
     pub fn want(&mut self, room: &str) {
         if !self.rooms.wanted.iter().any(|r| r == room) {
             self.rooms.wanted.push(room.to_string());
         }
-        // Asked for again: try again.
+        // Asked for again: try again, now.
         self.rooms.failed.remove(room);
+        self.rooms.retrying.remove(room);
+        self.retries.remove(room);
     }
 
     /// Leave `room`.
-    pub fn unwant(&mut self, room: &str) {
+    pub fn unwant(&mut self, room: &str, now: Instant) {
         self.rooms.wanted.retain(|r| r != room);
         self.rooms.failed.remove(room);
+        self.rooms.retrying.remove(room);
         self.rooms.over_limit.retain(|r| r != room);
-        let pending = self.pending_join.as_ref().is_some_and(|(r, _)| r == room);
-        if (self.rooms.joined.iter().any(|r| r == room) || pending) && !self.parting.iter().any(|r| r == room) {
-            let env = self.envelope(MessageType::Part).with_room(room);
-            self.outbox.push(env);
-            self.parting.push(room.to_string());
+        self.retries.remove(room);
+        if (self.is_joined(room) || self.is_pending(room)) && !self.is_parting(room) {
+            self.part(room, now);
+        }
+    }
+
+    fn part(&mut self, room: &str, now: Instant) {
+        let env = self.envelope(MessageType::Part).with_room(room);
+        self.outbox.push(env);
+        self.parting.push((room.to_string(), now));
+    }
+
+    /// Whether a JOINED or PARTED is about the bouncer. rrcd sends both
+    /// from its own identity (K_SRC is the hub's), to the member itself
+    /// without a nick and to the others with the member's nick, which a
+    /// member without a nick does not have. With
+    /// `include_joined_member_list` the body lists the member's identity
+    /// (the answer to a JOIN lists every member), which settles it.
+    fn is_about_me(&self, env: &Envelope) -> bool {
+        match env.members() {
+            Some(members) => members.iter().any(|m| m[..] == self.user[..]),
+            None => env.nick.is_none(),
         }
     }
 
@@ -291,71 +387,120 @@ impl Session {
                     Inbound::Handled
                 }
             }
-            MessageType::Joined => self.joined(env),
+            MessageType::Joined => self.joined(env, now),
             MessageType::Parted => self.parted(env),
-            MessageType::Error => self.error(env),
+            MessageType::Error => self.error(env, now),
             _ => Inbound::Relay,
         }
     }
 
-    fn joined(&mut self, env: &Envelope) -> Inbound {
+    fn joined(&mut self, env: &Envelope, now: Instant) -> Inbound {
         let Some(room) = env.room.as_deref() else {
             return Inbound::Relay;
         };
-        // rrcd sends the joiner its JOINED without a nick and everyone
-        // already in the room one with the joiner's nick; the bouncer is
-        // not in a room it is still joining, so the first JOINED for it
-        // is the answer.
-        if self.pending_join.as_ref().is_some_and(|(r, _)| r == room) {
-            self.pending_join = None;
-            self.rooms.joined.push(room.to_string());
-            return Inbound::JoinConfirmed(room.to_string());
+        if self.is_joined(room) {
+            return Inbound::Relay;
         }
-        Inbound::Relay
+        // rrcd sends JOINED only to the room's members, so a JOINED for a
+        // room the bouncer asked to join on this link and is not in yet
+        // means rrcd has it there: the answer to the pending JOIN, or a
+        // late answer to one that timed out.
+        if !self.is_pending(room) && !self.retries.contains_key(room) {
+            return Inbound::Relay;
+        }
+        if self.is_pending(room) {
+            self.pending_join = None;
+        }
+        self.retries.remove(room);
+        self.rooms.retrying.remove(room);
+        self.rooms.joined.push(room.to_string());
+        // Left again while the JOIN was out: leave it once more.
+        if !self.rooms.wanted.iter().any(|r| r == room) && !self.is_parting(room) {
+            self.part(room, now);
+        }
+        Inbound::JoinConfirmed(room.to_string())
     }
 
     fn parted(&mut self, env: &Envelope) -> Inbound {
         let Some(room) = env.room.as_deref() else {
             return Inbound::Relay;
         };
-        // The answer to the bouncer's PART has no nick; another member's
-        // leaving has theirs.
-        if env.nick.is_none() && self.parting.iter().any(|r| r == room) {
-            self.parting.retain(|r| r != room);
+        if self.is_parting(room) && self.is_about_me(env) {
+            self.parting.retain(|(r, _)| r != room);
             self.rooms.joined.retain(|r| r != room);
             return Inbound::PartConfirmed(room.to_string());
+        }
+        // rrcd tells only members about a PART, so one for a room the
+        // bouncer is not in and did not try to join is the late answer to
+        // a PART already taken as done.
+        if !self.is_joined(room) && !self.is_pending(room) && !self.retries.contains_key(room) {
+            return Inbound::Handled;
         }
         Inbound::Relay
     }
 
-    fn error(&mut self, env: &Envelope) -> Inbound {
+    fn error(&mut self, env: &Envelope, now: Instant) -> Inbound {
         let reason = env.text_body().unwrap_or_else(|| "(no text)".into());
-        if let Some((pending, _)) = self.pending_join.clone() {
-            // rrcd names the room in a JOIN error about the room (+i, +k,
-            // ban) and leaves it out of one about the request (too many
-            // rooms, a bad name). "rate limited" is about the packet,
-            // whichever it was.
-            let about_join = match env.room.as_deref() {
-                Some(room) => room == pending,
-                None => reason != "rate limited",
-            };
-            if about_join {
-                self.pending_join = None;
-                self.rooms.failed.insert(pending.clone(), reason.clone());
-                return Inbound::JoinFailed { room: pending, reason };
-            }
-        }
-        if let Some(room) = env.room.as_deref()
-            && self.rooms.joined.iter().any(|r| r == room)
+        let room = env.room.as_deref();
+        // A kick (`commands.py` "kicked from {r}") or a ban that removes
+        // members ("banned from {r}"), both naming the room.
+        if let Some(room) = room
+            && self.is_joined(room)
+            && (reason.starts_with("kicked from ") || reason == format!("banned from {room}"))
         {
             self.rooms.joined.retain(|r| r != room);
+            self.parting.retain(|(r, _)| r != room);
             self.rooms.failed.insert(room.to_string(), reason.clone());
             return Inbound::Removed {
                 room: room.to_string(),
                 reason,
             };
         }
+        if let Some((pending, _)) = self.pending_join.clone() {
+            // rrcd names the room in a refusal about the room (+i, +k,
+            // ban) and leaves it out of one about the request (too many
+            // rooms, a bad name).
+            let refused = match room {
+                Some(room) => room == pending && join_refusal_with_room(&reason),
+                None => join_refusal_without_room(&reason),
+            };
+            if refused {
+                self.pending_join = None;
+                self.retries.remove(&pending);
+                self.rooms.retrying.remove(&pending);
+                self.rooms.failed.insert(pending.clone(), reason.clone());
+                return Inbound::JoinFailed { room: pending, reason };
+            }
+            // rrcd drops a packet that finds its bucket empty and says so
+            // without saying which; it may have been the JOIN, which is
+            // sent again later (a JOIN for a room rrcd has the bouncer in
+            // is answered with JOINED again).
+            if room.is_none() && reason == "rate limited" {
+                self.pending_join = None;
+                self.schedule_retry(&pending, "rate limited", now);
+            }
+        }
         Inbound::HubError(reason)
+    }
+
+    fn schedule_retry(&mut self, room: &str, reason: &str, now: Instant) {
+        let attempts = self.retries.get(room).map_or(0, |r| r.attempts) + 1;
+        let wait = if attempts <= JOIN_FAST_RETRIES {
+            self.timings.join_retry * 2u32.pow(attempts - 1)
+        } else {
+            self.timings.join_retry_slow
+        };
+        self.retries.insert(
+            room.to_string(),
+            Retry {
+                attempts,
+                next_at: now + wait,
+            },
+        );
+        self.rooms.retrying.insert(
+            room.to_string(),
+            format!("{reason}; {attempts} tr{}", if attempts == 1 { "y" } else { "ies" }),
+        );
     }
 
     /// Time passing: join the next room, PING when idle, give up on a
@@ -368,24 +513,40 @@ impl Session {
             return Ok(());
         };
         let limits = welcome.limits;
-        if let Some(sent) = self.ping_sent {
-            if now.saturating_duration_since(sent) >= self.timings.pong_timeout {
-                return Err(Dead::NoPong);
+        match self.ping_sent {
+            Some((sent, tries)) if now.saturating_duration_since(sent) >= self.timings.pong_timeout => {
+                if tries >= PING_TRIES {
+                    return Err(Dead::NoPong);
+                }
+                self.ping(now, tries + 1);
             }
-        } else if now.saturating_duration_since(self.last_heard) >= self.timings.ping_idle {
-            let body = Raw::from_value(&Value::Float(crate::bouncer::now()));
-            let env = self.envelope(MessageType::Ping).with_body(body);
-            self.outbox.push(env);
-            self.ping_sent = Some(now);
+            Some(_) => {}
+            None if now.saturating_duration_since(self.last_heard) >= self.timings.ping_idle => self.ping(now, 1),
+            None => {}
         }
         if let Some((room, sent)) = self.pending_join.clone()
             && now.saturating_duration_since(sent) >= self.timings.join_timeout
         {
             self.pending_join = None;
-            self.rooms.failed.insert(room, "no answer from the hub".into());
+            self.schedule_retry(&room, "no answer from the hub", now);
+        }
+        let part_timeout = self.timings.part_timeout;
+        let (late, parting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.parting)
+            .into_iter()
+            .partition(|(_, sent)| now.saturating_duration_since(*sent) >= part_timeout);
+        self.parting = parting;
+        for (room, _) in late {
+            self.rooms.joined.retain(|r| *r != room);
         }
         self.join_next(limits, now);
         Ok(())
+    }
+
+    fn ping(&mut self, now: Instant, tries: u32) {
+        let body = Raw::from_value(&Value::Float(crate::bouncer::now()));
+        let env = self.envelope(MessageType::Ping).with_body(body);
+        self.outbox.push(env);
+        self.ping_sent = Some((now, tries));
     }
 
     /// One JOIN at a time, so each answer can be told apart: rrcd's errors
@@ -394,11 +555,16 @@ impl Session {
         if self.pending_join.is_some() {
             return;
         }
+        // A room left (or a kick) makes room for those over the limit.
+        if (self.rooms.joined.len() as u64) < limits.max_rooms_per_session {
+            self.rooms.over_limit.clear();
+        }
         let next = self.rooms.wanted.iter().find(|room| {
             !self.rooms.joined.contains(room)
                 && !self.rooms.failed.contains_key(*room)
                 && !self.rooms.over_limit.contains(room)
-                && !self.parting.contains(room)
+                && !self.parting.iter().any(|(r, _)| r == *room)
+                && self.retries.get(*room).is_none_or(|r| now >= r.next_at)
         });
         let Some(room) = next.cloned() else {
             return;
@@ -420,16 +586,30 @@ impl Session {
     }
 }
 
+/// The size of the channel an upstream session takes commands from. The
+/// session never blocks on whoever sends them, and they must not block on
+/// the session: send with `try_send`, and count and report a full channel
+/// as a dropped send.
+pub const COMMAND_QUEUE: usize = 1024;
+/// The size of the channel an upstream session sends events into. The
+/// session sends with `try_send` and counts what does not fit in
+/// `dropped_events`; it never waits for the receiver.
+pub const EVENT_QUEUE: usize = 4096;
+
 /// What the rest of the bouncer can ask of an upstream session.
 #[derive(Debug)]
 pub enum Command {
     /// Send a client's envelope upstream, sharing the session's rate limit.
-    /// Dropped (and counted) while the session is not up.
+    /// With no link it is dropped; while the link waits for its WELCOME, or
+    /// the envelope's room is being joined, it is held (up to
+    /// `CLIENT_QUEUE` envelopes, each at most `CLIENT_HOLD`). A dropped
+    /// envelope is counted in `dropped_sends` and reported as
+    /// [`UpstreamEvent::SendDropped`].
     Send(Envelope),
     /// Add a room to the hub's room set (saved) and join it.
     Join(String),
     /// Take a room out of the room set and leave it. A room from the config
-    /// file is left until the next start.
+    /// file stays out until the process restarts.
     Part(String),
 }
 
@@ -442,6 +622,9 @@ pub enum UpstreamEvent {
     Down,
     /// An envelope from the hub, and what the session made of it.
     Envelope(Envelope, Inbound),
+    /// A client envelope from [`Command::Send`] that was not sent, and why;
+    /// its `id` is the client's.
+    SendDropped { envelope: Envelope, reason: String },
 }
 
 /// The hub's caps and limits as status.json shows them.
@@ -476,9 +659,11 @@ pub struct UpstreamStatus {
     /// The room set: the config's rooms and the saved ones.
     pub rooms: Vec<String>,
     pub rooms_joined: Vec<String>,
-    /// Rooms the hub refused, with its reason.
+    /// Rooms the hub refused on the current link, with its reason.
     pub rooms_failed: BTreeMap<String, String>,
-    /// Rooms past the hub's `max_rooms_per_session`.
+    /// Rooms whose JOIN is being tried again on the current link, with why.
+    pub rooms_retrying: BTreeMap<String, String>,
+    /// Rooms past the hub's `max_rooms_per_session` on the current link.
     pub rooms_over_limit: Vec<String>,
     pub last_connected_at: Option<f64>,
     pub last_disconnected_at: Option<f64>,
@@ -492,8 +677,11 @@ pub struct UpstreamStatus {
     pub next_attempt_at: Option<f64>,
     /// Envelopes from the hub nothing in the bouncer consumes yet, by type.
     pub unhandled: BTreeMap<String, u64>,
-    /// Client envelopes dropped because the session was not up.
+    /// Client envelopes not sent: no link, the queue full, held too long,
+    /// or still queued when the link ended.
     pub dropped_sends: u64,
+    /// Events the relay did not take in time (its channel was full).
+    pub dropped_events: u64,
 }
 
 pub type SharedStatus = Arc<Mutex<UpstreamStatus>>;
@@ -519,12 +707,33 @@ fn version_text(ver: &Option<Value>) -> Option<String> {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long to look for a path to the hub.
 const PATH_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long to wait for the link to close after asking it to.
-const CLOSE_WAIT: Duration = Duration::from_secs(5);
+/// How long to wait for the link to close after asking it to. The
+/// bouncer's `SESSION_STOP` is longer, so a session stopping at shutdown
+/// still writes its status.
+pub const CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// How often the session's clock runs.
 const TICK: Duration = Duration::from_millis(250);
-/// Client envelopes waiting for a token beyond this many are dropped.
-const CLIENT_QUEUE: usize = 256;
+/// Client envelopes waiting for a token or a room beyond this many are
+/// dropped.
+pub const CLIENT_QUEUE: usize = 256;
+/// A client envelope held this long (its room not joined yet) is dropped:
+/// a chat line sent much later than it was written is worse than none.
+pub const CLIENT_HOLD: Duration = Duration::from_secs(60);
+/// The longest local hub name, in bytes. The announce app data
+/// `{"proto": "rrc", "v": 1, "hub": name}` is then at most 120 bytes,
+/// well inside an announce's room for it.
+pub const MAX_HUB_NAME_BYTES: usize = 96;
+const VIA: &str = " (via rrc-bouncer)";
+
+/// The local hub's name for an upstream hub named `name`, cut on a
+/// character boundary to fit `MAX_HUB_NAME_BYTES`.
+pub fn local_name(name: &str) -> String {
+    let mut end = name.len().min(MAX_HUB_NAME_BYTES - VIA.len());
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{VIA}", &name[..end])
+}
 
 /// Everything an upstream session task needs.
 pub struct Upstream {
@@ -543,7 +752,8 @@ pub struct Upstream {
     pub changed: Arc<Notify>,
     /// Woken when the local hub's name changes.
     pub renamed: Arc<Notify>,
-    /// None until the relay (M3) consumes them.
+    /// None until the relay (M3) consumes them. Make it with
+    /// `EVENT_QUEUE`; the session never waits on it.
     pub events: Option<mpsc::Sender<UpstreamEvent>>,
 }
 
@@ -582,6 +792,7 @@ impl Upstream {
             s.rooms = view.wanted.clone();
             s.rooms_joined = view.joined.clone();
             s.rooms_failed = view.failed.clone();
+            s.rooms_retrying = view.retrying.clone();
             s.rooms_over_limit = view.over_limit.clone();
         });
     }
@@ -591,10 +802,38 @@ impl Upstream {
         self.update(|s| s.rooms = rooms);
     }
 
-    async fn emit(&self, event: UpstreamEvent) {
-        if let Some(events) = &self.events {
-            let _ = events.send(event).await;
+    /// Hand the relay an event without waiting: a full channel drops it.
+    fn emit(&self, event: UpstreamEvent) {
+        let Some(events) = &self.events else { return };
+        if let Err(mpsc::error::TrySendError::Full(_)) = events.try_send(event) {
+            let mut dropped = 0;
+            self.tally(|s| {
+                s.dropped_events += 1;
+                dropped = s.dropped_events;
+            });
+            // Logged at the 1st, 2nd, 4th, 8th, ... drop.
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    "upstream {}: the relay is not keeping up: {dropped} events dropped",
+                    self.tag()
+                );
+            }
         }
+    }
+
+    /// A client envelope that will not be sent.
+    fn drop_send(&self, envelope: Envelope, reason: &str) {
+        tracing::debug!(
+            "upstream {}: dropped a client {:?} room={:?}: {reason}",
+            self.tag(),
+            envelope.t,
+            envelope.room
+        );
+        self.tally(|s| s.dropped_sends += 1);
+        self.emit(UpstreamEvent::SendDropped {
+            envelope,
+            reason: reason.into(),
+        });
     }
 
     fn count_unhandled(&self, t: MessageType) {
@@ -604,10 +843,7 @@ impl Upstream {
     /// A command while there is no session: the room set still changes.
     fn command_offline(&mut self, command: Command) {
         match command {
-            Command::Send(env) => {
-                tracing::debug!("upstream {}: dropped a client {:?}: not connected", self.tag(), env.t);
-                self.tally(|s| s.dropped_sends += 1);
-            }
+            Command::Send(env) => self.drop_send(env, "not connected"),
             Command::Join(room) => {
                 self.add_room(&room);
             }
@@ -625,9 +861,10 @@ impl Upstream {
     }
 
     fn remove_room(&mut self, room: &str) {
+        let configured = crate::config::normalize_room(room).is_some_and(|r| self.rooms.is_configured(&r));
         match self.rooms.remove(room) {
-            Ok(_) if self.rooms.is_configured(room) => tracing::info!(
-                "upstream {}: room {room} is in the config file; it is left until the next start",
+            Ok(true) if configured => tracing::info!(
+                "upstream {}: room {room} is in the config file; it stays out until the bouncer restarts",
                 self.tag()
             ),
             Ok(_) => {}
@@ -683,32 +920,48 @@ impl Upstream {
         // its default until the WELCOME says otherwise.
         let mut bucket = TokenBucket::new(Limits::default().rate_limit_msgs_per_minute, started);
         let mut control: VecDeque<Envelope> = VecDeque::new();
-        let mut client: VecDeque<Envelope> = VecDeque::new();
+        // Client envelopes and when they came.
+        let mut client: VecDeque<(Envelope, Instant)> = VecDeque::new();
         let mut send_at: Option<Instant> = None;
         let mut commands_open = true;
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         self.update(|s| s.state = "linked".into());
 
-        let reason = 'link: loop {
+        let (reason, shut) = 'link: loop {
             control.extend(session.take_outbox());
-            // Send what the bucket allows: the bouncer's own envelopes
-            // first, then clients'.
             let now = Instant::now();
+            // The queue is in arrival order: what was held too long is at
+            // its front.
+            while client
+                .front()
+                .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= CLIENT_HOLD)
+            {
+                if let Some((env, _)) = client.pop_front() {
+                    self.drop_send(env, "held too long: its room was not joined");
+                }
+            }
+            // Send what the bucket allows: the bouncer's own envelopes
+            // first, then the clients' that may go (in order per room).
             while send_at.is_none_or(|at| now >= at) {
-                let queue = if !control.is_empty() {
-                    &mut control
-                } else if welcomed_at.is_some() && !client.is_empty() {
-                    &mut client
+                let pick = if control.is_empty() {
+                    match client.iter().position(|(e, _)| session.may_send(e.room.as_deref())) {
+                        Some(pos) => Some(pos),
+                        None => break,
+                    }
                 } else {
-                    break;
+                    None
                 };
                 if let Err(wait) = bucket.take(now) {
                     send_at = Some(now + wait);
                     break;
                 }
                 send_at = None;
-                let Some(env) = queue.pop_front() else { break };
+                let env = match pick {
+                    None => control.pop_front(),
+                    Some(pos) => client.remove(pos).map(|(env, _)| env),
+                };
+                let Some(env) = env else { break };
                 match link.handle.send_packet(env.encode()).await {
                     Ok(_) => tracing::debug!("upstream {tag}: sent {:?} room={:?}", env.t, env.room),
                     Err(LinkSessionError::PayloadTooLarge { actual, max }) => {
@@ -716,8 +969,16 @@ impl Upstream {
                             "upstream {tag}: dropped a {:?} of {actual} bytes (link MDU {max})",
                             env.t
                         );
+                        if pick.is_some() {
+                            self.drop_send(env, &format!("{actual} bytes is more than the link carries ({max})"));
+                        }
                     }
-                    Err(e) => break 'link format!("send failed: {e}"),
+                    Err(e) => {
+                        if pick.is_some() {
+                            self.drop_send(env, "the link ended");
+                        }
+                        break 'link (format!("send failed: {e}"), false);
+                    }
                 }
             }
             let sleep_until = send_at.map(tokio::time::Instant::from_std);
@@ -739,29 +1000,29 @@ impl Upstream {
                                 welcomed_at = Some(Instant::now());
                                 bucket.set_limit(welcome.limits.rate_limit_msgs_per_minute, Instant::now());
                                 self.welcomed(&welcome).await;
-                                self.emit(UpstreamEvent::Up(welcome)).await;
+                                self.emit(UpstreamEvent::Up(welcome));
                             }
                             Inbound::JoinConfirmed(room) => tracing::info!("upstream {tag}: joined {room}"),
                             Inbound::JoinFailed { room, reason } => tracing::warn!("upstream {tag}: could not join {room}: {reason}"),
                             Inbound::PartConfirmed(room) => tracing::info!("upstream {tag}: left {room}"),
                             Inbound::Removed { room, reason } => tracing::warn!("upstream {tag}: out of {room}: {reason}"),
-                            Inbound::HubError(reason) => tracing::warn!("upstream {tag}: hub error: {reason}"),
+                            Inbound::HubError(reason) => tracing::warn!("upstream {tag}: hub error: {reason} (room={:?})", env.room),
                             Inbound::Relay => tracing::debug!("upstream {tag}: {:?} room={:?} not relayed yet", env.t, env.room),
                         }
                         if !matches!(inbound, Inbound::Handled | Inbound::Welcomed) {
                             if self.events.is_some() {
-                                self.emit(UpstreamEvent::Envelope(env, inbound)).await;
+                                self.emit(UpstreamEvent::Envelope(env, inbound));
                             } else if matches!(inbound, Inbound::Relay | Inbound::HubError(_)) {
                                 self.count_unhandled(env.t);
                             }
                         }
                         self.show_rooms(session.rooms());
                     }
-                    Some(LinkSessionEvent::Closed { reason }) => break 'link format!("link closed ({reason:?})"),
+                    Some(LinkSessionEvent::Closed { reason }) => break 'link (format!("link closed ({reason:?})"), false),
                     Some(LinkSessionEvent::Stale) => tracing::debug!("upstream {tag}: link stale"),
                     Some(LinkSessionEvent::Recovered) => tracing::debug!("upstream {tag}: link recovered"),
                     Some(_) => {}
-                    None => break 'link "link session ended".into(),
+                    None => break 'link ("link session ended".into(), false),
                 },
                 // The bouncer accepts no Resources yet (M5); an offer left
                 // undecided expires.
@@ -770,13 +1031,11 @@ impl Upstream {
                 }
                 command = commands.recv(), if commands_open => match command {
                     Some(Command::Send(env)) => {
-                        if welcomed_at.is_none() {
-                            self.command_offline(Command::Send(env));
-                        } else if client.len() >= CLIENT_QUEUE {
+                        if client.len() >= CLIENT_QUEUE {
                             tracing::warn!("upstream {tag}: client queue full, dropped a {:?}", env.t);
-                            self.tally(|s| s.dropped_sends += 1);
+                            self.drop_send(env, "the queue is full");
                         } else {
-                            client.push_back(env);
+                            client.push_back((env, Instant::now()));
                         }
                     }
                     Some(Command::Join(room)) => {
@@ -789,7 +1048,7 @@ impl Upstream {
                     Some(Command::Part(room)) => {
                         self.remove_room(&room);
                         if let Some(room) = crate::config::normalize_room(&room) {
-                            session.unwant(&room);
+                            session.unwant(&room, Instant::now());
                         }
                         self.show_rooms(session.rooms());
                     }
@@ -800,7 +1059,7 @@ impl Upstream {
                     if let Err(dead) = session.tick(Instant::now()) {
                         link.handle.close().await;
                         drain_until_closed(&mut link).await;
-                        break 'link dead.to_string();
+                        break 'link (dead.to_string(), false);
                     }
                     self.show_rooms(session.rooms());
                 }
@@ -808,7 +1067,7 @@ impl Upstream {
                 _ = shutdown.changed() => {
                     link.handle.close().await;
                     drain_until_closed(&mut link).await;
-                    return Ended { welcomed_for: welcomed_at.map(|t| t.elapsed()), reason: "shutting down".into(), shutdown: true };
+                    break 'link ("shutting down".into(), true);
                 }
             }
         };
@@ -816,10 +1075,13 @@ impl Upstream {
             link.handle.close().await;
             drain_until_closed(&mut link).await;
         }
+        for (env, _) in client {
+            self.drop_send(env, "the link ended");
+        }
         Ended {
             welcomed_for: welcomed_at.map(|t| t.elapsed()),
             reason,
-            shutdown: false,
+            shutdown: shut,
         }
     }
 
@@ -861,7 +1123,7 @@ impl Upstream {
             s.next_attempt_at = None;
         });
         if renamed && let Some(name) = &welcome.hub {
-            let name = format!("{name} (via rrc-bouncer)");
+            let name = local_name(name);
             match self.local_hub.set_default_app_data(Some(hub_app_data(&name))).await {
                 Ok(()) => {
                     tracing::info!("upstream {tag}: the local hub is now {name:?}");
@@ -930,13 +1192,19 @@ pub async fn run(mut up: Upstream, mut commands: mpsc::Receiver<Command>, mut sh
                 );
                 let ended = up.drive(link, &mut commands, &mut shutdown).await;
                 if ended.welcomed_for.is_some() {
-                    up.emit(UpstreamEvent::Down).await;
+                    up.emit(UpstreamEvent::Down);
                 }
                 let welcomed_for = ended.welcomed_for;
+                let rooms = up.rooms.rooms();
                 up.update(|s| {
                     s.state = if ended.shutdown { "stopped" } else { "disconnected" }.into();
                     s.last_disconnected_at = Some(now());
+                    // The room state was the link's.
+                    s.rooms = rooms;
                     s.rooms_joined.clear();
+                    s.rooms_failed.clear();
+                    s.rooms_retrying.clear();
+                    s.rooms_over_limit.clear();
                     s.last_error = Some(ended.reason.clone());
                     if welcomed_for.is_none() {
                         s.failed_attempts += 1;
@@ -1079,50 +1347,267 @@ mod tests {
         assert_eq!(s.handle(&other, t0), Inbound::Relay);
     }
 
+    fn error(room: Option<&str>, text: &str) -> Envelope {
+        let env = from_hub(MessageType::Error).with_body(Raw::text(text));
+        match room {
+            Some(room) => env.with_room(room),
+            None => env,
+        }
+    }
+
+    /// A welcomed session with `rooms` joined and the outbox empty.
+    fn joined_session(rooms: &[&str], t0: Instant) -> Session {
+        let mut s = session(rooms, t0);
+        s.handle(&welcome(32), t0);
+        for room in rooms {
+            s.tick(t0).unwrap();
+            assert_eq!(
+                types(&s.take_outbox()).last(),
+                Some(&(MessageType::Join, Some(room.to_string())))
+            );
+            s.handle(&from_hub(MessageType::Joined).with_room(room), t0);
+        }
+        s.take_outbox();
+        s
+    }
+
     #[test]
-    fn join_errors_with_and_without_a_room() {
+    fn each_join_refusal_fails_the_room_for_the_link() {
+        // rrcd's texts: router.py _handle_join and service.py _norm_room.
+        let refusals = [
+            (None, "JOIN requires room name"),
+            (None, "too many rooms"),
+            (None, "room name must not be empty"),
+            (None, "room name too long: 9 bytes > 8 bytes"),
+            (Some("a"), "invite-only (+i)"),
+            (Some("a"), "bad key (+k)"),
+            (Some("a"), "banned from room"),
+        ];
+        for (room, text) in refusals {
+            let t0 = Instant::now();
+            let mut s = session(&["a", "b"], t0);
+            s.handle(&welcome(32), t0);
+            s.tick(t0).unwrap();
+            s.take_outbox();
+            assert_eq!(
+                s.handle(&error(room, text), t0),
+                Inbound::JoinFailed {
+                    room: "a".into(),
+                    reason: text.into()
+                },
+                "{text}"
+            );
+            assert_eq!(s.rooms().failed.get("a").map(String::as_str), Some(text));
+            // The next room is joined, and the refused one is not tried
+            // again on this link, however long it lasts.
+            s.tick(t0).unwrap();
+            assert_eq!(types(&s.take_outbox()), [(MessageType::Join, Some("b".into()))]);
+            s.handle(&from_hub(MessageType::Joined).with_room("b"), t0);
+            s.tick(t0 + Duration::from_secs(3600)).unwrap();
+            assert!(!types(&s.take_outbox()).iter().any(|(t, _)| *t == MessageType::Join));
+            // Asking for it again tries again.
+            s.want("a");
+            s.tick(t0 + Duration::from_secs(3600)).unwrap();
+            assert!(types(&s.take_outbox()).contains(&(MessageType::Join, Some("a".into()))));
+        }
+    }
+
+    #[test]
+    fn a_refusal_naming_another_room_is_not_about_the_join() {
         let t0 = Instant::now();
-        let mut s = session(&["a", "b", "c", "d"], t0);
+        let mut s = session(&["a"], t0);
         s.handle(&welcome(32), t0);
         s.tick(t0).unwrap();
         s.take_outbox();
-        let err = from_hub(MessageType::Error)
-            .with_room("a")
-            .with_body(Raw::text("banned from room"));
         assert_eq!(
-            s.handle(&err, t0),
-            Inbound::JoinFailed {
+            s.handle(&error(Some("z"), "invite-only (+i)"), t0),
+            Inbound::HubError("invite-only (+i)".into())
+        );
+        assert!(s.rooms().failed.is_empty());
+        assert_eq!(
+            s.handle(&from_hub(MessageType::Joined).with_room("a"), t0),
+            Inbound::JoinConfirmed("a".into())
+        );
+    }
+
+    #[test]
+    fn other_errors_while_a_join_is_pending_leave_it_pending() {
+        let t0 = Instant::now();
+        let mut s = session(&["a"], t0);
+        s.handle(&welcome(32), t0);
+        s.tick(t0).unwrap();
+        s.take_outbox();
+        for (room, text) in [
+            (None, "message too large: 400 bytes > 350 bytes"),
+            (None, "destination not connected"),
+            (None, "bad message: unknown type"),
+            (None, "message requires room name"),
+            (Some("a"), "no such room"),
+            (Some("a"), "unrecognized command"),
+            (Some("a"), "not authorized"),
+        ] {
+            assert_eq!(s.handle(&error(room, text), t0), Inbound::HubError(text.into()));
+        }
+        assert!(s.rooms().failed.is_empty() && s.rooms().retrying.is_empty());
+        s.tick(t0).unwrap();
+        assert!(s.take_outbox().is_empty(), "the JOIN is still pending");
+        assert_eq!(
+            s.handle(&from_hub(MessageType::Joined).with_room("a"), t0),
+            Inbound::JoinConfirmed("a".into())
+        );
+    }
+
+    #[test]
+    fn errors_about_a_joined_room_are_not_kicks() {
+        let t0 = Instant::now();
+        let mut s = joined_session(&["a", "b"], t0);
+        for text in [
+            "room is moderated (+m)",
+            "banned from room",
+            "no outside messages (+n)",
+            "not authorized",
+            "not authorized (+t)",
+            "unrecognized command",
+        ] {
+            assert_eq!(s.handle(&error(Some("a"), text), t0), Inbound::HubError(text.into()));
+        }
+        assert_eq!(s.rooms().joined, ["a", "b"]);
+        assert!(s.rooms().failed.is_empty());
+        // A kick, and a ban that removes members.
+        assert_eq!(
+            s.handle(&error(Some("a"), "kicked from a"), t0),
+            Inbound::Removed {
                 room: "a".into(),
-                reason: "banned from room".into()
+                reason: "kicked from a".into()
             }
         );
-        s.tick(t0).unwrap();
-        assert_eq!(types(&s.take_outbox()), [(MessageType::Join, Some("b".into()))]);
-        // "rate limited" is not about the JOIN.
-        let limited = from_hub(MessageType::Error).with_body(Raw::text("rate limited"));
-        assert_eq!(s.handle(&limited, t0), Inbound::HubError("rate limited".into()));
-        let err = from_hub(MessageType::Error).with_body(Raw::text("too many rooms"));
-        assert!(matches!(s.handle(&err, t0), Inbound::JoinFailed { room, .. } if room == "b"));
-        s.tick(t0).unwrap();
-        assert_eq!(types(&s.take_outbox()), [(MessageType::Join, Some("c".into()))]);
-        // No answer at all.
-        s.tick(t0 + Duration::from_secs(20)).unwrap();
-        assert_eq!(
-            s.rooms().failed.get("c").map(String::as_str),
-            Some("no answer from the hub")
+        assert!(
+            matches!(s.handle(&error(Some("b"), "banned from b"), t0), Inbound::Removed { room, .. } if room == "b")
         );
-        assert_eq!(types(&s.take_outbox()), [(MessageType::Join, Some("d".into()))]);
-        s.handle(&from_hub(MessageType::Joined).with_room("d"), t0);
-        // A kick: rrcd sends an ERROR naming the room.
-        let kicked = from_hub(MessageType::Error)
-            .with_room("d")
-            .with_body(Raw::text("kicked from d"));
-        assert!(matches!(s.handle(&kicked, t0), Inbound::Removed { room, .. } if room == "d"));
         assert!(s.rooms().joined.is_empty());
-        // Asking for a failed room again tries again.
+        // Not joined again on this link until asked for.
+        s.tick(t0 + Duration::from_secs(3600)).unwrap();
+        assert!(s.take_outbox().iter().all(|e| e.t != MessageType::Join));
         s.want("a");
-        s.tick(t0 + Duration::from_secs(20)).unwrap();
+        s.tick(t0 + Duration::from_secs(3600)).unwrap();
+        assert!(types(&s.take_outbox()).contains(&(MessageType::Join, Some("a".into()))));
+    }
+
+    /// The JOINs in the outbox; the bouncer's PINGs are answered.
+    fn joins(s: &mut Session, now: Instant) -> Vec<(MessageType, Option<String>)> {
+        let out = s.take_outbox();
+        if out.iter().any(|e| e.t == MessageType::Ping) {
+            s.handle(&from_hub(MessageType::Pong), now);
+        }
+        types(&out)
+            .into_iter()
+            .filter(|(t, _)| *t == MessageType::Join)
+            .collect()
+    }
+
+    #[test]
+    fn an_unanswered_join_is_tried_again_with_backoff_then_slowly() {
+        let t0 = Instant::now();
+        let t = timings();
+        let mut s = session(&["a", "b"], t0);
+        s.take_outbox();
+        s.handle(&welcome(32), t0);
+        s.tick(t0).unwrap();
         assert_eq!(types(&s.take_outbox()), [(MessageType::Join, Some("a".into()))]);
+        // No answer: "a" waits for its retry and "b" goes meanwhile.
+        let mut now = t0 + t.join_timeout;
+        s.tick(now).unwrap();
+        assert!(s.rooms().retrying.contains_key("a"));
+        assert!(s.rooms().failed.is_empty());
+        assert_eq!(types(&s.take_outbox()), [(MessageType::Join, Some("b".into()))]);
+        s.handle(&from_hub(MessageType::Joined).with_room("b"), now);
+        // Retries after 5, 10, 20 s, then every 300 s, for as long as the
+        // link lasts.
+        let waits = [5u64, 10, 20, 300, 300, 300];
+        for wait in waits {
+            let due = now + Duration::from_secs(wait);
+            s.tick(due - Duration::from_millis(1)).unwrap();
+            assert!(joins(&mut s, due).is_empty(), "nothing before {wait} s");
+            s.tick(due).unwrap();
+            assert_eq!(
+                joins(&mut s, due),
+                [(MessageType::Join, Some("a".into()))],
+                "after {wait} s"
+            );
+            now = due + t.join_timeout;
+            s.tick(now).unwrap();
+            assert!(joins(&mut s, now).is_empty());
+        }
+        assert_eq!(
+            s.rooms().retrying.get("a").map(String::as_str),
+            Some("no answer from the hub; 7 tries")
+        );
+        // An answer ends it.
+        let due = now + Duration::from_secs(300);
+        s.tick(due).unwrap();
+        joins(&mut s, due);
+        assert_eq!(
+            s.handle(&from_hub(MessageType::Joined).with_room("a"), due),
+            Inbound::JoinConfirmed("a".into())
+        );
+        assert!(s.rooms().retrying.is_empty());
+        assert_eq!(s.rooms().joined, ["b", "a"]);
+    }
+
+    #[test]
+    fn a_late_answer_to_a_timed_out_join_is_taken() {
+        let t0 = Instant::now();
+        let mut s = session(&["a", "b"], t0);
+        s.handle(&welcome(32), t0);
+        s.tick(t0).unwrap();
+        s.take_outbox();
+        let now = t0 + timings().join_timeout;
+        s.tick(now).unwrap();
+        assert_eq!(types(&s.take_outbox()), [(MessageType::Join, Some("b".into()))]);
+        // The JOINED for "a" comes while "b" is pending.
+        assert_eq!(
+            s.handle(&from_hub(MessageType::Joined).with_room("a"), now),
+            Inbound::JoinConfirmed("a".into())
+        );
+        assert!(s.rooms().retrying.is_empty());
+        assert_eq!(
+            s.handle(&from_hub(MessageType::Joined).with_room("b"), now),
+            Inbound::JoinConfirmed("b".into())
+        );
+        assert_eq!(s.rooms().joined, ["a", "b"]);
+        s.tick(now + Duration::from_secs(600)).unwrap();
+        assert!(s.take_outbox().iter().all(|e| e.t != MessageType::Join));
+    }
+
+    #[test]
+    fn a_rate_limited_join_is_tried_again() {
+        let t0 = Instant::now();
+        let mut s = session(&["a"], t0);
+        s.handle(&welcome(32), t0);
+        s.tick(t0).unwrap();
+        s.take_outbox();
+        // Still an error for whoever sent the lost packet.
+        assert_eq!(
+            s.handle(&error(None, "rate limited"), t0),
+            Inbound::HubError("rate limited".into())
+        );
+        assert!(s.rooms().failed.is_empty());
+        assert_eq!(
+            s.rooms().retrying.get("a").map(String::as_str),
+            Some("rate limited; 1 try")
+        );
+        s.tick(t0 + Duration::from_secs(4)).unwrap();
+        assert!(s.take_outbox().is_empty());
+        s.tick(t0 + timings().join_retry).unwrap();
+        assert_eq!(types(&s.take_outbox()), [(MessageType::Join, Some("a".into()))]);
+        // Without a pending JOIN, "rate limited" changes nothing.
+        s.handle(&from_hub(MessageType::Joined).with_room("a"), t0);
+        assert_eq!(
+            s.handle(&error(None, "rate limited"), t0),
+            Inbound::HubError("rate limited".into())
+        );
+        assert_eq!(s.rooms().joined, ["a"]);
+        assert!(s.rooms().retrying.is_empty());
     }
 
     #[test]
@@ -1154,33 +1639,136 @@ mod tests {
             &from_hub(MessageType::Msg).with_room("x"),
             idle + Duration::from_secs(2),
         );
-        assert_eq!(s.tick(idle + timings().pong_timeout), Err(Dead::NoPong));
+        // One lost PONG: a second PING, and the link goes only when that
+        // one is not answered either.
+        let second = idle + timings().pong_timeout;
+        s.tick(second).unwrap();
+        assert_eq!(types(&s.take_outbox()), [(MessageType::Ping, None)]);
+        s.tick(second + timings().pong_timeout - Duration::from_millis(1))
+            .unwrap();
+        assert!(s.take_outbox().is_empty());
+        assert_eq!(s.tick(second + timings().pong_timeout), Err(Dead::NoPong));
+        // A PONG to the second PING keeps it up.
+        let mut s = session(&[], t0);
+        s.handle(&welcome(32), t0);
+        s.tick(idle).unwrap();
+        s.tick(second).unwrap();
+        s.handle(&from_hub(MessageType::Pong), second + Duration::from_secs(1));
+        s.tick(second + timings().pong_timeout).unwrap();
         // A PONG in time keeps it up.
         let mut s = session(&[], t0);
         s.handle(&welcome(32), t0);
         s.tick(idle).unwrap();
         s.handle(&from_hub(MessageType::Pong), idle + Duration::from_secs(1));
         s.tick(idle + timings().pong_timeout).unwrap();
+        assert!(
+            s.take_outbox()
+                .iter()
+                .all(|e| e.t != MessageType::Ping || e.body.is_some())
+        );
     }
 
     #[test]
-    fn part_is_confirmed_by_a_parted_without_a_nick() {
+    fn part_is_confirmed_by_a_parted_about_the_bouncer() {
         let t0 = Instant::now();
-        let mut s = session(&["a"], t0);
-        s.handle(&welcome(32), t0);
-        s.tick(t0).unwrap();
-        s.handle(&from_hub(MessageType::Joined).with_room("a"), t0);
-        s.take_outbox();
-        s.unwant("a");
+        let mut s = joined_session(&["a"], t0);
+        s.unwant("a", t0);
         assert_eq!(types(&s.take_outbox()), [(MessageType::Part, Some("a".into()))]);
         let other = from_hub(MessageType::Parted).with_room("a").with_nick(Some("x"));
         assert_eq!(s.handle(&other, t0), Inbound::Relay);
         assert_eq!(s.rooms().joined, ["a"]);
-        let mine = from_hub(MessageType::Parted).with_room("a");
+        // A member without a nick, with include_joined_member_list: the
+        // body names them, not the bouncer.
+        let nickless = from_hub(MessageType::Parted)
+            .with_room("a")
+            .with_body(Raw::from_value(&Value::Array(vec![Value::Bytes(vec![3; 16])])));
+        assert_eq!(s.handle(&nickless, t0), Inbound::Relay);
+        assert_eq!(s.rooms().joined, ["a"]);
+        let mine = from_hub(MessageType::Parted)
+            .with_room("a")
+            .with_body(Raw::from_value(&Value::Array(vec![Value::Bytes(USER.to_vec())])));
         assert_eq!(s.handle(&mine, t0), Inbound::PartConfirmed("a".into()));
         assert!(s.rooms().joined.is_empty() && s.rooms().wanted.is_empty());
         s.tick(t0).unwrap();
         assert!(s.take_outbox().is_empty());
+        // Without a member list, the bouncer's PARTED is the one without a
+        // nick.
+        let mut s = joined_session(&["a"], t0);
+        s.unwant("a", t0);
+        assert_eq!(
+            s.handle(&from_hub(MessageType::Parted).with_room("a"), t0),
+            Inbound::PartConfirmed("a".into())
+        );
+    }
+
+    #[test]
+    fn a_lost_parted_times_out_and_a_late_one_is_handled() {
+        let t0 = Instant::now();
+        let mut s = joined_session(&["a"], t0);
+        s.unwant("a", t0);
+        s.take_outbox();
+        s.tick(t0 + timings().part_timeout - Duration::from_millis(1)).unwrap();
+        assert_eq!(s.rooms().joined, ["a"]);
+        s.tick(t0 + timings().part_timeout).unwrap();
+        assert!(s.rooms().joined.is_empty());
+        assert_eq!(
+            s.handle(&from_hub(MessageType::Parted).with_room("a"), t0),
+            Inbound::Handled
+        );
+        // Joining it again works as for any room.
+        s.want("a");
+        s.tick(t0 + timings().part_timeout).unwrap();
+        assert_eq!(types(&s.take_outbox()), [(MessageType::Join, Some("a".into()))]);
+    }
+
+    #[test]
+    fn rooms_over_the_limit_are_joined_when_there_is_room() {
+        let t0 = Instant::now();
+        let mut s = session(&["a", "b", "c"], t0);
+        s.handle(&welcome(2), t0);
+        for room in ["a", "b"] {
+            s.tick(t0).unwrap();
+            s.take_outbox();
+            s.handle(&from_hub(MessageType::Joined).with_room(room), t0);
+        }
+        s.tick(t0).unwrap();
+        assert_eq!(s.rooms().over_limit, ["c"]);
+        assert!(s.take_outbox().is_empty());
+        s.unwant("a", t0);
+        s.handle(&from_hub(MessageType::Parted).with_room("a"), t0);
+        s.take_outbox();
+        s.tick(t0).unwrap();
+        assert!(s.rooms().over_limit.is_empty());
+        assert_eq!(types(&s.take_outbox()), [(MessageType::Join, Some("c".into()))]);
+        // A kick makes room too.
+        s.handle(&from_hub(MessageType::Joined).with_room("c"), t0);
+        s.want("d");
+        s.tick(t0).unwrap();
+        assert_eq!(s.rooms().over_limit, ["d"]);
+        s.handle(&error(Some("b"), "kicked from b"), t0);
+        s.tick(t0).unwrap();
+        assert_eq!(types(&s.take_outbox()), [(MessageType::Join, Some("d".into()))]);
+    }
+
+    #[test]
+    fn client_sends_wait_for_the_welcome_and_their_room() {
+        let t0 = Instant::now();
+        let mut s = session(&["a", "b"], t0);
+        assert!(!s.may_send(None));
+        assert!(!s.may_send(Some("elsewhere")));
+        s.handle(&welcome(32), t0);
+        assert!(s.may_send(None));
+        assert!(s.may_send(Some("elsewhere")));
+        assert!(!s.may_send(Some("a")));
+        assert!(!s.may_send(Some(" A ")));
+        s.tick(t0).unwrap();
+        s.handle(&from_hub(MessageType::Joined).with_room("a"), t0);
+        assert!(s.may_send(Some("A")));
+        assert!(!s.may_send(Some("b")));
+        // Refused: the hub's answer to the send is for the client.
+        s.tick(t0).unwrap();
+        s.handle(&error(Some("b"), "invite-only (+i)"), t0);
+        assert!(s.may_send(Some("b")));
     }
 
     #[test]

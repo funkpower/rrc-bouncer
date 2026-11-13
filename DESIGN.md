@@ -196,7 +196,8 @@ rsReticulum (`deps/rsReticulum` at 14241a3), from the code and on a private netw
 - `announce = true`: normal announces 5 s after start, then every `announce_interval_minutes`,
   with app data `{"proto": "rrc", "v": 1, "hub": NAME}` (cbor2's bytes, checked in a unit test).
 - NAME is `rrc-bouncer for <upstream hash>` until the upstream hub's first WELCOME, then
-  `"<upstream name> (via rrc-bouncer)"`. It is the local hub's `default_app_data`
+  `"<upstream name> (via rrc-bouncer)"`, the upstream name cut on a character boundary so NAME is
+  at most 96 bytes and the app data at most 120, well inside an announce. It is the local hub's `default_app_data`
   (`DestinationHandle::set_default_app_data`), and announces and path responses are sent without
   app data of their own, so both carry it. A WELCOME with a new name sets it and, at once, announces
   the hubs (`announce = true`) or sends the uplink its path responses (`tcp`), so the network does
@@ -219,48 +220,90 @@ send out; unit-tested), and `run`, the task per hub that owns the link and feeds
   defaults.
 - **JOIN, one at a time.** The room set is joined in order (config rooms first), the next JOIN
   only after the last one's answer, because rrcd's errors for a refused JOIN do not always name
-  the room (`too many rooms`, a bad name: no room; `+i`, `+k`, ban: the room). The answer is:
-  - `JOINED` for the room: joined (rrcd sends the joiner its JOINED without a nick; the bouncer is
-    not yet a member, so it cannot be another member's).
-  - `ERROR` naming the room, or naming no room unless it is `rate limited`: the room failed, with
-    the hub's text. It is not tried again on this link.
-  - No answer in 20 s: failed, `no answer from the hub`.
+  the room. rrcd sends a joiner's JOINED and PARTED from the hub's identity, so `K_SRC` cannot tell
+  the bouncer's own from another member's; the body can, when rrcd's
+  `include_joined_member_list` puts the member's identity hash in it, and otherwise the bouncer's
+  own is the one without a nick (other members' carry theirs). The answer is:
+  - `JOINED` for the room: joined. A JOINED for a room whose JOIN timed out or was rate limited
+    is a late answer and is taken too.
+  - A refusal (`router.py` `_handle_join`, `service.py` `_norm_room`): failed with the hub's text,
+    and not tried again on this link. Without a room: `JOIN requires room name`, `too many rooms`,
+    or a text starting `room name` (empty, too long). Naming the pending room: `invite-only (+i)`,
+    `bad key (+k)`, `banned from room`.
+  - `ERROR "rate limited"` (no room) while the JOIN is pending, or no answer in 20 s: the JOIN was
+    lost, not refused. The room is tried again after 5, 10 and 20 s, then every 5 minutes for as
+    long as the link lasts, and shows as `trying again` with the reason and the count meanwhile.
+    The next room goes while it waits.
   - A name over `max_room_name_bytes` fails without being sent. Rooms past
-    `max_rooms_per_session` are not sent either and show as over the limit.
-  Failed and over-limit rooms are tried again on the next link. An `ERROR` naming a room the
-  bouncer is in (a kick: `kicked from <room>`) takes it out of the joined list until the next link
-  or a new JOIN for it from a client (M3).
-- **PART** (M3, `part_upstream = true`): sends PART and takes the room as left on a `PARTED`
-  without a nick (other members' PARTED carry theirs).
+    `max_rooms_per_session` are not sent either and show as over the limit; when a part or kick
+    makes room, they are joined.
+  Failed and over-limit rooms are tried again on the next link, or at once when a client JOINs
+  them (M3).
+- **Other ERRORs.** Only two take the bouncer out of a joined room, both from rrcd's
+  `commands.py` and naming the room: a text starting `kicked from ` (`/kick`) and
+  `banned from <room>` (a `/ban` that removes members). The room counts as failed until the next
+  link or a client's JOIN for it. Every other ERROR (`room is moderated (+m)`, `message too
+  large: …`, `not authorized`, `rate limited` with no JOIN pending, …) changes no room state: it
+  is a hub error, logged and handed to the relay (`Inbound::HubError`), which sends it to the
+  client whose envelope caused it.
+- **PART** (M3, `part_upstream = true`): sends PART and takes the room as left on the bouncer's
+  own PARTED (matched as above). With none in 20 s the room is taken as left anyway; a PARTED that
+  comes later is handled and not relayed. A JOINED for a room no longer wanted is answered with a PART. An added room is taken out of the room set file; a config room is kept out in
+  memory until the process restarts (or a client JOINs it again), and the config file is not
+  touched.
 - **PING.** A PING from the hub gets PONG with the same body (rrcd PINGs only if its
   `ping_interval_s` is set, and drops a link whose PONG is `ping_timeout_s` late). After 120 s with
-  nothing from the hub the bouncer sends PING (body: the time as a float, as rrcd does); no PONG in
-  60 s, or the link closing, ends the link. 120 s keeps an idle link's traffic small and is far
+  nothing from the hub the bouncer sends PING (body: the time as a float, as rrcd does). No PONG in
+  60 s sends one more PING, since one lost packet should not end a link; no PONG to that one
+  either, or the link closing, ends the link. 120 s keeps an idle link's traffic small and is far
   inside rrcd's defaults; a Reticulum link that went silent is otherwise noticed only after its
   keepalive, minutes later.
 - **Reconnect.** After the link ends, wait 5 s, doubling to 5 min, then connect again. A link that
   was welcomed and stayed up 60 s resets the wait to 5 s; a shorter one does not, so a hub that
   welcomes and then drops the link at once is not hammered. Every room is joined again on the new
-  link.
+  link, and the joined, failed, retrying and over-limit lists in the status are cleared when a link
+  ends.
 - **Rate.** rrcd's bucket is per link: `rate_limit_msgs_per_minute` tokens, full when the link
   opens, one token per packet of any type, and a packet into an empty bucket gets
   `ERROR "rate limited"` and is lost (`session.py` `refill_and_take`, `router.py:80-91`). The
   session keeps the same bucket (`src/rate.rs`) at 90 % of the limit (240 a minute until the
   WELCOME) and holds a packet until there is a token instead of losing it. Its own envelopes
-  (PONG, PING, JOIN, PART) go first; client envelopes (M3) wait in a queue of 256 behind them and
-  are sent only once the link is welcomed. A client envelope with the queue full or no link up is
-  dropped and counted (`dropped_sends`).
-- **Hooks for M3/M4.** `Command` (`Send`, `Join`, `Part`) goes in through the channel `run` gets;
-  `UpstreamEvent` (`Up(welcome)`, `Down`, `Envelope(env, Inbound)`) comes out through
-  `Upstream::events`, with backpressure (`send().await`). With no events channel (M2), the
-  envelopes the session does not handle itself (MSG, NOTICE, ERROR it cannot place, …) are logged
-  at debug and counted by type in `unhandled`.
+  (PONG, PING, JOIN, PART) go first.
+- **Client envelopes** (`Command::Send`, from M3):
+  - No link up: dropped at once.
+  - Link up but not welcomed yet, or its room is in the room set but not joined yet (JOIN pending
+    or waiting to try again): held, in arrival order, in a queue of at most 256
+    (`CLIENT_QUEUE`), each for at most 60 s (`CLIENT_HOLD`). A room that is joined, failed, over
+    the limit or not in the room set does not hold its envelopes: they go, and rrcd's answer
+    reaches the client.
+  - Dropped: with the queue full, after 60 s held, when the link ends with it still queued, or
+    when it is too large for the link.
+  Every drop counts in `dropped_sends` and is reported as `UpstreamEvent::SendDropped { envelope,
+  reason }`, the envelope as the client sent it (so its `K_ID` names it).
+- **Events and commands (the contract with the relay, M3).** The session task never waits on the
+  relay.
+  - Events: `Upstream::events` is an `mpsc` channel of `EVENT_QUEUE` (4096). The session sends
+    with `try_send`; a full channel drops the event, counts it in `dropped_events` and logs a
+    warning at the 1st, 2nd, 4th, 8th, … drop. Events: `Up(welcome)`, `Down`,
+    `Envelope(env, Inbound)` for everything the session does not handle itself (`Relay`,
+    `JoinConfirmed`, `JoinFailed`, `PartConfirmed`, `Removed`, `HubError`), and `SendDropped`.
+    With no events channel (M2), the `Relay` and `HubError` envelopes are logged at debug and
+    counted by type in `unhandled`.
+  - Commands: `Command` (`Send`, `Join`, `Part`) goes in through an `mpsc` channel of
+    `COMMAND_QUEUE` (1024). The relay must send with `try_send`, never `send().await`, so a slow
+    or reconnecting session cannot stall the clients of that hub; a full channel drops the
+    command, and the relay counts it and tells the client (an `ERROR` for a `Send`, as for a
+    `SendDropped`). `Join` and `Part` change the room set with or without a link.
 - **Room set file.** `state_dir/rooms/<upstream hash>.json`, `{"rooms": [...]}`, mode 0600 in a
-  0700 directory, written through a temporary file and a rename. It holds the rooms added while
-  the bouncer runs (a client's JOIN, M3); the config's `rooms` are not copied into it, and the
-  config file is never written. On start the names are normalised as the config's are and the file
-  is written back if that changed it; a file that does not parse stops the start with its path and
-  is left as it is. A config room taken out at run time (M3) comes back on the next start.
+  0700 directory, written to a temporary file that is synced, renamed over it, and the directory
+  synced, so a crash leaves the old or the new file; a failed write removes the temporary file. It
+  holds the rooms added while the bouncer runs (a client's JOIN, M3); the config's `rooms` are not
+  copied into it, and the config file is never written. On start the names are normalised as the
+  config's are and the file is written back if that changed it; a file that does not parse stops
+  the start with its path and is left as it is.
+- **Shutdown.** On a signal every session closes its link (waiting at most 5 s, `CLOSE_WAIT`) and
+  writes its status, within the bouncer's 10 s per session (`SESSION_STOP`, longer by a
+  compile-time check); Reticulum is stopped only after that, so no link outlives the transport.
 
 ## History
 
@@ -336,14 +379,15 @@ As of M2:
 - Each `hubs` entry adds the upstream link: `state` (`connecting`, `linked` before the WELCOME,
   `connected`, `disconnected`, `waiting`, `stopped`), `hub_name`, `hub_version`, `hub_caps`,
   `hub_limits`, `rooms` (the room set), `rooms_joined`, `rooms_failed` (room → reason),
-  `rooms_over_limit`, `last_connected_at`, `last_disconnected_at`, `last_error`, `connects`
+  `rooms_retrying` (room → reason and tries), `rooms_over_limit`, `last_connected_at`, `last_disconnected_at`, `last_error`, `connects`
   (welcomed links), `reconnects` (welcomed links after the first), `failed_attempts` (links that
-  ended before a WELCOME, or never opened), `next_attempt_at`, `unhandled` (type → count) and
-  `dropped_sends`. A change of state or rooms writes the file at once; the counters go out with
+  ended before a WELCOME, or never opened), `next_attempt_at`, `unhandled` (type → count),
+  `dropped_sends` and `dropped_events`. A change of state or rooms writes the file at once; the counters go out with
   the next minute's write. A file without these fields (from M1) still reads.
 - `status` prints, per hub, the link (`connected to "<name>" (version v), since …` or its state and
-  last error), the room set with `joined N of M`, the rooms not joined and why, the connect
-  counts, the next attempt, the envelopes not relayed yet and the dropped sends.
+  last error), the room set with `joined N of M`, the rooms not joined and why (a room being tried
+  again shows `trying again: <reason>; N tries`), the connect counts, the next attempt, the
+  envelopes not relayed yet, the dropped sends and the dropped events.
 
 ## Implementation notes
 

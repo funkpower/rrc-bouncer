@@ -16,7 +16,7 @@ use crate::config::{RnsAccess, Settings};
 use crate::envelope::{Envelope, MessageType};
 use crate::identity::{HUB_ASPECT, create_private_dir, hub_address, load_identity, load_or_create_hub_identity};
 use crate::rooms::RoomSet;
-use crate::upstream::{self, SharedStatus, Timings, Upstream, UpstreamStatus};
+use crate::upstream::{self, COMMAND_QUEUE, SharedStatus, Timings, Upstream, UpstreamStatus};
 
 /// How long to wait after starting before the first announce, so
 /// interfaces have come up.
@@ -31,10 +31,11 @@ const UPLINK_CHECK: Duration = Duration::from_secs(10);
 const UPLINK_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// Overrides `UPLINK_REFRESH`, in seconds, for tests/e2e.py.
 const UPLINK_REFRESH_ENV: &str = "RRC_BOUNCER_UPLINK_REFRESH_SECS";
-/// How long the upstream sessions get to close their links at shutdown.
-const SESSION_STOP: Duration = Duration::from_secs(5);
-/// Upstream commands waiting for a session beyond this many hold the sender.
-const COMMAND_QUEUE: usize = 64;
+/// How long the upstream sessions get to close their links at shutdown:
+/// longer than a session waits for its link to close, so each one gets to
+/// write `stopped` to its status.
+const SESSION_STOP: Duration = Duration::from_secs(10);
+const _: () = assert!(SESSION_STOP.as_secs() > upstream::CLOSE_WAIT.as_secs());
 
 fn uplink_refresh() -> Duration {
     std::env::var(UPLINK_REFRESH_ENV)
@@ -356,9 +357,11 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         locals.push((hub, local, rooms));
     }
 
-    let shutdown = ShutdownSignal::new();
-    let mut signals = rns_runtime::lifecycle::install_signal_handlers(shutdown.clone());
-    let runtime = start_reticulum(&settings, shutdown.clone()).await?;
+    // A signal stops the bouncer, not Reticulum: the upstream sessions close
+    // their links first, while the transport can still send the close and
+    // clean the link up, and `shutdown_and_wait` stops Reticulum after.
+    let mut signals = rns_runtime::lifecycle::install_signal_handlers(ShutdownSignal::new());
+    let runtime = start_reticulum(&settings, ShutdownSignal::new()).await?;
 
     let mut allowed = vec![identity.hash];
     allowed.extend(settings.allowed_identities.iter().copied());
@@ -369,8 +372,9 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     let mut tasks = Vec::new();
     let mut sessions = Vec::new();
     let mut session_status = Vec::new();
-    // The command senders the relay (M3) will use; held so the sessions'
-    // command channels stay open.
+    // The command senders the relay (M3) will use (with `try_send`; see
+    // `upstream::COMMAND_QUEUE`); held so the sessions' command channels
+    // stay open.
     let mut commands = Vec::new();
     let mut announced = Vec::new();
     let mut status = Status {
@@ -520,6 +524,22 @@ async fn futures_join_all(tasks: Vec<tokio::task::JoinHandle<()>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_upstream_name_is_cut_to_fit_the_announce() {
+        let long = "é".repeat(200);
+        let name = upstream::local_name(&long);
+        assert!(name.len() <= upstream::MAX_HUB_NAME_BYTES, "{}", name.len());
+        assert!(name.ends_with(" (via rrc-bouncer)"));
+        assert!(name.starts_with("éé"));
+        assert!(hub_app_data(&name).len() <= 120);
+        // An odd byte budget lands inside a two-byte character.
+        let mixed = format!("a{}", "é".repeat(100));
+        let name = upstream::local_name(&mixed);
+        assert!(name.len() <= upstream::MAX_HUB_NAME_BYTES);
+        assert_eq!(name.len(), upstream::MAX_HUB_NAME_BYTES - 1);
+        assert_eq!(upstream::local_name("test hub"), "test hub (via rrc-bouncer)");
+    }
 
     #[test]
     fn app_data_is_what_rrcd_announces() {
