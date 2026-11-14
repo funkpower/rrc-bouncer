@@ -27,6 +27,9 @@ shared_instance = true
 # tcp = "127.0.0.1:4242"
 # config_dir = "~/.config/rrc-bouncer/reticulum"
 
+# Room history, kept unencrypted under state_dir/history/. A client that joins
+# a room gets the last replay_hours of it, at most replay_max messages
+# (0 turns that off); /history N in a room asks for the last N.
 [history]
 days = 30
 max_mb = 100

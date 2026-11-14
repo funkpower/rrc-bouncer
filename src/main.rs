@@ -98,6 +98,7 @@ fn status(settings: &config::Settings, json: bool) -> Result<(), String> {
         println!("  hub {}  local hub {}", hub.upstream, hub.local_hub);
         print_upstream(&hub.link, running);
         print_relay(&hub.relay);
+        print_history(&hub.history);
     }
     Ok(())
 }
@@ -119,6 +120,18 @@ fn print_relay(r: &rrc_bouncer::relay::RelayStatus) {
     if r.refused_links > 0 {
         println!("    refused links    {}", r.refused_links);
     }
+}
+
+fn print_history(h: &rrc_bouncer::history::HistoryStatus) {
+    let rooms = if h.history_rooms == 1 { "room" } else { "rooms" };
+    println!(
+        "    history          {} bytes in {} {rooms}",
+        h.history_bytes, h.history_rooms
+    );
+    println!(
+        "    history written  {} records, {} dropped",
+        h.history_records, h.history_drops
+    );
 }
 
 fn print_upstream(u: &rrc_bouncer::upstream::UpstreamStatus, running: bool) {

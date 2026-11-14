@@ -30,7 +30,9 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::bouncer::local_hub_name;
 use crate::config::normalize_room;
-use crate::envelope::{Caps, Envelope, Limits, MessageType, Raw, Welcome};
+use crate::envelope::{Caps, Envelope, Limits, MessageType, Raw, Welcome, now_ms};
+use crate::history::{self, History, Query, Record};
+use crate::identity::hub_address;
 use crate::upstream::{CLIENT_HOLD, Command, EventReceiver, Inbound, SharedStatus, UpstreamEvent, local_name};
 
 /// A link that has not identified this long after it was established is
@@ -60,6 +62,23 @@ const LINK_MDU: usize = 431;
 /// A send to a client link that takes longer than this is given up, so a
 /// slow link does not hold up the others.
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+/// The gap between two envelopes of a replay. rsReticulum sends link
+/// packets best-effort, with no flow control, so a burst could overrun the
+/// client's link; 20 ms puts a full default replay (100) through in two
+/// seconds.
+const REPLAY_PACE: Duration = Duration::from_millis(20);
+/// Room envelopes held for a client while a replay of the room runs, most;
+/// later ones are dropped.
+const MAX_HELD: usize = 512;
+/// A replay not done by then is taken as done, and what was held for it is
+/// sent.
+const REPLAY_WAIT: Duration = Duration::from_secs(120);
+/// `/history` gives at most this many messages.
+pub const MAX_HISTORY: usize = 500;
+/// `/history` with no number, when `replay_max` is 0.
+const DEFAULT_HISTORY: usize = 100;
+/// The NOTICE that answers a bad `/history`.
+pub const HISTORY_USAGE: &str = "usage: /history [N], N from 1 to 500";
 /// The text of the ERROR a link of another identity gets.
 pub const NOT_ALLOWED: &str = "identity not allowed on this hub";
 
@@ -75,6 +94,93 @@ pub enum Output {
     Close(Link),
     /// Close a client link after `REFUSE_CLOSE_DELAY`.
     CloseLater(Link),
+    /// Send a client a room's history. The relay holds the room's
+    /// envelopes for that client until `Relay::replay_done`.
+    Replay(Replay),
+}
+
+/// A replay of a room's history to one client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replay {
+    pub link: Link,
+    pub query: Query,
+    /// Say so when there is nothing (`/history`); a JOIN's replay says
+    /// nothing then.
+    pub say_empty: bool,
+}
+
+/// Room envelopes held for a client while its replay of the room runs.
+#[derive(Debug)]
+struct Held {
+    since: Instant,
+    envelopes: Vec<Envelope>,
+}
+
+/// Whether a client MSG body is `/history [N]`, and what it asks for:
+/// Ok(N), capped at `MAX_HISTORY`, `default` with no number, Err for a bad
+/// number. The command word is matched as rrcd matches its own commands,
+/// whatever its case.
+fn history_request(body: &str, default: usize) -> Option<Result<usize, ()>> {
+    let mut words = body.trim().strip_prefix('/')?.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("history") {
+        return None;
+    }
+    Some(match (words.next(), words.next()) {
+        (None, _) => Ok(default.min(MAX_HISTORY)),
+        (Some(n), None) => match n.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n.min(MAX_HISTORY)),
+            _ => Err(()),
+        },
+        _ => Err(()),
+    })
+}
+
+/// What a replay sends: a NOTICE, the envelopes oldest first, a NOTICE;
+/// for an empty one, nothing, or with `say_empty` one NOTICE. Envelopes go
+/// as the hub sent them, but with K_SRC the local hub's identity where it
+/// was the upstream hub's (whose identity's hub address is `upstream`).
+pub fn replay_envelopes(
+    records: &[Record],
+    hub: &[u8; 16],
+    upstream: &[u8; 16],
+    room: &str,
+    say_empty: bool,
+) -> Vec<Envelope> {
+    let notice = |text: String| {
+        Envelope::new(MessageType::Notice, hub)
+            .with_room(room)
+            .with_body(Raw::text(&text))
+    };
+    let mut envelopes: Vec<Envelope> = Vec::new();
+    let mut oldest = None;
+    for record in records {
+        let Ok(mut env) = Envelope::decode(&record.envelope) else {
+            continue;
+        };
+        if let Ok(src) = <[u8; 16]>::try_from(&env.src[..])
+            && hub_address(&src) == *upstream
+        {
+            env.src = hub.to_vec();
+        }
+        oldest.get_or_insert(record.ts_ms);
+        envelopes.push(env);
+    }
+    let Some(oldest) = oldest else {
+        return if say_empty {
+            vec![notice(format!("--- no history in {room} ---"))]
+        } else {
+            Vec::new()
+        };
+    };
+    let n = envelopes.len();
+    let what = if n == 1 { "message" } else { "messages" };
+    let mut out = vec![notice(format!(
+        "--- replay: {n} {what} since {} ---",
+        history::utc(oldest)
+    ))];
+    out.extend(envelopes);
+    out.push(notice("--- end of replay ---".into()));
+    out
 }
 
 /// One local hub's clients and traffic in status.json. Every field has a
@@ -273,6 +379,11 @@ pub struct Relay {
     greeting: Vec<Envelope>,
     /// Until when room-less hub NOTICEs are taken as the greeting.
     greeting_until: Option<Instant>,
+    history: History,
+    replay_window: Duration,
+    replay_max: usize,
+    /// Replays running, by client and room.
+    replaying: BTreeMap<(Link, String), Held>,
 }
 
 /// Everything a relay needs.
@@ -287,6 +398,11 @@ pub struct RelayConfig {
     pub commands: mpsc::Sender<Command>,
     pub session: SharedStatus,
     pub status: SharedRelayStatus,
+    pub history: History,
+    /// A JOIN replays what came in this long before it; zero: no replay.
+    pub replay_window: Duration,
+    /// A JOIN replays at most this many messages; 0: no replay.
+    pub replay_max: usize,
 }
 
 impl Relay {
@@ -313,6 +429,10 @@ impl Relay {
             join_notice: BTreeMap::new(),
             greeting: Vec::new(),
             greeting_until: None,
+            history: config.history,
+            replay_window: config.replay_window,
+            replay_max: config.replay_max,
+            replaying: BTreeMap::new(),
         }
     }
 
@@ -490,6 +610,7 @@ impl Relay {
         if self.clients.remove(&link).is_some() {
             self.show_clients();
         }
+        self.replaying.retain(|(l, _), _| *l != link);
         // Its commands' answers have nobody to go to; they still take
         // their place in the order.
         self.sent.retain(|s| s.link != link);
@@ -573,12 +694,98 @@ impl Relay {
             _ if !welcomed => out.push(Output::Client(link, self.error(None, "send HELLO first"))),
             MessageType::Join => self.join(link, &env, &mut out),
             MessageType::Part => self.part(link, identity, &env, &mut out),
+            MessageType::Msg if self.history_command(link, &env, &mut out) => {}
             MessageType::Msg | MessageType::Action | MessageType::Notice => {
                 self.message(link, env, now, &mut out);
             }
             other => tracing::debug!("client {}: ignored a {other:?}", hex::encode(link)),
         }
-        out
+        self.hold(out, now)
+    }
+
+    /// A client's `/history [N]`, answered here, never sent upstream:
+    /// false if `env` is not one.
+    fn history_command(&mut self, link: Link, env: &Envelope, out: &mut Vec<Output>) -> bool {
+        let default = if self.replay_max == 0 {
+            DEFAULT_HISTORY
+        } else {
+            self.replay_max
+        };
+        let Some(request) = env.text_body().and_then(|b| history_request(&b, default)) else {
+            return false;
+        };
+        let room = env.room.as_deref().and_then(normalize_room);
+        let notice = |relay: &Self, text: &str| {
+            let mut env = relay.own(MessageType::Notice).with_body(Raw::text(text));
+            env.room = room.clone();
+            env
+        };
+        match (request, &room) {
+            (Ok(max), Some(room)) => {
+                if self.replaying.contains_key(&(link, room.clone())) {
+                    let env = notice(self, &format!("--- a replay of {room} is running ---"));
+                    self.deliver(out, &[link], &env);
+                } else {
+                    out.push(Output::Replay(Replay {
+                        link,
+                        query: Query {
+                            room: room.clone(),
+                            since_ms: None,
+                            max,
+                        },
+                        say_empty: true,
+                    }));
+                }
+            }
+            _ => {
+                let env = notice(self, HISTORY_USAGE);
+                self.deliver(out, &[link], &env);
+            }
+        }
+        true
+    }
+
+    /// Hold the room envelopes for a client that come after its replay of
+    /// the room started, so they reach it after the replay.
+    fn hold(&mut self, out: Vec<Output>, now: Instant) -> Vec<Output> {
+        let mut sent = Vec::with_capacity(out.len());
+        for output in out {
+            match output {
+                Output::Replay(replay) => {
+                    let key = (replay.link, replay.query.room.clone());
+                    if self.replaying.contains_key(&key) {
+                        continue;
+                    }
+                    self.replaying.insert(
+                        key,
+                        Held {
+                            since: now,
+                            envelopes: Vec::new(),
+                        },
+                    );
+                    sent.push(Output::Replay(replay));
+                }
+                Output::Client(link, env) => {
+                    let room = env.room.as_deref().and_then(normalize_room);
+                    match room.and_then(|r| self.replaying.get_mut(&(link, r))) {
+                        Some(held) if held.envelopes.len() < MAX_HELD => held.envelopes.push(env),
+                        Some(_) => self.tally(|s| s.relay_drops += 1),
+                        None => sent.push(Output::Client(link, env)),
+                    }
+                }
+                other => sent.push(other),
+            }
+        }
+        sent
+    }
+
+    /// A client's replay of a room is over: what was held for it follows.
+    pub fn replay_done(&mut self, link: Link, room: &str) -> Vec<Output> {
+        let held = self.replaying.remove(&(link, room.to_string()));
+        held.into_iter()
+            .flat_map(|h| h.envelopes)
+            .map(|env| Output::Client(link, env))
+            .collect()
     }
 
     /// A room name, checked as rrcd's `_norm_room` checks it, or the text
@@ -650,13 +857,30 @@ impl Relay {
         }
     }
 
-    /// M4: replay the room's history to a client that just joined it.
-    fn replay(&mut self, _link: Link, _room: &str, _out: &mut Vec<Output>) {}
+    /// Replay the room's history to a client that just joined it: the
+    /// newest `replay_max` messages of the last `replay_window`.
+    fn replay(&mut self, link: Link, room: &str, out: &mut Vec<Output>) {
+        if self.replay_max == 0 || self.replay_window.is_zero() {
+            return;
+        }
+        let window = u64::try_from(self.replay_window.as_millis()).unwrap_or(u64::MAX);
+        out.push(Output::Replay(Replay {
+            link,
+            query: Query {
+                room: room.to_string(),
+                since_ms: Some(now_ms().saturating_sub(window)),
+                max: self.replay_max,
+            },
+            say_empty: false,
+        }));
+    }
 
-    /// M4: keep an envelope from the hub in the room's history. It gets
-    /// every envelope the hub sends to the room as a whole (see DESIGN.md
+    /// Keep an envelope from the hub in the room's history. It gets every
+    /// envelope the hub sends to the room as a whole (see DESIGN.md
     /// § Local hub, History).
-    fn record(&mut self, _room: &str, _env: &Envelope) {}
+    fn record(&mut self, room: &str, env: &Envelope) {
+        self.history.record(room, env);
+    }
 
     fn part(&mut self, link: Link, identity: [u8; 16], env: &Envelope, out: &mut Vec<Output>) {
         let Some(raw) = env.room.as_deref().filter(|r| !r.is_empty()) else {
@@ -896,7 +1120,7 @@ impl Relay {
             }
             UpstreamEvent::Envelope(env, inbound) => self.hub_envelope(env, inbound, now, &mut out),
         }
-        out
+        self.hold(out, now)
     }
 
     /// The session went down: what was joined through it is gone.
@@ -1076,6 +1300,8 @@ impl Relay {
                             links.push(command.link);
                         }
                     }
+                    // The NOTICE about the room is for the joiner: not kept.
+                    None if fresh => {}
                     None => self.record(room, &env),
                 }
                 links
@@ -1105,8 +1331,20 @@ impl Relay {
         self.deliver(out, &links, &env);
     }
 
-    /// Time passing: close links that never identified, forget old sends.
+    /// Time passing: close links that never identified, forget old sends,
+    /// end replays that never said they were done.
     pub fn tick(&mut self, now: Instant) -> Vec<Output> {
+        let stuck: Vec<(Link, String)> = self
+            .replaying
+            .iter()
+            .filter(|(_, h)| now.saturating_duration_since(h.since) >= REPLAY_WAIT)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut out = Vec::new();
+        for (link, room) in stuck {
+            tracing::warn!("a replay of {room} did not end in {}s", REPLAY_WAIT.as_secs());
+            out.extend(self.replay_done(link, &room));
+        }
         let late: Vec<Link> = self
             .clients
             .iter()
@@ -1126,7 +1364,8 @@ impl Relay {
         if self.greeting_until.is_some_and(|until| now >= until) {
             self.greeting_until = None;
         }
-        late.into_iter().map(Output::Close).collect()
+        out.extend(late.into_iter().map(Output::Close));
+        out
     }
 }
 
@@ -1177,6 +1416,54 @@ pub struct LocalHub {
 /// How often the relay's clock runs.
 const TICK: Duration = Duration::from_secs(1);
 
+/// Send a client its replay, paced, then tell the relay it is done (also
+/// when the task ends early). `records` was asked for when the replay
+/// started, so a record the hub sent after that is held, not replayed.
+async fn send_replay(
+    handle: DestinationHandle,
+    replay: Replay,
+    records: tokio::sync::oneshot::Receiver<Vec<Record>>,
+    ids: ([u8; 16], [u8; 16]),
+    status: SharedRelayStatus,
+    done: mpsc::UnboundedSender<(Link, String)>,
+) {
+    struct Done(mpsc::UnboundedSender<(Link, String)>, Link, String);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            let _ = self.0.send((self.1, std::mem::take(&mut self.2)));
+        }
+    }
+    let Replay { link, query, say_empty } = replay;
+    let _done = Done(done, link, query.room.clone());
+    let records = records.await.unwrap_or_default();
+    let (hub, upstream) = ids;
+    let envelopes = replay_envelopes(&records, &hub, &upstream, &query.room, say_empty);
+    for (i, env) in envelopes.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(REPLAY_PACE).await;
+        }
+        let sent = matches!(
+            tokio::time::timeout(SEND_TIMEOUT, handle.send_link_packet(link, env.encode())).await,
+            Ok(Ok(_))
+        );
+        if let Ok(mut s) = status.lock() {
+            if sent {
+                s.relayed_out += 1;
+            } else {
+                s.relay_drops += 1;
+            }
+        }
+        if !sent {
+            tracing::debug!(
+                "replay of {} to link {}: send failed, given up",
+                query.room,
+                hex::encode(link)
+            );
+            break;
+        }
+    }
+}
+
 /// A packet from a client link.
 fn link_packet(relay: &mut Relay, identities: &LinkIdentities, tag: &str, link: Link, data: &[u8]) -> Vec<Output> {
     let now = Instant::now();
@@ -1209,6 +1496,7 @@ pub async fn run(hub: LocalHub) {
     let events = &mut registered.events;
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let (replayed, mut replays_done) = mpsc::unbounded_channel::<(Link, String)>();
     loop {
         let now = Instant::now();
         let outputs = tokio::select! {
@@ -1263,6 +1551,7 @@ pub async fn run(hub: LocalHub) {
                 out
             }
             _ = ticker.tick() => relay.tick(now),
+            Some((link, room)) = replays_done.recv() => relay.replay_done(link, &room),
             Some(_) = events.packets.recv() => Vec::new(),
             Some(_) = events.link_packet_proofs.recv() => Vec::new(),
             Some(_) = events.resource_completions.recv() => Vec::new(),
@@ -1302,6 +1591,19 @@ pub async fn run(hub: LocalHub) {
                         tokio::time::sleep(REFUSE_CLOSE_DELAY).await;
                         let _ = handle.close_link(link, CloseReason::DestinationClosed, true).await;
                     });
+                }
+                // Asked now, before the next event is recorded; sent on its
+                // own task, so one client's replay holds up nobody else.
+                Output::Replay(replay) => {
+                    let records = relay.history.query(replay.query.clone());
+                    tokio::spawn(send_replay(
+                        handle.clone(),
+                        replay,
+                        records,
+                        (relay.hub, relay.upstream),
+                        relay.status.clone(),
+                        replayed.clone(),
+                    ));
                 }
             }
         }
@@ -1348,6 +1650,10 @@ mod tests {
             commands: tx,
             session: session.clone(),
             status: status.clone(),
+            history: History::disabled(),
+            // The M3 tests run without replays; `replays` turns them on.
+            replay_window: Duration::from_secs(3600),
+            replay_max: 0,
         });
         Fixture {
             relay,
@@ -2133,6 +2439,9 @@ mod tests {
             commands: tx,
             session: SharedStatus::default(),
             status: SharedRelayStatus::default(),
+            history: History::disabled(),
+            replay_window: Duration::ZERO,
+            replay_max: 0,
         });
         let now = Instant::now();
         relay.upstream(
@@ -2321,5 +2630,291 @@ mod tests {
         let reply = from_hub(MessageType::Notice).with_body(Raw::text("Registered public rooms:"));
         assert_eq!(links(&f.hub(reply, Inbound::Relay)), vec![A]);
         assert!(f.relay.pending_commands.is_empty());
+    }
+
+    impl Fixture {
+        fn replays(mut self, max: usize) -> Self {
+            self.relay.replay_max = max;
+            self
+        }
+    }
+
+    fn replays_in(out: &[Output]) -> Vec<Replay> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Replay(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn room_msg(room: &str, body: &str) -> Envelope {
+        Envelope::new(MessageType::Msg, &OTHER)
+            .with_room(room)
+            .with_body(Raw::text(body))
+    }
+
+    #[test]
+    fn history_requests() {
+        assert_eq!(history_request("/history", 100), Some(Ok(100)));
+        assert_eq!(history_request("  /HISTORY  ", 100), Some(Ok(100)));
+        // As rrcd splits a command line.
+        assert_eq!(history_request("/ history 3", 100), Some(Ok(3)));
+        assert_eq!(history_request("/history 5", 100), Some(Ok(5)));
+        assert_eq!(history_request("/history\t7 ", 100), Some(Ok(7)));
+        assert_eq!(history_request("/history 9999", 100), Some(Ok(MAX_HISTORY)));
+        assert_eq!(history_request("/history", 9999), Some(Ok(MAX_HISTORY)));
+        for bad in [
+            "/history 0",
+            "/history -1",
+            "/history x",
+            "/history 5 6",
+            "/history 99999999999999999999999",
+        ] {
+            assert_eq!(history_request(bad, 100), Some(Err(())), "{bad}");
+        }
+        for not in ["/historyx", "/list", "history", "hello /history"] {
+            assert_eq!(history_request(not, 100), None, "{not}");
+        }
+    }
+
+    #[test]
+    fn a_replay_is_framed_and_keeps_the_envelopes_but_the_upstream_hubs_src() {
+        let upstream = hub_address(&UPSTREAM_HUB);
+        let mut said = room_msg("lobby", "hi").with_nick(Some("d"));
+        said.extra.push((64, Raw::text("fmt")));
+        let notice = from_hub(MessageType::Notice)
+            .with_room("lobby")
+            .with_body(Raw::text("topic changed"));
+        let records = vec![
+            Record {
+                ts_ms: 1_794_567_845_123,
+                envelope: said.encode(),
+            },
+            Record {
+                ts_ms: 1_794_567_846_000,
+                envelope: notice.encode(),
+            },
+        ];
+        let out = replay_envelopes(&records, &HUB, &upstream, "lobby", false);
+        assert_eq!(out.len(), 4);
+        for frame in [&out[0], &out[3]] {
+            assert_eq!((frame.t, frame.room.as_deref()), (MessageType::Notice, Some("lobby")));
+            assert_eq!(frame.src, HUB.to_vec());
+        }
+        assert_eq!(
+            out[0].text_body().as_deref(),
+            Some("--- replay: 2 messages since 2026-11-13T11:04:05Z ---")
+        );
+        assert_eq!(out[3].text_body().as_deref(), Some("--- end of replay ---"));
+        assert_eq!(out[1], said);
+        assert_eq!(out[1].encode(), said.encode());
+        let mut local = notice.clone();
+        local.src = HUB.to_vec();
+        assert_eq!(out[2], local);
+        // One message; nothing.
+        let one = replay_envelopes(&records[..1], &HUB, &upstream, "lobby", false);
+        assert!(one[0].text_body().unwrap().starts_with("--- replay: 1 message since "));
+        assert!(replay_envelopes(&[], &HUB, &upstream, "lobby", false).is_empty());
+        let empty = replay_envelopes(&[], &HUB, &upstream, "lobby", true);
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].text_body().as_deref(), Some("--- no history in lobby ---"));
+    }
+
+    #[test]
+    fn a_join_replays_and_holds_the_rooms_envelopes_until_done() {
+        let mut f = fixture().replays(50);
+        f.up();
+        f.joined_upstream("lobby", &[&USER, &OTHER]);
+        f.in_rooms(B, &["lobby"]);
+        let _ = f.relay.replay_done(B, "lobby");
+        f.connect(A, USER);
+        f.hello(A);
+        let out = f.packet(A, &client(MessageType::Join).with_room("lobby"));
+        assert_eq!(sent_to(&out)[0].1.t, MessageType::Joined);
+        let replays = replays_in(&out);
+        assert_eq!(replays.len(), 1);
+        let r = &replays[0];
+        assert_eq!(
+            (r.link, r.query.room.as_str(), r.query.max, r.say_empty),
+            (A, "lobby", 50, false)
+        );
+        let since = r.query.since_ms.unwrap();
+        assert!(now_ms() - since >= 3_600_000 && now_ms() - since < 3_610_000);
+        // A JOIN while the replay runs starts no second one.
+        let again = f.packet(A, &client(MessageType::Join).with_room("lobby"));
+        assert!(replays_in(&again).is_empty());
+        // The room's envelopes wait for A; B gets them now; other rooms
+        // are not held.
+        let first = f.hub(room_msg("lobby", "one"), Inbound::Relay);
+        assert_eq!(links(&first), vec![B]);
+        f.hub(room_msg("lobby", "two"), Inbound::Relay);
+        let done = f.relay.replay_done(A, "lobby");
+        let bodies: Vec<String> = sent_to(&done)
+            .iter()
+            .map(|(l, e)| {
+                assert_eq!(*l, A);
+                e.text_body().unwrap_or_default()
+            })
+            .collect();
+        // The JOINED answering the second JOIN, then the two messages.
+        assert_eq!(bodies[1..], ["one".to_string(), "two".to_string()]);
+        assert_eq!(links(&f.hub(room_msg("lobby", "three"), Inbound::Relay)), vec![A, B]);
+    }
+
+    #[test]
+    fn a_replay_ends_at_a_close_or_in_time() {
+        let mut f = fixture().replays(10);
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.in_rooms(A, &["lobby"]);
+        f.in_rooms(B, &["lobby"]);
+        f.hub(room_msg("lobby", "held"), Inbound::Relay);
+        f.relay.link_closed(A);
+        assert!(f.relay.replay_done(A, "lobby").is_empty());
+        let out = f.relay.tick(f.now + REPLAY_WAIT);
+        assert_eq!(links(&out), vec![B]);
+        assert!(f.relay.replaying.is_empty());
+        // Too much to hold: the rest is dropped and counted.
+        f.in_rooms(C, &["lobby"]);
+        for i in 0..MAX_HELD + 3 {
+            f.hub(room_msg("lobby", &i.to_string()), Inbound::Relay);
+        }
+        assert_eq!(f.relay.replay_done(C, "lobby").len(), MAX_HELD);
+        assert!(f.status.lock().unwrap().relay_drops >= 3);
+    }
+
+    #[test]
+    fn no_replay_when_replay_max_is_zero() {
+        let mut f = fixture();
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.connect(A, USER);
+        f.hello(A);
+        let out = f.packet(A, &client(MessageType::Join).with_room("lobby"));
+        assert!(replays_in(&out).is_empty());
+        // A new room joined upstream: no replay either.
+        f.packet(A, &client(MessageType::Join).with_room("side"));
+        assert!(replays_in(&f.joined_upstream("side", &[&USER])).is_empty());
+    }
+
+    #[test]
+    fn a_new_room_replays_when_joined_upstream() {
+        let mut f = fixture().replays(5);
+        f.up();
+        f.connect(A, USER);
+        f.hello(A);
+        f.packet(A, &client(MessageType::Join).with_room("side"));
+        let out = f.joined_upstream("side", &[&USER]);
+        let sent = sent_to(&out);
+        assert_eq!((sent[0].0, sent[0].1.t), (A, MessageType::Joined));
+        assert_eq!(replays_in(&out).len(), 1);
+    }
+
+    #[test]
+    fn history_is_answered_locally_to_its_client() {
+        let mut f = fixture();
+        f.in_rooms(A, &[]);
+        f.in_rooms(B, &[]);
+        // Works with the session down, and asks no time window.
+        let ask = |body: &str, room: Option<&str>| {
+            let mut env = client(MessageType::Msg).with_body(Raw::text(body));
+            env.room = room.map(String::from);
+            env
+        };
+        let out = f.packet(A, &ask("/history 7", Some("Lobby")));
+        assert!(f.command().is_none());
+        assert!(sent_to(&out).is_empty());
+        assert_eq!(
+            replays_in(&out),
+            vec![Replay {
+                link: A,
+                query: Query {
+                    room: "lobby".into(),
+                    since_ms: None,
+                    max: 7
+                },
+                say_empty: true
+            }]
+        );
+        // While it runs, another is refused with a NOTICE (held for after).
+        assert!(f.packet(A, &ask("/history", Some("lobby"))).is_empty());
+        let after = f.relay.replay_done(A, "lobby");
+        assert!(sent_to(&after)[0].1.text_body().unwrap().contains("is running"));
+        // No number: replay_max, or 100 when that is 0.
+        assert_eq!(
+            replays_in(&f.packet(B, &ask("/history", Some("lobby"))))[0].query.max,
+            100
+        );
+        // A bad one, or none in no room: the usage, to that client.
+        for (body, room) in [("/history 0", Some("side")), ("/history", None)] {
+            let sent = sent_to(&f.packet(A, &ask(body, room)));
+            assert_eq!(sent.len(), 1);
+            let (link, notice) = &sent[0];
+            assert_eq!(
+                (*link, notice.t, notice.src.as_slice()),
+                (A, MessageType::Notice, &HUB[..])
+            );
+            assert_eq!(notice.room.as_deref(), room);
+            assert_eq!(notice.text_body().as_deref(), Some(HISTORY_USAGE));
+        }
+        assert!(f.command().is_none());
+        // ACTION and NOTICE are not the command; nor is /historyx.
+        f.up();
+        f.packet(
+            A,
+            &client(MessageType::Notice)
+                .with_room("lobby")
+                .with_body(Raw::text("/history")),
+        );
+        assert!(matches!(f.command(), Some(Command::Send(_))));
+        f.packet(A, &ask("/historyx", Some("lobby")));
+        assert!(matches!(f.command(), Some(Command::Send(_))));
+    }
+
+    #[tokio::test]
+    async fn room_envelopes_are_recorded_with_no_client_but_not_the_join_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = History::start(
+            dir.path().join("h"),
+            crate::config::HistorySettings {
+                retention: Duration::from_secs(86_400),
+                max_bytes: 1_000_000,
+                replay_window: Duration::from_secs(3600),
+                replay_max: 100,
+            },
+            Default::default(),
+        )
+        .unwrap();
+        let mut f = fixture();
+        f.relay.history = history.clone();
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        let about = from_hub(MessageType::Notice)
+            .with_room("lobby")
+            .with_body(Raw::text("room lobby: unregistered; mode=+nt; topic=(none)"));
+        f.hub(about, Inbound::Relay);
+        let said = room_msg("lobby", "hello");
+        f.hub(said.clone(), Inbound::Relay);
+        let joined = from_hub(MessageType::Joined)
+            .with_room("lobby")
+            .with_body(members(&[&OTHER]));
+        f.hub(joined, Inbound::Relay);
+        let mut echo = client(MessageType::Action)
+            .with_room("lobby")
+            .with_body(Raw::text("waves"));
+        echo.nick = Some("me".into());
+        f.hub(echo.clone(), Inbound::Relay);
+        let records = history
+            .query(Query {
+                room: "lobby".into(),
+                since_ms: None,
+                max: 10,
+            })
+            .await
+            .unwrap();
+        let got: Vec<Envelope> = records.iter().map(|r| Envelope::decode(&r.envelope).unwrap()).collect();
+        assert_eq!(got, vec![said, echo]);
+        history.stop().await;
     }
 }

@@ -21,9 +21,14 @@ host's own rnsd or any other network. Run through tests/e2e.sh.
         (B says HELLO in the same breath as its identify, as NomadNet does)
   D  an RRC client of H under an identity of its own, in the same room
   Y  an RRC client of the local hub holding an identity it does not allow
+  D3, E  RRC clients of H under identities of their own, in room hist
+  A3-A8  RRC clients of the local hub holding the user's identity, each
+         joining hist to see what is replayed
 """
 
 import argparse
+import calendar
+import io
 import json
 import os
 import shutil
@@ -199,14 +204,17 @@ class Run:
         if not self.wait_event(name, lambda e: e["event"] == "ready", 180):
             raise Failure(f"{name} did not start")
 
-    def config(self, name, reticulum, announce=False, upstream=UPSTREAM, nick=None, allowed=(), part_upstream=False):
+    def config(self, name, reticulum, announce=False, upstream=UPSTREAM, nick=None, allowed=(), part_upstream=False,
+               rooms=("lobby",), history=None):
         path = self.path(f"{name}.toml")
         with open(path, "w") as f:
             f.write(f'identity = "ids/user"\nstate_dir = "state"\nlog_level = "debug"\n'
                     f"announce = {'true' if announce else 'false'}\n"
                     f"part_upstream = {'true' if part_upstream else 'false'}\n"
-                    f'allowed_identities = {json.dumps(list(allowed))}\n\n[reticulum]\n{reticulum}\n\n'
-                    f'[[hub]]\naddress = "{upstream}"\nrooms = ["lobby"]\n')
+                    f'allowed_identities = {json.dumps(list(allowed))}\n\n[reticulum]\n{reticulum}\n\n')
+            if history:
+                f.write("[history]\n" + "".join(f"{k} = {v}\n" for k, v in history.items()) + "\n")
+            f.write(f'[[hub]]\naddress = "{upstream}"\nrooms = {json.dumps(list(rooms))}\n')
             if nick:
                 f.write(f'nick = "{nick}"\n')
         return path
@@ -588,6 +596,7 @@ def relay_phases(run, args, port_r, upstream, user, local, config, env, found):
     run.stop("Y2")
     check(run.stop("BR") == 0, "the bouncer stops cleanly")
     part_upstream_phases(run, args, port_r, upstream, user, local, env, found, hub_id)
+    history_phases(run, args, port_r, upstream, user, local, env, found)
 
 
 def part_upstream_phases(run, args, port_r, upstream, user, local, env, found, hub_id):
@@ -639,6 +648,279 @@ def part_upstream_phases(run, args, port_r, upstream, user, local, env, found, h
     check(run.stop("BR") == 0, "the bouncer stops cleanly")
 
 
+HISTORY_USAGE = "usage: /history [N], N from 1 to 500"
+END_OF_REPLAY = "--- end of replay ---"
+
+
+def history_file(run, upstream, room):
+    return run.path("state", "history", upstream, f"{room}.log")
+
+
+def read_history(path):
+    """A room's history file: its records, and whether it ends on a whole record."""
+    with open(path, "rb") as f:
+        data = f.read()
+    stream = io.BytesIO(data)
+    records = []
+    while stream.tell() < len(data):
+        try:
+            record = cbor2.load(stream)
+        except Exception:
+            return records, False
+        records.append(dict(ts_ms=record["ts_ms"], env=cbor2.loads(record["envelope"])))
+    return records, True
+
+
+def history_record(ts_ms, t, src, body, nick=None, room="hist"):
+    """A history record written by hand, and its envelope's K_ID."""
+    env = {0: 1, 1: t, 2: os.urandom(8), 3: ts_ms, 4: bytes.fromhex(src), 5: room, 6: body}
+    if nick is not None:
+        env[7] = nick
+    return cbor2.dumps({"ts_ms": ts_ms, "envelope": cbor2.dumps(env)}), env[2].hex()
+
+
+def utc(ts_ms):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts_ms // 1000))
+
+
+def replayed(run, name, room, since, timeout=30):
+    """The next replay a client got in a room after `since`: its opening
+    NOTICE, the envelopes in between, and its closing NOTICE; None if no
+    replay ended in time."""
+    if run.wait_event(name, lambda e: e["event"] == "env" and e["at"] >= since and e["t"] == 21
+                      and e["room"] == room and e["body"] == END_OF_REPLAY, timeout) is None:
+        return None
+    got = [e for e in envs(run, name, room=room) if e["at"] >= since]
+    start = next(i for i, e in enumerate(got) if e["t"] == 21 and str(e["body"]).startswith("--- replay: "))
+    end = next(i for i, e in enumerate(got) if i > start and e["body"] == END_OF_REPLAY)
+    return got[start], got[start + 1:end], got[end]
+
+
+def same(env, expected):
+    keys = ("id", "t", "ts", "src", "nick", "body", "room")
+    return all(env.get(k) == expected.get(k) for k in keys)
+
+
+def check_replay(run, name, room, since, hub_id, expected, what):
+    """A replay of `expected` (env events as first delivered) framed by the
+    two NOTICEs from the local hub; returns the opening NOTICE."""
+    got = replayed(run, name, room, since)
+    check(got is not None, f"{name}: a replay ends in {room} ({what})")
+    start, middle, end = got
+    n = len(expected)
+    check(start["src"] == hub_id and end["src"] == hub_id and start["nick"] is None,
+          f"{name}: both framing NOTICEs come from the local hub")
+    check(start["body"].startswith(f"--- replay: {n} message{'' if n == 1 else 's'} since ")
+          and start["body"].endswith(" ---"), f"{name}: \"{start['body']}\"")
+    ids = [e["id"] for e in middle]
+    if [e["id"] for e in expected] != ids:
+        raise Failure(f"{name} got {[e['body'] for e in middle]}, not {[e['body'] for e in expected]}")
+    bad = [e["body"] for e, x in zip(middle, expected) if not same(e, x)]
+    check(not bad, f"{name}: {n} envelope{'' if n == 1 else 's'} in order, each with its K_ID, K_TS, K_SRC, "
+                   "K_NICK and body")
+    return start
+
+
+def no_replay(run, name, room, since, wait=4):
+    time.sleep(wait)
+    return not [e for e in envs(run, name, room=room) if e["at"] >= since
+                and (e["t"] in (20, 22) or str(e["body"]).startswith("--- replay"))]
+
+
+def history_phases(run, args, port_r, upstream, user, local, env, found):
+    print("history: the bouncer records hist with no client linked", flush=True)
+    run.stop("H")
+    run.rrcd(args.rrcd, port_r, max_rooms=6)
+    direct = RNS.Identity.from_file(run.identity("direct")).hash.hex()
+    eve = RNS.Identity.from_file(run.identity("eve")).hash.hex()
+    upstream_id = RNS.Identity.from_file(run.identity("rrcd-hub")).hash.hex()
+    hub_id = None
+    reticulum = f'tcp = "127.0.0.1:{port_r}"'
+    rooms = ("lobby", "hist")
+
+    def bouncer(**history):
+        config = run.config("history", reticulum, upstream=upstream, nick="bnc", rooms=rooms, history=history)
+        run.start("BR", [args.bouncer, "--config", config, "run"], env=env)
+        hub = run.wait_status(upstream, lambda h: h["state"] == "connected" and "hist" in h["rooms_joined"], 60)
+        check(hub["state"] == "connected" and "hist" in hub["rooms_joined"],
+              f"the bouncer is in hist ({', '.join(f'{k} = {v}' for k, v in history.items()) or 'defaults'})")
+        return config
+
+    def client(name):
+        nonlocal hub_id
+        driven(run, name, port_r, "user", local, name.lower())
+        check(wait_env(run, name, 40, t=2) is not None, f"{name} links to the local hub")
+        linked = next(e["hub_identity"] for e in run.events(name) if e["event"] == "link")
+        hub_id = hub_id or linked
+        check(linked == hub_id, f"{name}: the local hub's identity is {hub_id}")
+
+    def join(name, room="hist"):
+        since = time.time()
+        command(run, name, op="join", room=room)
+        joined = wait_env(run, name, 40, t=11, room=room)
+        check(joined is not None and joined["src"] == hub_id, f"{name} joins {room}: JOINED")
+        return since
+
+    def history(name, n, room="hist"):
+        since = time.time()
+        command(run, name, op="send", t=20, room=room, body=f"/history {n}")
+        return since
+
+    bouncer()
+    driven(run, "D3", port_r, "direct", upstream, "dee")
+    driven(run, "E", port_r, "eve", upstream, "eve")
+    check(wait_env(run, "D3", 40, t=2) and wait_env(run, "E", 40, t=2), "D3 and E link to rrcd H")
+    command(run, "D3", op="join", room="hist")
+    check(wait_env(run, "D3", t=11, room="hist") is not None, "D3 joins hist on rrcd H")
+    command(run, "E", op="join", room="hist")
+    check(wait_env(run, "D3", t=11, room="hist", body=[eve]) is not None, "D3 sees E join hist")
+    command(run, "E", op="part", room="hist")
+    check(wait_env(run, "D3", t=13, room="hist") is not None, "D3 sees E part hist")
+    said = []
+    for t, body in ((20, "first, before anyone linked"), (22, "waves at nobody"), (21, "a notice to hist")):
+        ident = os.urandom(8).hex()
+        command(run, "D3", op="send", id=ident, t=t, room="hist", body=body)
+        echo = wait_env(run, "D3", id=ident)
+        check(echo is not None, f"D3 says t={t} \"{body}\" in hist")
+        said.append(echo)
+    path = history_file(run, upstream, "hist")
+    end = time.time() + 10
+    while time.time() < end and not (os.path.exists(path) and len(read_history(path)[0]) >= 6):
+        time.sleep(0.3)
+    records, whole = read_history(path)
+    found["history_file"] = records
+    kinds = [(r["env"][1], [m.hex() for m in r["env"][6]] if r["env"][1] in (11, 13) else None) for r in records]
+    check(whole and kinds == [(11, [direct]), (11, [eve]), (13, [eve]), (20, None), (22, None), (21, None)],
+          "hist.log holds D3's and E's JOIN, E's PART and D3's three messages")
+    check([r["env"][2].hex() for r in records[3:]] == [e["id"] for e in said]
+          and all(r["env"][4].hex() == direct and r["env"][3] == e["ts"] for r, e in zip(records[3:], said)),
+          "as the hub sent them: D3's K_ID, K_TS and K_SRC")
+    mode = lambda p: oct(os.stat(p).st_mode & 0o777)
+    check(mode(path) == "0o600" and mode(os.path.dirname(path)) == "0o700"
+          and mode(run.path("state", "history")) == "0o700",
+          "the history file is mode 0600, its directories 0700")
+
+    print("history: a client links and joins hist", flush=True)
+    client("A3")
+    since = join("A3")
+    start = check_replay(run, "A3", "hist", since, hub_id, said, "D3's MSG, ACTION and NOTICE")
+    oldest = start["body"].split(" since ")[1].rstrip(" -")
+    check(abs(calendar.timegm(time.strptime(oldest, "%Y-%m-%dT%H:%M:%SZ")) - said[0]["at"]) < 30,
+          f"the replay is since the first message's time ({oldest})")
+    check(not envs(run, "A3", room="hist", t=11, nick="eve") and not envs(run, "A3", room="hist", t=13),
+          "E's JOIN and PART are not replayed")
+    mine = os.urandom(8).hex()
+    command(run, "A3", op="send", id=mine, t=20, room="hist", body="mine, through the bouncer")
+    check(wait_env(run, "D3", id=mine) is not None and wait_env(run, "A3", id=mine) is not None,
+          "A3's MSG reaches D3 and comes back to A3")
+    said.append(wait_env(run, "A3", id=mine))
+    check(said[-1]["src"] == user, "with the user's identity")
+    client("A4")
+    since = join("A4")
+    check_replay(run, "A4", "hist", since, hub_id, said, "A3's own MSG among them")
+    check(len(envs(run, "A4", id=mine)) == 1 and len(envs(run, "A3", id=mine)) == 1,
+          "A3's MSG is in the replay once, with the user's identity")
+    hub = run.wait_status(upstream, lambda h: h.get("clients") == 2 and h.get("history_records", 0) >= 6, 10)
+    found["history_status"] = hub
+    check(hub["history_records"] >= 6 and hub["history_rooms"] >= 1 and hub["history_bytes"] > 0
+          and hub["history_drops"] == 0,
+          f"status.json: {hub['history_records']} records written, {hub['history_bytes']} bytes "
+          f"in {hub['history_rooms']} room(s), no drops")
+    out = run.bouncer("--config", run.path("history.toml"), "status")
+    found["history_status_out"] = out.stdout
+    kept_in = f"{hub['history_rooms']} room{'' if hub['history_rooms'] == 1 else 's'}"
+    check(f"history          {hub['history_bytes']} bytes in {kept_in}" in out.stdout
+          and f"history written  {hub['history_records']} records, 0 dropped" in out.stdout,
+          "status prints the history")
+
+    print("history: /history N", flush=True)
+    asked = since = history("A3", 2)
+    check_replay(run, "A3", "hist", since, hub_id, said[-2:], "/history 2")
+    since = history("A3", 0)
+    usage = run.wait_event("A3", lambda e: e["event"] == "env" and e["at"] >= since and e["body"] == HISTORY_USAGE, 20)
+    check(usage is not None and usage["src"] == hub_id and usage["room"] == "hist", f"/history 0: \"{HISTORY_USAGE}\"")
+    time.sleep(3)
+    check(not [e for e in envs(run, "A4") if e["at"] >= asked and str(e["body"]).startswith(("--- replay", "usage"))],
+          "A4 gets neither answer")
+    check(not [e for e in envs(run, "D3") if "/history" in str(e["body"])], "D3 sees no /history: it went nowhere upstream")
+    for name in ("A3", "A4"):
+        run.stop(name)
+    check(run.stop("BR") == 0, "the bouncer stops cleanly")
+    hub = run.status(upstream)
+    check(hub["history_drops"] == 0 and hub["history_records"] >= 6, "status.json at shutdown: no drops")
+
+    print("history: the bouncer restarts", flush=True)
+    bouncer()
+    client("A5")
+    check_replay(run, "A5", "hist", join("A5"), hub_id, said, "the same history after a restart")
+    run.stop("A5")
+    check(run.stop("BR") == 0, "the bouncer stops cleanly")
+
+    print("history: days, replay_hours and a cut record (replay_hours = 1)", flush=True)
+    now = int(time.time() * 1000)
+    day = 24 * 3600 * 1000
+    stale, stale_id = history_record(now - 40 * day, 20, direct, "forty days ago", "dee")
+    earlier, earlier_id = history_record(now - 2 * 3600 * 1000, 21, upstream_id, "two hours ago")
+    cut, cut_id = history_record(now, 20, direct, "cut short", "dee")
+    with open(path, "rb") as f:
+        kept = f.read()
+    with open(path, "wb") as f:
+        f.write(stale + earlier + kept + cut[:len(cut) // 2])
+    gone = history_file(run, upstream, "old")
+    with open(gone, "wb") as f:
+        f.write(history_record(now - 31 * day, 20, direct, "a month ago", "dee", "old")[0])
+    bouncer(replay_hours=1)
+    records, whole = read_history(path)
+    ids = [r["env"][2].hex() for r in records]
+    check(whole and stale_id not in ids and earlier_id in ids and cut_id not in ids,
+          "at start the record older than days = 30 is pruned and the cut record cut off")
+    check(not os.path.exists(gone), "old.log, all of it older than 30 days, is gone")
+    client("A6")
+    check_replay(run, "A6", "hist", join("A6"), hub_id, said, "the two-hour-old NOTICE is outside replay_hours")
+    since = history("A6", 50)
+    earlier_env = dict(id=earlier_id, t=21, ts=now - 2 * 3600 * 1000, src=hub_id, nick=None,
+                       body="two hours ago", room="hist")
+    start = check_replay(run, "A6", "hist", since, hub_id, [earlier_env] + said, "/history 50")
+    check(start["body"] == f"--- replay: 5 messages since {utc(now - 2 * 3600 * 1000)} ---",
+          "/history has no time window; the upstream hub's NOTICE is from the local hub")
+    run.stop("A6")
+    check(run.stop("BR") == 0, "the bouncer stops cleanly")
+
+    print("history: replay_max = 2", flush=True)
+    bouncer(replay_max=2)
+    client("A7")
+    check_replay(run, "A7", "hist", join("A7"), hub_id, said[-2:], "the newest two")
+    run.stop("A7")
+    check(run.stop("BR") == 0, "the bouncer stops cleanly")
+
+    print("history: replay_max = 0", flush=True)
+    bouncer(replay_max=0)
+    client("A8")
+    since = join("A8")
+    check(no_replay(run, "A8", "hist", since), "a JOIN replays nothing")
+    check_replay(run, "A8", "hist", history("A8", 1), hub_id, said[-1:], "/history 1 still answers")
+    errors = [e for name in ("A3", "A4", "A5", "A6", "A7", "A8", "D3", "E") for e in run.events(name)
+              if e["event"] == "error"]
+    check(not errors, "the driven clients raised nothing")
+    for name in ("A8", "D3", "E"):
+        run.stop(name)
+    check(run.stop("BR") == 0, "the bouncer stops cleanly")
+
+
+def history_only(run, args, ports, found):
+    port_r = free_port(ports)
+    run.rnsd("R", port_r)
+    upstream = RNS.Destination.hash(RNS.Identity.from_file(run.identity("rrcd-hub")), "rrc", "hub").hex()
+    user = RNS.Identity.from_file(run.path("ids/user")).hash.hex()
+    config = run.config("rrcd", f'tcp = "127.0.0.1:{port_r}"', upstream=upstream, nick="bnc")
+    local = {k.strip(): v for k, v in (line.rsplit(None, 1) for line in
+                                       run.bouncer("--config", config, "hashes").stdout.splitlines())}["local hub"]
+    env = {"RRC_BOUNCER_PING_SECS": str(BOUNCER_PING), "RRC_BOUNCER_BACKOFF_SECS": str(BOUNCER_BACKOFF)}
+    history_phases(run, args, port_r, upstream, user, local, env, found)
+    run.stop("H")
+    run.stop("R")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--work", required=True)
@@ -646,7 +928,7 @@ def main():
     parser.add_argument("--rnsd", required=True)
     parser.add_argument("--rrcd", required=True)
     parser.add_argument("--bouncer", required=True)
-    parser.add_argument("--only", choices=["rrcd"])
+    parser.add_argument("--only", choices=["rrcd", "history"])
     args = parser.parse_args()
     shutil.rmtree(args.work, ignore_errors=True)
     os.makedirs(args.work)
@@ -660,6 +942,9 @@ def main():
         port_l = free_port({port_t, port_s, port_d})
         if args.only == "rrcd":
             rrcd_phases(run, args, {port_t, port_s, port_d, port_l}, found)
+            raise Done()
+        if args.only == "history":
+            history_only(run, args, {port_t, port_s, port_d, port_l}, found)
             raise Done()
         tcp = f'tcp = "127.0.0.1:{port_t}"'
         config = run.config("tcp", tcp)
@@ -833,7 +1118,7 @@ def main():
     finally:
         run.stop_all()
         with open(run.path("found.json"), "w") as f:
-            json.dump(found, f, indent=1)
+            json.dump(found, f, indent=1, default=lambda v: v.hex() if isinstance(v, bytes) else repr(v))
     print(f"passed (logs: {args.work})", flush=True)
     return 0
 

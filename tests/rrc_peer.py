@@ -214,8 +214,8 @@ def driven(args, identity):
             emit(args.events, event="bad_packet", error=str(e))
             return
         t = env.get(K_T)
-        emit(args.events, event="env", session=1, t=t, id=plain(env.get(K_ID)), room=env.get(K_ROOM),
-             nick=env.get(K_NICK), src=plain(env.get(K_SRC)), dst=plain(env.get(K_DST)),
+        emit(args.events, event="env", session=1, t=t, id=plain(env.get(K_ID)), ts=env.get(K_TS),
+             room=env.get(K_ROOM), nick=env.get(K_NICK), src=plain(env.get(K_SRC)), dst=plain(env.get(K_DST)),
              body=plain(env.get(K_BODY)), fmt=plain(env.get(K_FMT)))
         if t == T_PING:
             send(envelope(identity, T_PONG, body=env.get(K_BODY)))

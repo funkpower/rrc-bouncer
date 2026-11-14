@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::config::{RnsAccess, Settings};
+use crate::history::{History, HistoryStatus, SharedHistoryStatus};
 use crate::identity::{HUB_ASPECT, create_private_dir, hub_address, load_identity, load_or_create_hub_identity};
 use crate::relay::{self, LinkIdentities, LocalHub, Relay, RelayConfig, RelayStatus, SharedRelayStatus};
 use crate::rooms::RoomSet;
@@ -31,6 +32,8 @@ const UPLINK_CHECK: Duration = Duration::from_secs(10);
 const UPLINK_REFRESH: Duration = Duration::from_secs(5 * 60);
 /// Overrides `UPLINK_REFRESH`, in seconds, for tests/e2e.py.
 const UPLINK_REFRESH_ENV: &str = "RRC_BOUNCER_UPLINK_REFRESH_SECS";
+/// How long each hub's history gets to write what it was given at shutdown.
+const HISTORY_STOP: Duration = Duration::from_secs(5);
 /// How long the upstream sessions get to close their links at shutdown:
 /// longer than a session waits for its link to close, so each one gets to
 /// write `stopped` to its status.
@@ -91,6 +94,9 @@ pub struct HubStatus {
     /// The local hub's clients (M3).
     #[serde(flatten)]
     pub relay: RelayStatus,
+    /// The hub's history on disk (M4).
+    #[serde(flatten)]
+    pub history: HistoryStatus,
 }
 
 /// `state_dir/status.json`.
@@ -115,6 +121,7 @@ pub fn hubs(settings: &Settings) -> Result<(String, Vec<HubStatus>), String> {
             local_hub: hex::encode(hub_address(&local.hash)),
             link: UpstreamStatus::default(),
             relay: RelayStatus::default(),
+            history: HistoryStatus::default(),
         });
     }
     Ok((hex::encode(identity.hash), hubs))
@@ -251,13 +258,16 @@ fn write_status(settings: &Settings, status: &Status) {
     }
 }
 
-fn show_sessions(status: &mut Status, sessions: &[(SharedStatus, SharedRelayStatus)]) {
-    for (hub, (session, relay)) in status.hubs.iter_mut().zip(sessions) {
+fn show_sessions(status: &mut Status, sessions: &[(SharedStatus, SharedRelayStatus, SharedHistoryStatus)]) {
+    for (hub, (session, relay, history)) in status.hubs.iter_mut().zip(sessions) {
         if let Ok(link) = session.lock() {
             hub.link = link.clone();
         }
         if let Ok(relay) = relay.lock() {
             hub.relay = relay.clone();
+        }
+        if let Ok(history) = history.lock() {
+            hub.history = history.clone();
         }
     }
     status.updated_at = now();
@@ -270,7 +280,13 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     for hub in &settings.hubs {
         let local = load_or_create_hub_identity(&settings.hub_identity_path(&hub.address), &identity)?;
         let rooms = RoomSet::load(&settings.rooms_path(&hub.address), &hub.rooms)?;
-        locals.push((hub, local, rooms));
+        let history_status = SharedHistoryStatus::default();
+        let history = History::start(
+            settings.history_dir(&hub.address),
+            settings.history.clone(),
+            history_status.clone(),
+        )?;
+        locals.push((hub, local, rooms, history, history_status));
     }
 
     // A signal stops the bouncer, not Reticulum: the upstream sessions close
@@ -297,7 +313,8 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         announce: settings.announce,
         hubs: Vec::new(),
     };
-    for (hub, local, rooms) in locals {
+    let mut histories = Vec::new();
+    for (hub, local, rooms, history, history_status) in locals {
         let upstream = hub.address;
         let hub_identity = local.hash;
         let identities = LinkIdentities::default();
@@ -327,6 +344,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             local_hub: hex::encode(address),
             link: UpstreamStatus::default(),
             relay: RelayStatus::default(),
+            history: HistoryStatus::default(),
         });
         announced.push(registered.handle.clone());
         let shared = SharedStatus::default();
@@ -343,7 +361,11 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             commands: command_tx,
             session: shared.clone(),
             status: relay_status.clone(),
+            history: history.clone(),
+            replay_window: settings.history.replay_window,
+            replay_max: settings.history.replay_max,
         });
+        histories.push(history);
         sessions.push(tokio::spawn(upstream::run(
             Upstream {
                 runtime: runtime.clone(),
@@ -361,7 +383,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             command_rx,
             sessions_stop.clone(),
         )));
-        session_status.push((shared, relay_status));
+        session_status.push((shared, relay_status, history_status));
         tasks.push(tokio::spawn(relay::run(LocalHub {
             registered,
             identities,
@@ -425,6 +447,12 @@ pub async fn run(settings: Settings) -> Result<(), String> {
     }
     for task in &tasks {
         task.abort();
+    }
+    // What the history threads were given is written and synced.
+    for history in &histories {
+        if tokio::time::timeout(HISTORY_STOP, history.stop()).await.is_err() {
+            tracing::warn!("the history did not stop in {}s", HISTORY_STOP.as_secs());
+        }
     }
     show_sessions(&mut status, &session_status);
     write_status(&settings, &status);

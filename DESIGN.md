@@ -372,7 +372,7 @@ of time in, commands to the upstream session and envelopes for client links out)
     repeats could never be emptied. The user comes first, then the others in order, as many as
     keep the envelope within one link packet (`LINK_MDU`, 431 bytes, about 20 members); rrcd
     itself puts no cap on its member list.
-  - M4 replays history right after the JOINED: `Relay::replay`.
+  - The room's history is replayed right after the JOINED ([History](#history)).
 - **PART.** Checked as rrcd does: no room or an empty string is `"PART requires room name"`, then
   the name is normalised. Answered with PARTED (body the parting identity when the hub sends
   member lists), whether the client was in the room or not, as rrcd does.
@@ -505,11 +505,12 @@ of time in, commands to the upstream session and envelopes for client links out)
   - Each send to a client link is given 2 s (`SEND_TIMEOUT`); one that takes longer is given up,
     counted in `relay_drops` and logged, so a client link that does not drain cannot hold up the
     other clients or the session's events.
-- **History hooks (M4).** `Relay::record` is called with every envelope the hub sends to a room as
+- **History hooks.** `Relay::record` is called with every envelope the hub sends to a room as
   a whole: room MSG, ACTION and NOTICE (the hub's room NOTICEs included, not a command's answer
   to one client), other members' JOINED and PARTED, and the ERROR that removes the bouncer from
   the room (kick, ban). It is not called for direct NOTICEs, room-less NOTICEs (greeting, command
-  answers), ERRORs answering a client, or the bouncer's own JOINED and PARTED (the session's).
+  answers), ERRORs answering a client, the bouncer's own JOINED and PARTED (the session's), or the
+  `room <r>: …` NOTICE rrcd sends after a JOIN (it goes to the joiner alone).
   The hub's echo of a client's envelope is a room envelope like any other, so each client
   envelope is recorded once, as the hub delivered it. `Relay::replay` is called after each JOINED
   a client gets.
@@ -529,17 +530,88 @@ of time in, commands to the upstream session and envelopes for client links out)
 
 ## History
 
-- One append-only file per hub and room: `state_dir/history/<upstream hash>/<room>.log`, a sequence
-  of CBOR records `{ts_ms, envelope}` where `envelope` is the envelope bytes as received or sent.
-  Kept on the local disk unencrypted, mode 0600, directory 0700 (README says so).
-- Retention: `history.days` (default 30) and `history.max_mb` per hub (default 100); prune at start
-  and hourly, oldest first.
-- Replay on JOIN: the envelopes of the last `history.replay_hours` (default 24), at most
-  `history.replay_max` (default 100), sent between two NOTICEs from the local hub
-  (`"--- replay: N messages since <time> ---"` and `"--- end of replay ---"`), each with its
-  original `K_ID`, `K_TS`, `K_SRC` and `K_NICK`.
-- A `/history N` MSG from a client is not forwarded upstream; the bouncer answers it with the last
-  N envelopes in that room, framed the same way.
+- **Store.** One append-only file per hub and room:
+  `state_dir/history/<upstream hash>/<room file name>.log`, a sequence of CBOR records, each a map
+  `{"ts_ms": <uint>, "envelope": <bytes>}`: the time the bouncer got the envelope (milliseconds
+  since the epoch) and the envelope's bytes as the hub delivered them (`K_SRC` the original
+  sender, the upstream hub for its own NOTICEs). Kept on the local disk unencrypted (README says
+  so), files mode 0600, `history/` and each hub's directory mode 0700.
+- **Room file names.** A room name is kept as it is when it is made of `a-z`, `0-9`, `_`, `-` and
+  `.` (a `.` not first); every other byte (upper case, `%`, `/`, a leading `.`, UTF-8) is written
+  `%XX`, upper-case hex, and `.log` is added. The mapping is one to one, and a file whose name does
+  not decode back to the same name is ignored. A room whose file name would be over 255 bytes is
+  not recorded (counted in `history_drops`).
+- **Writer.** Each hub has one history thread (`src/history.rs`) fed by a bounded queue (4096
+  jobs). `Relay::record` puts a job on it with `try_send` and never waits: when the queue is full
+  the record is dropped and counted in `history_drops`, so a slow disk cannot hold up the relay.
+  Replay queries go through the same queue, so a query sees every record queued before it.
+- **Durability.** Each record is one `write` to a file opened with `O_APPEND`. The thread calls
+  `fdatasync` on the files written to 5 s after a write and at shutdown (the bouncer gives it 5 s),
+  not after each record: a power loss can take the last 5 s of history, a crash of the bouncer
+  alone loses nothing written. A write that fails is cut back off the file (`set_len`) and counted
+  as a drop.
+- **A cut record.** Reading stops at the first record that does not decode, so a file whose last
+  record was cut short (power loss, full disk) still replays everything before it. The prune at
+  start and every hour takes such a tail off (logged), and removes `*.tmp` files a crash left.
+- **Retention.** `history.days` (default 30) and `history.max_mb` per hub (default 100, in units of
+  1,000,000 bytes). At start and every hour the thread reads the hub's room files, drops the
+  records older than `days`, then, while the hub's files together are over `max_mb`, the oldest
+  records of the hub, whichever room they are in. A file that changes is written to a `.tmp` file,
+  synced and renamed over the old one (the directory synced after); a file left empty is removed.
+  Between prunes a hub's history can grow past `max_mb` by an hour's traffic. Records are in the
+  order the bouncer got them; a file is not sorted.
+- **What is replayed.** MSG, ACTION and NOTICE only. JOINED, PARTED and the ERROR that removes the
+  bouncer are recorded but not replayed: a client takes them as changes to the room it is in now
+  (weechat-rrc updates its member list, an ERROR naming the room is taken as a kick).
+- **Replay on JOIN.** After each JOINED a client gets (answered locally, or once the hub answers a
+  new room's JOIN), the records of that room from the last `history.replay_hours` (default 24),
+  at most `history.replay_max` (default 100, the newest kept), are sent to that client alone,
+  oldest first:
+  - framed by two NOTICEs from the local hub (`K_SRC` its identity, `K_ROOM` the room, no
+    `K_NICK`): `--- replay: N messages since <time> ---` (`1 message` for one) before, and
+    `--- end of replay ---` after. `<time>` is the oldest replayed record's `ts_ms` in UTC,
+    `YYYY-MM-DDTHH:MM:SSZ`; clients show replayed lines at the time they arrive, so the opening
+    NOTICE is what dates them;
+  - each envelope as the hub delivered it, `K_ID`, `K_TS`, `K_SRC`, `K_NICK`, `K_FMT` and unknown
+    keys kept, except a `K_SRC` that is the upstream hub's identity, which is made the local hub's
+    (as for live envelopes);
+  - nothing at all when there is nothing to replay;
+  - none when `replay_max = 0` or `replay_hours = 0`.
+- **Pacing.** A replay is sent by a task of its own, one envelope every 20 ms, each send given 2 s
+  as any send to a client (counted in `relayed_out`, or in `relay_drops` and the rest of the
+  replay given up). Other clients and the upstream session are not held up. While a client's
+  replay of a room runs, the room's live envelopes for that client are held (up to 512, the rest
+  dropped and counted in `relay_drops`) and sent after `--- end of replay ---`, so the client sees
+  them in order and none twice: the query is queued when the client joins, before any live
+  envelope that follows is recorded. A hold not released in 120 s is sent anyway (logged); a
+  client that closes its link ends its replays.
+- **Repeats.** The bouncer does not know what a client has already seen. A client that links
+  again (or joins again) gets the room's last `replay_hours` once more, including what it saw
+  before it went away; the opening NOTICE says where the replay starts. A client's own messages
+  are recorded from the hub's echo, so they are replayed once, with the user's identity in
+  `K_SRC`: see the client notes below.
+- **`/history [N]`.** A client's MSG in a room whose body is `/history` with at most one argument
+  (`/ history 3` too, and any case, as rrcd parses commands) is answered by the bouncer to that
+  client alone and is not sent upstream. It works whether or not the client has joined the room
+  and while the upstream link is down. It replays the last N records of the room (MSG, ACTION,
+  NOTICE; no time window; N defaults to `replay_max`, or 100 when that is 0, and is at most 500),
+  framed and paced as the replay on JOIN; with nothing to replay it gets one NOTICE,
+  `--- no history in <room> ---`. An N that is not a whole number from 1 up gets the NOTICE
+  `usage: /history [N], N from 1 to 500`, and a `/history` while a replay of that room to that
+  client is still running gets `--- a replay of <room> is running ---`.
+- **Clients and replayed own lines.** From the code of weechat-rrc, rBrowser2 and NomadNet:
+  - weechat-rrc (`rrc.c`) marks an envelope as the user's own when `K_SRC` is the user's identity
+    and drops it only when its `K_ID` is in the ids it sent in this session; a replayed own line
+    is shown as the user's own line.
+  - rBrowser2 (`rrc.py`, around line 1858) drops an envelope from the user only when its `K_ID` is
+    in `hub.sent_ids`; otherwise it shows the line.
+  - NomadNet (`RRC.py` 1145-1215) drops an own envelope only when its id is in `_sent_ids`;
+    otherwise it keeps it as a message stamped with the time it arrived, not `K_TS`.
+  - None of them fails on a replay; all show replayed lines at their arrival time.
+- **Status.** Each `hubs` entry adds `history_bytes` and `history_rooms` (as of the last write or
+  prune), `history_records` (records written since start) and `history_drops` (records not
+  written: queue full, disk error, room name too long). They go out with the next write of
+  `status.json` (every minute, a change of clients, shutdown).
 
 ## Configuration
 
@@ -556,7 +628,7 @@ See `contrib/config.example.toml`.
 | `announce_interval_minutes` | `360` | With `announce = true`; at least 1 |
 | `allowed_identities` | `[]` | Identity hashes allowed to use the local hubs besides the user's |
 | `part_upstream` | `false` | A client's PART also parts upstream |
-| `[history] days / max_mb / replay_hours / replay_max` | `30 / 100 / 24 / 100` | Above; `days` and `max_mb` at least 1, `replay_*` 0 turns replay off |
+| `[history] days / max_mb / replay_hours / replay_max` | `30 / 100 / 24 / 100` | [History](#history); `days` and `max_mb` at least 1 (`max_mb` in units of 1,000,000 bytes), either `replay_*` 0 turns the replay on JOIN off |
 | `[[hub]] address` | required | The upstream hub's `rrc.hub` destination hash |
 | `[[hub]] rooms` | `[]` | Rooms to be in from the start (more are added by clients' JOINs and kept in the room set file). Trimmed and lowercased as rrcd does (`service.py:507`), duplicates dropped, an empty name refused |
 | `[[hub]] nick` | none | `K_NICK` the bouncer uses on its own envelopes (HELLO, JOIN, PART, PING; not PONG, as rrcd's has none) and puts on every client MSG, ACTION and NOTICE it sends upstream; empty means none, and then each client's own nick goes up, so the bouncer's nick on the hub changes with whichever client spoke last |
@@ -621,10 +693,19 @@ As of M3:
 - `status` prints, per hub, the clients and their identities, the envelopes relayed in and out,
   and the relay drops and refused links when there are any.
 
+As of M4:
+
+- `run` also runs one history thread per upstream hub ([History](#history)): room envelopes are
+  recorded, replayed after each JOINED and on `/history`.
+- Each `hubs` entry adds `history_bytes`, `history_rooms`, `history_records` and
+  `history_drops`. A file without these fields still reads.
+- `status` prints, per hub, `history          <bytes> bytes in <n> rooms` (`1 room`) and
+  `history written  <records> records, <drops> dropped`.
+
 ## Implementation notes
 
-- **Crate layout.** `src/lib.rs` (`config`, `identity`, `envelope`, `bouncer`, `upstream`,
-  `rate`, `rooms`, `relay`) and a thin
+- **Crate layout.** `src/lib.rs` (`config`, `identity`, `envelope`, `history`, `bouncer`,
+  `upstream`, `rate`, `rooms`, `relay`) and a thin
   `src/main.rs` (CLI, logging). The library split lets the codec and config be tested and used
   without the binary.
 - **Local hub identities.** `state_dir/hubs/<upstream hash>.identity`, 64 bytes as Python RNS
@@ -651,7 +732,8 @@ As of M3:
   `tests/fixtures/envelopes/*.cbor`. The bytes are committed, so `cargo test` needs no Python;
   the tests decode each one, check its fields, and re-encode it to the same bytes.
 - **End-to-end test.** `tests/e2e.sh` (`RRC_TEST_VENV` = a venv with `rns`, `cbor2` and `rrcd`;
-  `RRC_TEST_WORK`, default `/tmp/rrc-bouncer-e2e`; `--only rrcd` runs the rrcd phases alone)
+  `RRC_TEST_WORK`, default `/tmp/rrc-bouncer-e2e`; `--only rrcd` runs the rrcd phases alone,
+  `--only history` the history phases)
   builds the bouncer and runs `tests/e2e.py`: rnsd instances with unique instance names and
   TCPServerInterfaces on 127.0.0.1, ports 4370-4379, and Python peers (`tests/rrc_peer.py`) that
   watch announces, request paths, link, identify and PING, or act as an RRC client of a hub. It
@@ -691,6 +773,26 @@ As of M3:
   JOIN right after joins upstream again (D sees the JOINED); D's MSG reaches A; with rrcd stopped, a
   JOIN gets `hub not connected: side not joined`, and once rrcd is back and the session has
   rejoined, the same JOIN is answered with a JOINED.
+  The history phases follow, on rrcd restarted with `max_rooms_per_session = 6` and the bouncer
+  in `lobby` and `hist`. With no client of the bouncer linked, D3 (directly on rrcd) joins `hist`,
+  E (another identity) joins and parts, and D3 says a MSG, an ACTION and a NOTICE; `hist.log`
+  holds the three JOIN/PART envelopes and the three messages with D3's `K_ID`, `K_TS` and
+  `K_SRC`, mode 0600 in 0700 directories. Then, each check comparing every replayed envelope's
+  `K_ID`, `K_TS`, `K_SRC`, `K_NICK`, type and body with what D3 or A3 got live:
+  - A3 links and joins: the three messages, in order, between the two NOTICEs from the local hub,
+    the opening one dated by the first message; E's JOIN and PART are not replayed.
+  - A3 says a MSG; A4 links and joins: four messages, A3's once, with the user's identity.
+  - `status.json` and `status` show the history counts; `/history 2` from A3 gets the last two,
+    framed, `/history 0` gets the usage NOTICE, A4 gets neither, and D3 never sees `/history`.
+  - After a bouncer restart, A5's JOIN gets the same four.
+  - With a record 40 days old, a hub NOTICE two hours old and half a record written into
+    `hist.log` by hand, an `old.log` holding only a 31-day-old record, and `replay_hours = 1`: at
+    start the old record and the cut tail are gone and `old.log` is removed; A6's JOIN gets the
+    four (the two-hour-old NOTICE is outside the window); `/history 50` gets five, the hub's NOTICE
+    with `K_SRC` the local hub.
+  - With `replay_max = 2`, A7's JOIN gets the newest two; with `replay_max = 0`, A8's JOIN gets
+    nothing and `/history 1` still answers.
+  Pruning by `max_mb` is covered by the unit tests in `src/history.rs`.
   The phases' start waits are generous (Python peers 180 s, rrcd 120 s) so a loaded host does not
   fail them.
   `RRC_BOUNCER_PING_SECS` (the idle PING and the PONG wait) and `RRC_BOUNCER_BACKOFF_SECS` (the
@@ -717,7 +819,7 @@ instance with no interfaces to the outside, so nothing reaches a real network).
    foreign identity is refused (done: [Local hub](#local-hub)).
 4. **M4: history.** Store, retention, replay on JOIN, `/history N`. e2e: messages said while no
    client is linked are replayed, in order, with their original ids, to a client that joins later;
-   after a bouncer restart too.
+   after a bouncer restart too (done: [History](#history)).
 5. **M5: finish.** `RESOURCE_ENVELOPE` relay (MOTD and long notices both ways), `status`,
    README (setup, every client's settings, limits), `contrib/` unit and example config final.
    A manual check list for NomadNet, weechat-rrc and rBrowser2 against the bouncer goes in the README.

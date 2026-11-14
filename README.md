@@ -34,8 +34,20 @@ requests and PING on them. It links to each upstream hub as you, joins your
 rooms, keeps the link up and reconnects when it drops. Your clients link to
 the local hub under your identity (or one in `allowed_identities`), join and
 part rooms, and their messages are relayed to the hub and to each other;
-`rrc-bouncer status` shows each link, its rooms and its clients. It keeps no
-history yet.
+`rrc-bouncer status` shows each link, its rooms, its clients and its history.
+
+Everything the hub sends to your rooms is kept in `state_dir/history/`, one
+file per hub and room, for 30 days and up to 100 MB per hub (`[history]`
+`days` and `max_mb`). It is stored unencrypted, readable by your user only:
+anyone who can read your files can read your rooms. A client that joins a room
+gets the last 24 hours, at most 100 messages (`replay_hours` and `replay_max`),
+between a `--- replay: N messages since <time> ---` and an
+`--- end of replay ---` notice. The bouncer does not know what a client has
+already seen, so a client that comes back gets those lines again, and your own
+messages from other clients are shown as yours. Clients show replayed lines at
+the time they arrive; the first notice says when they start. Say
+`/history N` in a room to get its last N messages (at most 500); it stays on
+the bouncer and never reaches the hub.
 
 Set `nick` on each `[[hub]]`. The hub takes the nick of every message it gets,
 and all your clients share one link, so without it your nick on the hub
