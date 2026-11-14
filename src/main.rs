@@ -3,9 +3,13 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use rrc_bouncer::{bouncer, config};
+
+/// How long tasks still running at exit get to stop.
+const RUNTIME_STOP: Duration = Duration::from_secs(2);
 
 #[derive(Parser)]
 #[command(
@@ -132,6 +136,9 @@ fn print_history(h: &rrc_bouncer::history::HistoryStatus) {
         "    history written  {} records, {} dropped",
         h.history_records, h.history_drops
     );
+    if h.history_sync_errors > 0 {
+        println!("    history syncs    {} failed", h.history_sync_errors);
+    }
 }
 
 fn print_upstream(u: &rrc_bouncer::upstream::UpstreamStatus, running: bool) {
@@ -238,7 +245,12 @@ fn main() -> ExitCode {
         Command::Run => {
             setup_logging(&settings.log_level);
             match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-                Ok(runtime) => runtime.block_on(bouncer::run(settings)),
+                Ok(runtime) => {
+                    let result = runtime.block_on(bouncer::run(settings));
+                    // A task that does not stop does not hold the exit up.
+                    runtime.shutdown_timeout(RUNTIME_STOP);
+                    result
+                }
                 Err(e) => Err(format!("could not start the async runtime: {e}")),
             }
         }

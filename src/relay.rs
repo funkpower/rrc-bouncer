@@ -60,19 +60,22 @@ const MAX_GREETING: usize = 16;
 /// A Reticulum link's MDU: the most one packet to a client carries.
 const LINK_MDU: usize = 431;
 /// A send to a client link that takes longer than this is given up, so a
-/// slow link does not hold up the others.
+/// slow link does not hold up the link's later envelopes for long.
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
-/// The gap between two envelopes of a replay. rsReticulum sends link
-/// packets best-effort, with no flow control, so a burst could overrun the
-/// client's link; 20 ms puts a full default replay (100) through in two
-/// seconds.
+/// The gap between two replayed envelopes on a link, whichever replay they
+/// are of. rsReticulum sends link packets best-effort, with no flow
+/// control, so a burst could overrun the client's link; 20 ms puts a full
+/// default replay (100) through in two seconds.
 const REPLAY_PACE: Duration = Duration::from_millis(20);
 /// Room envelopes held for a client while a replay of the room runs, most;
 /// later ones are dropped.
 const MAX_HELD: usize = 512;
-/// A replay not done by then is taken as done, and what was held for it is
-/// sent.
+/// A replay not done this long after it was asked for is ended, and what
+/// was held for it is sent.
 const REPLAY_WAIT: Duration = Duration::from_secs(120);
+/// Envelopes waiting for a client link's sender task, most; later ones are
+/// dropped.
+const LINK_QUEUE: usize = 1024;
 /// `/history` gives at most this many messages.
 pub const MAX_HISTORY: usize = 500;
 /// `/history` with no number, when `replay_max` is 0.
@@ -88,20 +91,33 @@ pub type Link = [u8; 16];
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
-    /// Send an envelope to a client link.
+    /// Send an envelope to a client link: held while a replay of its room
+    /// to that link runs.
     Client(Link, Envelope),
+    /// Send the local hub's own notice to a client link: never held.
+    Now(Link, Envelope),
     /// Close a client link now.
     Close(Link),
     /// Close a client link after `REFUSE_CLOSE_DELAY`.
     CloseLater(Link),
-    /// Send a client a room's history. The relay holds the room's
-    /// envelopes for that client until `Relay::replay_done`.
+    /// Send a client a room's history. The link's room envelopes are held
+    /// from here until the replay ends.
     Replay(Replay),
+    /// End a client's replay of `room` (of every room: None), sending what
+    /// was held for it (`flush`) or not.
+    EndReplay {
+        link: Link,
+        room: Option<String>,
+        flush: bool,
+    },
 }
 
 /// A replay of a room's history to one client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Replay {
+    /// Told back with the replay's end, so an old end is not taken for a
+    /// newer replay's.
+    pub id: u64,
     pub link: Link,
     pub query: Query,
     /// Say so when there is nothing (`/history`); a JOIN's replay says
@@ -109,11 +125,11 @@ pub struct Replay {
     pub say_empty: bool,
 }
 
-/// Room envelopes held for a client while its replay of the room runs.
+/// A replay the relay has asked for and not seen end.
 #[derive(Debug)]
-struct Held {
+struct Running {
+    id: u64,
     since: Instant,
-    envelopes: Vec<Envelope>,
 }
 
 /// Whether a client MSG body is `/history [N]`, and what it asks for:
@@ -383,7 +399,8 @@ pub struct Relay {
     replay_window: Duration,
     replay_max: usize,
     /// Replays running, by client and room.
-    replaying: BTreeMap<(Link, String), Held>,
+    replaying: BTreeMap<(Link, String), Running>,
+    next_replay: u64,
 }
 
 /// Everything a relay needs.
@@ -433,6 +450,7 @@ impl Relay {
             replay_window: config.replay_window,
             replay_max: config.replay_max,
             replaying: BTreeMap::new(),
+            next_replay: 0,
         }
     }
 
@@ -577,11 +595,23 @@ impl Relay {
             .collect()
     }
 
+    /// Send `env` to `links`; counted in `relayed_out` when it is sent.
     fn deliver(&self, out: &mut Vec<Output>, links: &[Link], env: &Envelope) {
         for link in links {
             out.push(Output::Client(*link, env.clone()));
         }
-        self.tally(|s| s.relayed_out += links.len() as u64);
+    }
+
+    /// End a client's replay of a room, if one runs; what was held for it
+    /// is not sent.
+    fn end_replay(&mut self, link: Link, room: &str, out: &mut Vec<Output>) {
+        if self.replaying.remove(&(link, room.to_string())).is_some() {
+            out.push(Output::EndReplay {
+                link,
+                room: Some(room.to_string()),
+                flush: false,
+            });
+        }
     }
 
     /// The session's room set (the rooms it stays in, joined or not, and
@@ -679,6 +709,17 @@ impl Relay {
                     client.rooms.clear();
                     client.pending.clear();
                 }
+                // A new session on the link: it is in no room, so its
+                // replays end.
+                let before = self.replaying.len();
+                self.replaying.retain(|(l, _), _| *l != link);
+                if self.replaying.len() < before {
+                    out.push(Output::EndReplay {
+                        link,
+                        room: None,
+                        flush: false,
+                    });
+                }
                 out.push(Output::Client(link, self.welcome_envelope()));
                 let greeting: Vec<Envelope> = self.greeting.iter().map(|g| self.outward(g)).collect();
                 for env in &greeting {
@@ -692,20 +733,20 @@ impl Relay {
                 );
             }
             _ if !welcomed => out.push(Output::Client(link, self.error(None, "send HELLO first"))),
-            MessageType::Join => self.join(link, &env, &mut out),
+            MessageType::Join => self.join(link, &env, now, &mut out),
             MessageType::Part => self.part(link, identity, &env, &mut out),
-            MessageType::Msg if self.history_command(link, &env, &mut out) => {}
+            MessageType::Msg if self.history_command(link, &env, now, &mut out) => {}
             MessageType::Msg | MessageType::Action | MessageType::Notice => {
                 self.message(link, env, now, &mut out);
             }
             other => tracing::debug!("client {}: ignored a {other:?}", hex::encode(link)),
         }
-        self.hold(out, now)
+        out
     }
 
     /// A client's `/history [N]`, answered here, never sent upstream:
     /// false if `env` is not one.
-    fn history_command(&mut self, link: Link, env: &Envelope, out: &mut Vec<Output>) -> bool {
+    fn history_command(&mut self, link: Link, env: &Envelope, now: Instant, out: &mut Vec<Output>) -> bool {
         let default = if self.replay_max == 0 {
             DEFAULT_HISTORY
         } else {
@@ -722,70 +763,50 @@ impl Relay {
         };
         match (request, &room) {
             (Ok(max), Some(room)) => {
-                if self.replaying.contains_key(&(link, room.clone())) {
+                let query = Query {
+                    room: room.clone(),
+                    since_ms: None,
+                    max,
+                };
+                if !self.start_replay(link, query, true, now, out) {
                     let env = notice(self, &format!("--- a replay of {room} is running ---"));
-                    self.deliver(out, &[link], &env);
-                } else {
-                    out.push(Output::Replay(Replay {
-                        link,
-                        query: Query {
-                            room: room.clone(),
-                            since_ms: None,
-                            max,
-                        },
-                        say_empty: true,
-                    }));
+                    out.push(Output::Now(link, env));
                 }
             }
             _ => {
                 let env = notice(self, HISTORY_USAGE);
-                self.deliver(out, &[link], &env);
+                out.push(Output::Now(link, env));
             }
         }
         true
     }
 
-    /// Hold the room envelopes for a client that come after its replay of
-    /// the room started, so they reach it after the replay.
-    fn hold(&mut self, out: Vec<Output>, now: Instant) -> Vec<Output> {
-        let mut sent = Vec::with_capacity(out.len());
-        for output in out {
-            match output {
-                Output::Replay(replay) => {
-                    let key = (replay.link, replay.query.room.clone());
-                    if self.replaying.contains_key(&key) {
-                        continue;
-                    }
-                    self.replaying.insert(
-                        key,
-                        Held {
-                            since: now,
-                            envelopes: Vec::new(),
-                        },
-                    );
-                    sent.push(Output::Replay(replay));
-                }
-                Output::Client(link, env) => {
-                    let room = env.room.as_deref().and_then(normalize_room);
-                    match room.and_then(|r| self.replaying.get_mut(&(link, r))) {
-                        Some(held) if held.envelopes.len() < MAX_HELD => held.envelopes.push(env),
-                        Some(_) => self.tally(|s| s.relay_drops += 1),
-                        None => sent.push(Output::Client(link, env)),
-                    }
-                }
-                other => sent.push(other),
-            }
+    /// Ask for a replay to a client, unless one of the room to that client
+    /// runs: false then.
+    fn start_replay(&mut self, link: Link, query: Query, say_empty: bool, now: Instant, out: &mut Vec<Output>) -> bool {
+        let key = (link, query.room.clone());
+        if self.replaying.contains_key(&key) {
+            return false;
         }
-        sent
+        let id = self.next_replay;
+        self.next_replay += 1;
+        self.replaying.insert(key, Running { id, since: now });
+        out.push(Output::Replay(Replay {
+            id,
+            link,
+            query,
+            say_empty,
+        }));
+        true
     }
 
-    /// A client's replay of a room is over: what was held for it follows.
-    pub fn replay_done(&mut self, link: Link, room: &str) -> Vec<Output> {
-        let held = self.replaying.remove(&(link, room.to_string()));
-        held.into_iter()
-            .flat_map(|h| h.envelopes)
-            .map(|env| Output::Client(link, env))
-            .collect()
+    /// A client's replay of a room is over (its sender task says so). An
+    /// end of an older replay than the one running is ignored.
+    pub fn replay_done(&mut self, link: Link, room: &str, id: u64) {
+        let key = (link, room.to_string());
+        if self.replaying.get(&key).is_some_and(|r| r.id == id) {
+            self.replaying.remove(&key);
+        }
     }
 
     /// A room name, checked as rrcd's `_norm_room` checks it, or the text
@@ -801,7 +822,7 @@ impl Relay {
         Ok(room)
     }
 
-    fn join(&mut self, link: Link, env: &Envelope, out: &mut Vec<Output>) {
+    fn join(&mut self, link: Link, env: &Envelope, now: Instant, out: &mut Vec<Output>) {
         // rrcd's order: no room (or an empty one), the room limit, then
         // the name.
         let Some(raw) = env.room.as_deref().filter(|r| !r.is_empty()) else {
@@ -817,7 +838,7 @@ impl Relay {
                 client.rooms.insert(room.clone());
             }
             self.deliver(out, &[link], &joined);
-            self.replay(link, room, out);
+            self.replay(link, room, now, out);
             return;
         }
         let rooms = self.room_set();
@@ -859,20 +880,17 @@ impl Relay {
 
     /// Replay the room's history to a client that just joined it: the
     /// newest `replay_max` messages of the last `replay_window`.
-    fn replay(&mut self, link: Link, room: &str, out: &mut Vec<Output>) {
+    fn replay(&mut self, link: Link, room: &str, now: Instant, out: &mut Vec<Output>) {
         if self.replay_max == 0 || self.replay_window.is_zero() {
             return;
         }
         let window = u64::try_from(self.replay_window.as_millis()).unwrap_or(u64::MAX);
-        out.push(Output::Replay(Replay {
-            link,
-            query: Query {
-                room: room.to_string(),
-                since_ms: Some(now_ms().saturating_sub(window)),
-                max: self.replay_max,
-            },
-            say_empty: false,
-        }));
+        let query = Query {
+            room: room.to_string(),
+            since_ms: Some(now_ms().saturating_sub(window)),
+            max: self.replay_max,
+        };
+        self.start_replay(link, query, false, now, out);
     }
 
     /// Keep an envelope from the hub in the room's history. It gets every
@@ -903,6 +921,9 @@ impl Relay {
             .clients
             .get_mut(&link)
             .is_some_and(|c| c.rooms.remove(&room) | c.pending.remove(&room));
+        // The replay of the room ends, and what it held goes with it: the
+        // PARTED goes out at once.
+        self.end_replay(link, &room, out);
         let answer = parted(self, identity);
         self.deliver(out, &[link], &answer);
         if !member || !self.part_upstream {
@@ -934,6 +955,7 @@ impl Relay {
                 client.rooms.remove(&room);
                 client.pending.remove(&room);
             }
+            self.end_replay(other, &room, out);
             let env = parted(self, id);
             self.deliver(out, &[other], &env);
         }
@@ -1120,7 +1142,7 @@ impl Relay {
             }
             UpstreamEvent::Envelope(env, inbound) => self.hub_envelope(env, inbound, now, &mut out),
         }
-        self.hold(out, now)
+        out
     }
 
     /// The session went down: what was joined through it is gone.
@@ -1191,7 +1213,7 @@ impl Relay {
                         client.rooms.insert(room.clone());
                     }
                     self.deliver(out, &[link], &answer);
-                    self.replay(link, &room, out);
+                    self.replay(link, &room, now, out);
                 }
             }
             Inbound::JoinFailed { room, .. } => {
@@ -1220,6 +1242,7 @@ impl Relay {
                     if let Some(client) = self.clients.get_mut(link) {
                         client.rooms.remove(&room);
                     }
+                    self.end_replay(*link, &room, out);
                 }
                 self.deliver(out, &members, &answer);
             }
@@ -1337,13 +1360,18 @@ impl Relay {
         let stuck: Vec<(Link, String)> = self
             .replaying
             .iter()
-            .filter(|(_, h)| now.saturating_duration_since(h.since) >= REPLAY_WAIT)
+            .filter(|(_, r)| now.saturating_duration_since(r.since) >= REPLAY_WAIT)
             .map(|(k, _)| k.clone())
             .collect();
         let mut out = Vec::new();
         for (link, room) in stuck {
-            tracing::warn!("a replay of {room} did not end in {}s", REPLAY_WAIT.as_secs());
-            out.extend(self.replay_done(link, &room));
+            tracing::warn!("a replay of {room} did not end in {}s: ended", REPLAY_WAIT.as_secs());
+            self.replaying.remove(&(link, room.clone()));
+            out.push(Output::EndReplay {
+                link,
+                room: Some(room),
+                flush: true,
+            });
         }
         let late: Vec<Link> = self
             .clients
@@ -1416,52 +1444,376 @@ pub struct LocalHub {
 /// How often the relay's clock runs.
 const TICK: Duration = Duration::from_secs(1);
 
-/// Send a client its replay, paced, then tell the relay it is done (also
-/// when the task ends early). `records` was asked for when the replay
-/// started, so a record the hub sent after that is held, not replayed.
-async fn send_replay(
-    handle: DestinationHandle,
-    replay: Replay,
-    records: tokio::sync::oneshot::Receiver<Vec<Record>>,
+/// Where a client link's envelopes go: the local hub's destination, or a
+/// fake in the tests.
+pub trait LinkSink: Clone + Send + Sync + 'static {
+    fn send(&self, link: Link, data: Vec<u8>) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+impl LinkSink for DestinationHandle {
+    async fn send(&self, link: Link, data: Vec<u8>) -> Result<(), String> {
+        self.send_link_packet(link, data)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// What the relay's task hands a client link's sender task.
+#[derive(Debug)]
+enum ToLink {
+    /// An envelope, held while a replay of its room runs.
+    Send(Envelope),
+    /// The local hub's own notice, never held.
+    Now(Envelope),
+    /// A replay; its room's envelopes are held from here.
+    Replay {
+        id: u64,
+        room: String,
+        say_empty: bool,
+        records: tokio::sync::oneshot::Receiver<Vec<Record>>,
+    },
+    /// End the replays of a room (of every room: None).
+    End { room: Option<String>, flush: bool },
+}
+
+/// A replay waiting its turn on a link, or sending.
+struct LinkReplay {
+    id: u64,
+    room: String,
+    say_empty: bool,
+    records: Records,
+}
+
+enum Records {
+    Asked(tokio::sync::oneshot::Receiver<Vec<Record>>),
+    Got(Vec<Record>),
+    Sending(VecDeque<Envelope>),
+}
+
+/// What a sender task shares: who it is, what it tells, where it counts.
+struct LinkTask<S> {
+    sink: S,
+    link: Link,
     ids: ([u8; 16], [u8; 16]),
     status: SharedRelayStatus,
-    done: mpsc::UnboundedSender<(Link, String)>,
-) {
-    struct Done(mpsc::UnboundedSender<(Link, String)>, Link, String);
-    impl Drop for Done {
-        fn drop(&mut self) {
-            let _ = self.0.send((self.1, std::mem::take(&mut self.2)));
+    done: mpsc::UnboundedSender<(Link, String, u64)>,
+}
+
+impl<S: LinkSink> LinkTask<S> {
+    fn tally(&self, f: impl FnOnce(&mut RelayStatus)) {
+        if let Ok(mut s) = self.status.lock() {
+            f(&mut s);
         }
     }
-    let Replay { link, query, say_empty } = replay;
-    let _done = Done(done, link, query.room.clone());
-    let records = records.await.unwrap_or_default();
-    let (hub, upstream) = ids;
-    let envelopes = replay_envelopes(&records, &hub, &upstream, &query.room, say_empty);
-    for (i, env) in envelopes.iter().enumerate() {
-        if i > 0 {
-            tokio::time::sleep(REPLAY_PACE).await;
-        }
-        let sent = matches!(
-            tokio::time::timeout(SEND_TIMEOUT, handle.send_link_packet(link, env.encode())).await,
-            Ok(Ok(_))
-        );
-        if let Ok(mut s) = status.lock() {
-            if sent {
-                s.relayed_out += 1;
-            } else {
-                s.relay_drops += 1;
+
+    /// Send one envelope, given `SEND_TIMEOUT`: false if it was not sent.
+    async fn send(&self, env: &Envelope) -> bool {
+        let failure = match tokio::time::timeout(SEND_TIMEOUT, self.sink.send(self.link, env.encode())).await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(_) => Some(format!("no room in {}s", SEND_TIMEOUT.as_secs())),
+        };
+        match failure {
+            None => {
+                self.tally(|s| s.relayed_out += 1);
+                true
+            }
+            Some(e) => {
+                self.tally(|s| s.relay_drops += 1);
+                tracing::debug!("could not send a {:?} to link {}: {e}", env.t, hex::encode(self.link));
+                false
             }
         }
-        if !sent {
-            tracing::debug!(
-                "replay of {} to link {}: send failed, given up",
-                query.room,
-                hex::encode(link)
-            );
-            break;
+    }
+
+    /// A replay is over: what was held for its room follows, then the
+    /// relay is told.
+    async fn finish(&self, replay: LinkReplay, held: &mut BTreeMap<String, Vec<Envelope>>) {
+        for env in held.remove(&replay.room).unwrap_or_default() {
+            self.send(&env).await;
+        }
+        let _ = self.done.send((self.link, replay.room, replay.id));
+    }
+
+    fn envelopes(&self, replay: &LinkReplay, records: &[Record]) -> VecDeque<Envelope> {
+        let (hub, upstream) = self.ids;
+        replay_envelopes(records, &hub, &upstream, &replay.room, replay.say_empty).into()
+    }
+}
+
+/// One client link's sender: sends what the relay's task gives it in
+/// order, never holding the relay's task up. Its replays go one after
+/// another, one envelope every `REPLAY_PACE`; while a room's replay waits
+/// or runs, the room's other envelopes are held (`MAX_HELD`, the rest
+/// dropped) and sent after it. The bouncer's own notices are never held.
+async fn link_sender<S: LinkSink>(
+    task: LinkTask<S>,
+    mut rx: mpsc::UnboundedReceiver<ToLink>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut waiting: VecDeque<LinkReplay> = VecDeque::new();
+    let mut current: Option<LinkReplay> = None;
+    let mut held: BTreeMap<String, Vec<Envelope>> = BTreeMap::new();
+    let mut next_at = tokio::time::Instant::now();
+    loop {
+        // A waiting replay with nothing to send ends at once: its "no
+        // history" goes out without waiting its turn.
+        let mut i = 0;
+        while i < waiting.len() {
+            if let Records::Asked(rx) = &mut waiting[i].records {
+                match rx.try_recv() {
+                    Ok(records) => waiting[i].records = Records::Got(records),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        waiting[i].records = Records::Got(Vec::new());
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                }
+            }
+            if matches!(&waiting[i].records, Records::Got(r) if r.is_empty()) {
+                let Some(replay) = waiting.remove(i) else { break };
+                for env in task.envelopes(&replay, &[]) {
+                    task.send(&env).await;
+                }
+                task.finish(replay, &mut held).await;
+            } else {
+                i += 1;
+            }
+        }
+        if current.is_none() {
+            current = waiting.pop_front();
+        }
+        if let Some(replay) = &mut current
+            && let Records::Got(records) = &replay.records
+        {
+            let envelopes = task.envelopes(replay, records);
+            replay.records = Records::Sending(envelopes);
+        }
+        enum Step {
+            Message(Option<ToLink>),
+            Records(Vec<Record>),
+            Pace,
+        }
+        let step = tokio::select! {
+            message = rx.recv() => Step::Message(message),
+            step = async {
+                match current.as_mut().map(|r| &mut r.records) {
+                    Some(Records::Asked(records)) => Step::Records(records.await.unwrap_or_default()),
+                    Some(Records::Sending(_)) => {
+                        tokio::time::sleep_until(next_at).await;
+                        Step::Pace
+                    }
+                    _ => std::future::pending().await,
+                }
+            } => step,
+        };
+        match step {
+            Step::Message(None) => return,
+            Step::Message(Some(ToLink::Send(env))) => {
+                queued.fetch_sub(1, Ordering::Relaxed);
+                let room = env.room.as_deref().and_then(normalize_room);
+                match room.and_then(|r| held.get_mut(&r)) {
+                    Some(envelopes) if envelopes.len() < MAX_HELD => envelopes.push(env),
+                    Some(_) => task.tally(|s| s.relay_drops += 1),
+                    None => {
+                        task.send(&env).await;
+                    }
+                }
+            }
+            Step::Message(Some(ToLink::Now(env))) => {
+                queued.fetch_sub(1, Ordering::Relaxed);
+                task.send(&env).await;
+            }
+            Step::Message(Some(ToLink::Replay {
+                id,
+                room,
+                say_empty,
+                records,
+            })) => {
+                held.entry(room.clone()).or_default();
+                waiting.push_back(LinkReplay {
+                    id,
+                    room,
+                    say_empty,
+                    records: Records::Asked(records),
+                });
+            }
+            Step::Message(Some(ToLink::End { room, flush })) => {
+                let ends = |r: &LinkReplay| room.as_ref().is_none_or(|room| *room == r.room);
+                waiting.retain(|r| !ends(r));
+                if current.as_ref().is_some_and(ends) {
+                    current = None;
+                }
+                let ended: Vec<String> = held
+                    .keys()
+                    .filter(|r| room.as_ref().is_none_or(|room| room == *r))
+                    .cloned()
+                    .collect();
+                for r in ended {
+                    let envelopes = held.remove(&r).unwrap_or_default();
+                    if flush {
+                        for env in envelopes {
+                            task.send(&env).await;
+                        }
+                    }
+                }
+            }
+            Step::Records(records) => {
+                if let Some(replay) = &mut current {
+                    replay.records = Records::Got(records);
+                }
+            }
+            Step::Pace => {
+                let Some(replay) = &mut current else { continue };
+                let Records::Sending(envelopes) = &mut replay.records else {
+                    continue;
+                };
+                if let Some(env) = envelopes.pop_front() {
+                    let sent = task.send(&env).await;
+                    next_at = tokio::time::Instant::now() + REPLAY_PACE;
+                    if !sent {
+                        tracing::debug!(
+                            "replay of {} to link {}: send failed, given up",
+                            replay.room,
+                            hex::encode(task.link)
+                        );
+                        envelopes.clear();
+                    }
+                }
+                if envelopes.is_empty()
+                    && let Some(replay) = current.take()
+                {
+                    task.finish(replay, &mut held).await;
+                }
+            }
         }
     }
+}
+
+/// A client link's sender task, and what is queued for it.
+struct LinkSender {
+    tx: mpsc::UnboundedSender<ToLink>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// The sender tasks of a local hub's client links, started at a link's
+/// first envelope and stopped when it closes.
+struct Links<S: LinkSink> {
+    sink: S,
+    ids: ([u8; 16], [u8; 16]),
+    status: SharedRelayStatus,
+    done: mpsc::UnboundedSender<(Link, String, u64)>,
+    senders: HashMap<Link, LinkSender>,
+}
+
+impl<S: LinkSink> Links<S> {
+    fn new(
+        sink: S,
+        ids: ([u8; 16], [u8; 16]),
+        status: SharedRelayStatus,
+        done: mpsc::UnboundedSender<(Link, String, u64)>,
+    ) -> Self {
+        Self {
+            sink,
+            ids,
+            status,
+            done,
+            senders: HashMap::new(),
+        }
+    }
+
+    fn sender(&mut self, link: Link) -> &LinkSender {
+        self.senders.entry(link).or_insert_with(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let task = LinkTask {
+                sink: self.sink.clone(),
+                link,
+                ids: self.ids,
+                status: self.status.clone(),
+                done: self.done.clone(),
+            };
+            let task = tokio::spawn(link_sender(task, rx, queued.clone()));
+            LinkSender { tx, queued, task }
+        })
+    }
+
+    /// Queue an envelope for a link, or drop it (counted) when
+    /// `LINK_QUEUE` wait already. Never waits.
+    fn envelope(&mut self, link: Link, message: ToLink) {
+        use std::sync::atomic::Ordering;
+        let status = self.status.clone();
+        let sender = self.sender(link);
+        if sender.queued.load(Ordering::Relaxed) >= LINK_QUEUE {
+            if let Ok(mut s) = status.lock() {
+                s.relay_drops += 1;
+            }
+            tracing::debug!("link {}: {LINK_QUEUE} envelopes wait: one dropped", hex::encode(link));
+            return;
+        }
+        sender.queued.fetch_add(1, Ordering::Relaxed);
+        if sender.tx.send(message).is_err() {
+            sender.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Hand a link's sender something that is never dropped.
+    fn control(&mut self, link: Link, message: ToLink) {
+        let _ = self.sender(link).tx.send(message);
+    }
+
+    fn close(&mut self, link: &Link) {
+        if let Some(sender) = self.senders.remove(link) {
+            sender.task.abort();
+        }
+    }
+}
+
+impl<S: LinkSink> Drop for Links<S> {
+    fn drop(&mut self) {
+        for sender in self.senders.values() {
+            sender.task.abort();
+        }
+    }
+}
+
+/// Hand the relay's outputs on: envelopes and replays to the links'
+/// sender tasks. Never waits; the links to close now are returned.
+fn dispatch<S: LinkSink>(
+    outputs: Vec<Output>,
+    relay: &Relay,
+    links: &mut Links<S>,
+    close_later: impl Fn(Link),
+) -> Vec<Link> {
+    let mut close = Vec::new();
+    for output in outputs {
+        match output {
+            Output::Client(link, env) => links.envelope(link, ToLink::Send(env)),
+            Output::Now(link, env) => links.envelope(link, ToLink::Now(env)),
+            Output::Close(link) => {
+                links.close(&link);
+                close.push(link);
+            }
+            Output::CloseLater(link) => close_later(link),
+            // Asked now, before the next event is recorded.
+            Output::Replay(replay) => {
+                let records = relay.history.query(replay.query.clone());
+                links.control(
+                    replay.link,
+                    ToLink::Replay {
+                        id: replay.id,
+                        room: replay.query.room,
+                        say_empty: replay.say_empty,
+                        records,
+                    },
+                );
+            }
+            Output::EndReplay { link, room, flush } => links.control(link, ToLink::End { room, flush }),
+        }
+    }
+    close
 }
 
 /// A packet from a client link.
@@ -1496,9 +1848,16 @@ pub async fn run(hub: LocalHub) {
     let events = &mut registered.events;
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let (replayed, mut replays_done) = mpsc::unbounded_channel::<(Link, String)>();
+    let (replayed, mut replays_done) = mpsc::unbounded_channel::<(Link, String, u64)>();
+    let mut links = Links::new(
+        handle.clone(),
+        (relay.hub, relay.upstream),
+        relay.status.clone(),
+        replayed,
+    );
     loop {
         let now = Instant::now();
+        let mut closed = None;
         let outputs = tokio::select! {
             Some(link) = events.links_established.recv() => {
                 tracing::info!("hub {tag}: link {} established", hex::encode(link));
@@ -1547,11 +1906,15 @@ pub async fn run(hub: LocalHub) {
                     map.remove(&link);
                 }
                 relay.link_closed(link);
+                closed = Some(link);
                 tracing::info!("hub {tag}: link {} closed", hex::encode(link));
                 out
             }
             _ = ticker.tick() => relay.tick(now),
-            Some((link, room)) = replays_done.recv() => relay.replay_done(link, &room),
+            Some((link, room, id)) = replays_done.recv() => {
+                relay.replay_done(link, &room, id);
+                Vec::new()
+            }
             Some(_) = events.packets.recv() => Vec::new(),
             Some(_) = events.link_packet_proofs.recv() => Vec::new(),
             Some(_) = events.resource_completions.recv() => Vec::new(),
@@ -1559,53 +1922,24 @@ pub async fn run(hub: LocalHub) {
             Some(_) = events.resource_events.recv() => Vec::new(),
             Some(_) = events.channel_messages.recv() => Vec::new(),
         };
-        for output in outputs {
-            match output {
-                Output::Client(link, env) => {
-                    let failure =
-                        match tokio::time::timeout(SEND_TIMEOUT, handle.send_link_packet(link, env.encode())).await {
-                            Ok(Ok(_)) => None,
-                            Ok(Err(e)) => Some(e.to_string()),
-                            Err(_) => Some(format!("no room in {}s", SEND_TIMEOUT.as_secs())),
-                        };
-                    if let Some(e) = failure {
-                        relay.tally(|s| s.relay_drops += 1);
-                        tracing::debug!(
-                            "hub {tag}: could not send a {:?} to link {}: {e}",
-                            env.t,
-                            hex::encode(link)
-                        );
-                    }
-                }
-                Output::Close(link) => {
-                    tracing::info!(
-                        "hub {tag}: closing link {}: not identified in {}s",
-                        hex::encode(link),
-                        IDENTIFY_TIMEOUT.as_secs()
-                    );
-                    let _ = handle.close_link(link, CloseReason::DestinationClosed, true).await;
-                }
-                Output::CloseLater(link) => {
-                    let handle = handle.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(REFUSE_CLOSE_DELAY).await;
-                        let _ = handle.close_link(link, CloseReason::DestinationClosed, true).await;
-                    });
-                }
-                // Asked now, before the next event is recorded; sent on its
-                // own task, so one client's replay holds up nobody else.
-                Output::Replay(replay) => {
-                    let records = relay.history.query(replay.query.clone());
-                    tokio::spawn(send_replay(
-                        handle.clone(),
-                        replay,
-                        records,
-                        (relay.hub, relay.upstream),
-                        relay.status.clone(),
-                        replayed.clone(),
-                    ));
-                }
-            }
+        let close_later = |link: Link| {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(REFUSE_CLOSE_DELAY).await;
+                let _ = handle.close_link(link, CloseReason::DestinationClosed, true).await;
+            });
+        };
+        for link in dispatch(outputs, &relay, &mut links, close_later) {
+            tracing::info!(
+                "hub {tag}: closing link {}: not identified in {}s",
+                hex::encode(link),
+                IDENTIFY_TIMEOUT.as_secs()
+            );
+            let _ = handle.close_link(link, CloseReason::DestinationClosed, true).await;
+        }
+        // A closed link's sender stops, with what was left for it.
+        if let Some(link) = closed {
+            links.close(&link);
         }
         if relay.take_changed() {
             changed.notify_one();
@@ -2034,8 +2368,8 @@ mod tests {
             assert_eq!(env.extra(64).map(Raw::value), Some(Value::Text("fmt".into())));
         }
         let status = f.status.lock().unwrap().clone();
-        // Two JOINED answers and two echoes.
-        assert_eq!((status.relayed_in, status.relayed_out), (1, 4));
+        // relayed_out is counted by the links' sender tasks, as they send.
+        assert_eq!((status.relayed_in, status.relayed_out), (1, 0));
         // Another member's ACTION too, with its K_SRC.
         let action = Envelope::new(MessageType::Action, &OTHER).with_room("lobby");
         let sent = sent_to(&f.hub(action, Inbound::Relay));
@@ -2721,17 +3055,33 @@ mod tests {
         assert_eq!(empty[0].text_body().as_deref(), Some("--- no history in lobby ---"));
     }
 
+    fn ends_in(out: &[Output]) -> Vec<(Link, Option<String>, bool)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::EndReplay { link, room, flush } => Some((*link, room.clone(), *flush)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn now_to(out: &[Output]) -> Vec<(Link, Envelope)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Now(l, e) => Some((*l, e.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn a_join_replays_and_holds_the_rooms_envelopes_until_done() {
+    fn a_join_asks_for_a_replay_after_its_joined() {
         let mut f = fixture().replays(50);
         f.up();
         f.joined_upstream("lobby", &[&USER, &OTHER]);
-        f.in_rooms(B, &["lobby"]);
-        let _ = f.relay.replay_done(B, "lobby");
         f.connect(A, USER);
         f.hello(A);
         let out = f.packet(A, &client(MessageType::Join).with_room("lobby"));
-        assert_eq!(sent_to(&out)[0].1.t, MessageType::Joined);
+        assert!(matches!(&out[0], Output::Client(A, e) if e.t == MessageType::Joined));
         let replays = replays_in(&out);
         assert_eq!(replays.len(), 1);
         let r = &replays[0];
@@ -2744,44 +3094,82 @@ mod tests {
         // A JOIN while the replay runs starts no second one.
         let again = f.packet(A, &client(MessageType::Join).with_room("lobby"));
         assert!(replays_in(&again).is_empty());
-        // The room's envelopes wait for A; B gets them now; other rooms
-        // are not held.
-        let first = f.hub(room_msg("lobby", "one"), Inbound::Relay);
-        assert_eq!(links(&first), vec![B]);
-        f.hub(room_msg("lobby", "two"), Inbound::Relay);
-        let done = f.relay.replay_done(A, "lobby");
-        let bodies: Vec<String> = sent_to(&done)
-            .iter()
-            .map(|(l, e)| {
-                assert_eq!(*l, A);
-                e.text_body().unwrap_or_default()
-            })
-            .collect();
-        // The JOINED answering the second JOIN, then the two messages.
-        assert_eq!(bodies[1..], ["one".to_string(), "two".to_string()]);
-        assert_eq!(links(&f.hub(room_msg("lobby", "three"), Inbound::Relay)), vec![A, B]);
+        // Room envelopes go out as ever: the link's sender holds them.
+        assert_eq!(links(&f.hub(room_msg("lobby", "one"), Inbound::Relay)), vec![A]);
+        // Done, the next JOIN replays again, with a new id.
+        f.relay.replay_done(A, "lobby", r.id);
+        let next = replays_in(&f.packet(A, &client(MessageType::Join).with_room("lobby")));
+        assert!(next.len() == 1 && next[0].id != r.id);
     }
 
     #[test]
-    fn a_replay_ends_at_a_close_or_in_time() {
+    fn a_stale_replay_done_is_ignored() {
         let mut f = fixture().replays(10);
         f.up();
         f.joined_upstream("lobby", &[&USER]);
-        f.in_rooms(A, &["lobby"]);
-        f.in_rooms(B, &["lobby"]);
-        f.hub(room_msg("lobby", "held"), Inbound::Relay);
-        f.relay.link_closed(A);
-        assert!(f.relay.replay_done(A, "lobby").is_empty());
+        f.connect(A, USER);
+        f.hello(A);
+        let join = client(MessageType::Join).with_room("lobby");
+        let first = replays_in(&f.packet(A, &join))[0].id;
+        // In time it is ended, and what it held is sent.
         let out = f.relay.tick(f.now + REPLAY_WAIT);
-        assert_eq!(links(&out), vec![B]);
+        assert_eq!(ends_in(&out), vec![(A, Some("lobby".into()), true)]);
         assert!(f.relay.replaying.is_empty());
-        // Too much to hold: the rest is dropped and counted.
-        f.in_rooms(C, &["lobby"]);
-        for i in 0..MAX_HELD + 3 {
-            f.hub(room_msg("lobby", &i.to_string()), Inbound::Relay);
-        }
-        assert_eq!(f.relay.replay_done(C, "lobby").len(), MAX_HELD);
-        assert!(f.status.lock().unwrap().relay_drops >= 3);
+        let second = replays_in(&f.packet(A, &join))[0].id;
+        // The first replay's end, late: the second still runs.
+        f.relay.replay_done(A, "lobby", first);
+        assert!(f.relay.replaying.contains_key(&(A, "lobby".to_string())));
+        assert_eq!(replays_in(&f.packet(A, &join)), vec![]);
+        f.relay.replay_done(A, "lobby", second);
+        assert!(f.relay.replaying.is_empty());
+        // A close ends a link's replays too.
+        replays_in(&f.packet(A, &join));
+        f.relay.link_closed(A);
+        assert!(f.relay.replaying.is_empty());
+    }
+
+    #[test]
+    fn part_and_hello_end_replays_before_their_answers() {
+        let mut f = fixture_with(true, 16).replays(10);
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.joined_upstream("side", &[&USER]);
+        f.in_rooms(A, &["lobby", "side"]);
+        f.in_rooms(B, &["lobby"]);
+        // A's PART: A's replay of the room ends, then its PARTED; with
+        // part_upstream, B's too, then B's.
+        let out = f.packet(A, &client(MessageType::Part).with_room("lobby"));
+        let order: Vec<(Link, &str)> = out
+            .iter()
+            .filter_map(|o| match o {
+                Output::EndReplay { link, flush: false, .. } => Some((*link, "end")),
+                Output::Client(link, e) if e.t == MessageType::Parted => Some((*link, "parted")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, [(A, "end"), (A, "parted"), (B, "end"), (B, "parted")]);
+        assert_eq!(ends_in(&out)[0], (A, Some("lobby".into()), false));
+        // A re-JOIN starts a fresh replay.
+        f.joined_upstream("lobby", &[&USER]);
+        let again = f.packet(A, &client(MessageType::Join).with_room("lobby"));
+        assert_eq!(replays_in(&again).len(), 1);
+        // HELLO ends every replay of the link, before the WELCOME.
+        let out = f.packet(A, &client(MessageType::Hello));
+        assert_eq!(ends_in(&out), vec![(A, None, false)]);
+        assert!(matches!(&out[1], Output::Client(A, e) if e.t == MessageType::Welcome));
+        assert!(f.relay.replaying.keys().all(|(l, _)| *l != A));
+        // A removal ends the members' replays of the room.
+        f.joined_upstream("side", &[&USER]);
+        f.in_rooms(C, &["side"]);
+        let kick = from_hub(MessageType::Error).with_room("side");
+        let out = f.hub(
+            kick,
+            Inbound::Removed {
+                room: "side".into(),
+                reason: String::new(),
+            },
+        );
+        assert_eq!(ends_in(&out), vec![(C, Some("side".into()), false)]);
     }
 
     #[test]
@@ -2825,9 +3213,11 @@ mod tests {
         let out = f.packet(A, &ask("/history 7", Some("Lobby")));
         assert!(f.command().is_none());
         assert!(sent_to(&out).is_empty());
+        let id = replays_in(&out)[0].id;
         assert_eq!(
             replays_in(&out),
             vec![Replay {
+                id,
                 link: A,
                 query: Query {
                     room: "lobby".into(),
@@ -2837,10 +3227,14 @@ mod tests {
                 say_empty: true
             }]
         );
-        // While it runs, another is refused with a NOTICE (held for after).
-        assert!(f.packet(A, &ask("/history", Some("lobby"))).is_empty());
-        let after = f.relay.replay_done(A, "lobby");
-        assert!(sent_to(&after)[0].1.text_body().unwrap().contains("is running"));
+        // While it runs, another is refused with a NOTICE, sent at once.
+        let running = now_to(&f.packet(A, &ask("/history", Some("lobby"))));
+        assert_eq!(running.len(), 1);
+        assert_eq!(
+            running[0].1.text_body().as_deref(),
+            Some("--- a replay of lobby is running ---")
+        );
+        f.relay.replay_done(A, "lobby", id);
         // No number: replay_max, or 100 when that is 0.
         assert_eq!(
             replays_in(&f.packet(B, &ask("/history", Some("lobby"))))[0].query.max,
@@ -2848,7 +3242,7 @@ mod tests {
         );
         // A bad one, or none in no room: the usage, to that client.
         for (body, room) in [("/history 0", Some("side")), ("/history", None)] {
-            let sent = sent_to(&f.packet(A, &ask(body, room)));
+            let sent = now_to(&f.packet(A, &ask(body, room)));
             assert_eq!(sent.len(), 1);
             let (link, notice) = &sent[0];
             assert_eq!(
@@ -2870,6 +3264,249 @@ mod tests {
         assert!(matches!(f.command(), Some(Command::Send(_))));
         f.packet(A, &ask("/historyx", Some("lobby")));
         assert!(matches!(f.command(), Some(Command::Send(_))));
+    }
+
+    /// A client link that takes every envelope, or none.
+    #[derive(Clone, Default)]
+    struct FakeSink {
+        sent: Arc<Mutex<Vec<(Link, Envelope, tokio::time::Instant)>>>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl LinkSink for FakeSink {
+        async fn send(&self, link: Link, data: Vec<u8>) -> Result<(), String> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("link down".into());
+            }
+            let env = Envelope::decode(&data).unwrap();
+            self.sent.lock().unwrap().push((link, env, tokio::time::Instant::now()));
+            Ok(())
+        }
+    }
+
+    struct Senders {
+        links: Links<FakeSink>,
+        sink: FakeSink,
+        done: mpsc::UnboundedReceiver<(Link, String, u64)>,
+        status: SharedRelayStatus,
+    }
+
+    fn senders() -> Senders {
+        let sink = FakeSink::default();
+        let status = SharedRelayStatus::default();
+        let (tx, done) = mpsc::unbounded_channel();
+        Senders {
+            links: Links::new(sink.clone(), (HUB, UPSTREAM), status.clone(), tx),
+            sink,
+            done,
+            status,
+        }
+    }
+
+    fn records_of(room: &str, n: usize) -> Vec<Record> {
+        (0..n)
+            .map(|i| Record {
+                ts_ms: 1_794_567_845_000 + i as u64,
+                envelope: room_msg(room, &format!("{room} {i}")).encode(),
+            })
+            .collect()
+    }
+
+    impl Senders {
+        /// A replay of `n` records of `room`, answered at once.
+        fn replay(&mut self, link: Link, id: u64, room: &str, n: usize) {
+            let tx = self.replay_waiting(link, id, room);
+            let _ = tx.send(records_of(room, n));
+        }
+
+        /// A replay whose records have not come: their sender.
+        fn replay_waiting(&mut self, link: Link, id: u64, room: &str) -> tokio::sync::oneshot::Sender<Vec<Record>> {
+            let (tx, records) = tokio::sync::oneshot::channel();
+            self.links.control(
+                link,
+                ToLink::Replay {
+                    id,
+                    room: room.into(),
+                    say_empty: true,
+                    records,
+                },
+            );
+            tx
+        }
+
+        fn end(&mut self, link: Link, room: Option<&str>, flush: bool) {
+            self.links.control(
+                link,
+                ToLink::End {
+                    room: room.map(String::from),
+                    flush,
+                },
+            );
+        }
+
+        /// What went to a link, as text bodies (or types).
+        fn to(&self, link: Link) -> Vec<String> {
+            self.sink
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(l, _, _)| *l == link)
+                .map(|(_, e, _)| e.text_body().unwrap_or_else(|| format!("{:?}", e.t)))
+                .collect()
+        }
+
+        fn done(&mut self) -> BTreeSet<(Link, String, u64)> {
+            std::iter::from_fn(|| self.done.try_recv().ok()).collect()
+        }
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+
+    fn done_of(list: &[(Link, &str, u64)]) -> BTreeSet<(Link, String, u64)> {
+        list.iter().map(|(l, r, i)| (*l, r.to_string(), *i)).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_rooms_replayed_to_one_link_are_paced_as_one_stream() {
+        let mut s = senders();
+        s.replay(A, 0, "lobby", 3);
+        s.replay(A, 1, "side", 3);
+        // Another link's replay runs beside them, paced on its own.
+        s.replay(B, 2, "lobby", 1);
+        settle().await;
+        let bodies = s.to(A);
+        assert_eq!(bodies.len(), 10);
+        assert!(bodies[0].starts_with("--- replay: 3 messages"));
+        assert_eq!(bodies[1..4], ["lobby 0", "lobby 1", "lobby 2"]);
+        assert_eq!(bodies[4], "--- end of replay ---");
+        assert!(bodies[5].starts_with("--- replay: 3 messages"));
+        assert_eq!(bodies[6..9], ["side 0", "side 1", "side 2"]);
+        assert_eq!(bodies[9], "--- end of replay ---");
+        let times: Vec<_> = s
+            .sink
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(l, _, _)| *l == A)
+            .map(|(_, _, t)| *t)
+            .collect();
+        for pair in times.windows(2) {
+            assert!(pair[1] - pair[0] >= REPLAY_PACE, "one pace across both replays");
+        }
+        assert_eq!(s.to(B).len(), 3);
+        assert_eq!(s.done(), done_of(&[(A, "lobby", 0), (A, "side", 1), (B, "lobby", 2)]));
+        assert_eq!(s.status.lock().unwrap().relayed_out, 13);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_lines_wait_for_their_rooms_replay_but_own_notices_do_not() {
+        let mut s = senders();
+        let records = s.replay_waiting(A, 0, "lobby");
+        s.links.envelope(A, ToLink::Send(room_msg("lobby", "live")));
+        s.links.envelope(A, ToLink::Send(room_msg("side", "other room")));
+        let own = Envelope::new(MessageType::Notice, &HUB)
+            .with_room("lobby")
+            .with_body(Raw::text("--- a replay of lobby is running ---"));
+        s.links.envelope(A, ToLink::Now(own));
+        settle().await;
+        assert_eq!(s.to(A), ["other room", "--- a replay of lobby is running ---"]);
+        let _ = records.send(records_of("lobby", 1));
+        settle().await;
+        assert_eq!(
+            s.to(A)[2..],
+            [
+                "--- replay: 1 message since 2026-11-13T11:04:05Z ---".to_string(),
+                "lobby 0".into(),
+                "--- end of replay ---".into(),
+                "live".into()
+            ]
+        );
+        assert_eq!(s.done(), done_of(&[(A, "lobby", 0)]));
+        // A failed send is a drop, counted where it failed.
+        s.sink.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        s.links.envelope(A, ToLink::Send(room_msg("lobby", "lost")));
+        settle().await;
+        let status = s.status.lock().unwrap().clone();
+        assert_eq!((status.relayed_out, status.relay_drops), (6, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ended_replay_stops_and_the_next_one_runs() {
+        let mut s = senders();
+        // Its records never come: the relay's timeout ends it, and what
+        // was held is sent.
+        let _stuck = s.replay_waiting(A, 0, "lobby");
+        s.links.envelope(A, ToLink::Send(room_msg("lobby", "live")));
+        s.replay(A, 1, "side", 1);
+        settle().await;
+        assert!(s.to(A).is_empty(), "the side replay waits its turn");
+        s.end(A, Some("lobby"), true);
+        settle().await;
+        assert_eq!(s.to(A)[0], "live");
+        assert_eq!(s.to(A)[2], "side 0");
+        assert_eq!(s.done(), done_of(&[(A, "side", 1)]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn part_ends_a_replay_and_parted_comes_before_any_later_room_line() {
+        let mut s = senders();
+        s.replay(A, 0, "lobby", 50);
+        tokio::time::sleep(REPLAY_PACE * 5).await;
+        s.links.envelope(A, ToLink::Send(room_msg("lobby", "live")));
+        s.end(A, Some("lobby"), false);
+        let parted = Envelope::new(MessageType::Parted, &HUB).with_room("lobby");
+        s.links.envelope(A, ToLink::Send(parted));
+        settle().await;
+        let bodies = s.to(A);
+        assert!(bodies.len() < 10, "the replay stopped: {bodies:?}");
+        assert_eq!(bodies.last().map(String::as_str), Some("Parted"));
+        assert!(
+            !bodies.contains(&"live".to_string()),
+            "held lines of a parted room are dropped"
+        );
+        // A JOIN again: a fresh replay, then live lines.
+        let before = bodies.len();
+        s.replay(A, 1, "lobby", 2);
+        s.links.envelope(A, ToLink::Send(room_msg("lobby", "live again")));
+        settle().await;
+        assert_eq!(
+            s.to(A)[before + 1..],
+            ["lobby 0", "lobby 1", "--- end of replay ---", "live again"]
+        );
+        assert_eq!(s.done(), done_of(&[(A, "lobby", 1)]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hello_ends_every_replay_of_its_link() {
+        let mut s = senders();
+        s.replay(A, 0, "lobby", 50);
+        let _waiting = s.replay_waiting(A, 1, "side");
+        s.replay(B, 2, "lobby", 2);
+        tokio::time::sleep(REPLAY_PACE * 3).await;
+        s.end(A, None, false);
+        let welcome = Envelope::new(MessageType::Welcome, &HUB);
+        s.links.envelope(A, ToLink::Send(welcome));
+        settle().await;
+        let bodies = s.to(A);
+        assert!(bodies.len() < 10);
+        assert_eq!(bodies.last().map(String::as_str), Some("Welcome"));
+        assert_eq!(s.to(B).len(), 4, "another link's replay runs on");
+        assert_eq!(s.done(), done_of(&[(B, "lobby", 2)]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_link_stops_its_sender() {
+        let mut s = senders();
+        s.replay(A, 0, "lobby", 50);
+        tokio::time::sleep(REPLAY_PACE * 3).await;
+        s.links.close(&A);
+        settle().await;
+        assert!(s.to(A).len() < 10);
+        assert!(s.links.senders.is_empty());
     }
 
     #[tokio::test]
@@ -2915,6 +3552,6 @@ mod tests {
             .unwrap();
         let got: Vec<Envelope> = records.iter().map(|r| Envelope::decode(&r.envelope).unwrap()).collect();
         assert_eq!(got, vec![said, echo]);
-        history.stop().await;
+        assert!(history.stop(Duration::from_secs(5)).await);
     }
 }

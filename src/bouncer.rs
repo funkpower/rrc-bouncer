@@ -34,6 +34,10 @@ const UPLINK_REFRESH: Duration = Duration::from_secs(5 * 60);
 const UPLINK_REFRESH_ENV: &str = "RRC_BOUNCER_UPLINK_REFRESH_SECS";
 /// How long each hub's history gets to write what it was given at shutdown.
 const HISTORY_STOP: Duration = Duration::from_secs(5);
+/// How long Reticulum gets to stop at shutdown.
+const RETICULUM_STOP: Duration = Duration::from_secs(5);
+/// The file in `state_dir` a running bouncer holds locked.
+pub const LOCK_FILE: &str = "lock";
 /// How long the upstream sessions get to close their links at shutdown:
 /// longer than a session waits for its link to close, so each one gets to
 /// write `stopped` to its status.
@@ -276,6 +280,9 @@ fn show_sessions(status: &mut Status, sessions: &[(SharedStatus, SharedRelayStat
 pub async fn run(settings: Settings) -> Result<(), String> {
     let identity = Arc::new(load_identity(&settings.identity)?);
     create_private_dir(&settings.state_dir)?;
+    // Held until the bouncer exits: a second one on the same state_dir
+    // would write the same history and status.
+    let _lock = lock_state_dir(&settings.state_dir)?;
     let mut locals = Vec::new();
     for hub in &settings.hubs {
         let local = load_or_create_hub_identity(&settings.hub_identity_path(&hub.address), &identity)?;
@@ -449,15 +456,47 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         task.abort();
     }
     // What the history threads were given is written and synced.
-    for history in &histories {
-        if tokio::time::timeout(HISTORY_STOP, history.stop()).await.is_err() {
+    // All hubs at once, each within HISTORY_STOP.
+    let stopping: Vec<_> = histories
+        .iter()
+        .map(|history| {
+            let history = history.clone();
+            tokio::spawn(async move { history.stop(HISTORY_STOP).await })
+        })
+        .collect();
+    for stop in stopping {
+        if !stop.await.unwrap_or(false) {
             tracing::warn!("the history did not stop in {}s", HISTORY_STOP.as_secs());
         }
     }
     show_sessions(&mut status, &session_status);
     write_status(&settings, &status);
-    runtime.shutdown_and_wait().await;
+    if tokio::time::timeout(RETICULUM_STOP, runtime.shutdown_and_wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!("Reticulum did not stop in {}s", RETICULUM_STOP.as_secs());
+    }
     Ok(())
+}
+
+/// Take the lock on `state_dir/lock`, or say another bouncer holds it.
+pub fn lock_state_dir(state_dir: &std::path::Path) -> Result<std::fs::File, String> {
+    let path = state_dir.join(LOCK_FILE);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "another rrc-bouncer is running with state_dir {} (it holds {})",
+            state_dir.display(),
+            path.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("{}: {e}", path.display())),
+    }
 }
 
 /// Wait for every task (aborting the rest if the caller times out).
@@ -479,6 +518,18 @@ async fn futures_join_all(tasks: Vec<tokio::task::JoinHandle<()>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lock_file_keeps_a_second_bouncer_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_state_dir(dir.path()).unwrap();
+        let err = lock_state_dir(dir.path()).unwrap_err();
+        assert!(err.contains("another rrc-bouncer is running"), "{err}");
+        // status reads the state_dir all the same.
+        assert!(dir.path().join(LOCK_FILE).exists());
+        drop(first);
+        lock_state_dir(dir.path()).unwrap();
+    }
 
     #[test]
     fn a_long_upstream_name_is_cut_to_fit_the_announce() {

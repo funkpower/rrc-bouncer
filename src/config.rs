@@ -261,6 +261,13 @@ impl Config {
         if h.max_mb == 0 {
             return Err("[history]: max_mb must be at least 1".into());
         }
+        if h.replay_max > crate::relay::MAX_HISTORY {
+            return Err(format!(
+                "[history]: replay_max must be at most {} (it is {})",
+                crate::relay::MAX_HISTORY,
+                h.replay_max
+            ));
+        }
         if self.hub.is_empty() {
             return Err("no [[hub]]: name at least one upstream hub".into());
         }
@@ -537,6 +544,14 @@ mod tests {
         assert!(settings(&zero_days).is_err());
         let zero_mb = MINIMAL.replace("[reticulum]", "[history]\nmax_mb = 0\n[reticulum]");
         assert!(settings(&zero_mb).is_err());
+        let most = MINIMAL.replace("[reticulum]", "[history]\nreplay_max = 500\n[reticulum]");
+        assert_eq!(settings(&most).unwrap().history.replay_max, 500);
+        let too_many = MINIMAL.replace("[reticulum]", "[history]\nreplay_max = 501\n[reticulum]");
+        assert!(
+            settings(&too_many)
+                .unwrap_err()
+                .contains("replay_max must be at most 500")
+        );
         let no_replay = MINIMAL.replace(
             "[reticulum]",
             "announce = true\npart_upstream = true\n[history]\nreplay_max = 0\nreplay_hours = 0\n[reticulum]",

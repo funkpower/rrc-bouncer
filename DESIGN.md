@@ -315,6 +315,15 @@ send out; unit-tested), and `run`, the task per hub that owns the link and feeds
 - **Shutdown.** On a signal every session closes its link (waiting at most 5 s, `CLOSE_WAIT`) and
   writes its status, within the bouncer's 10 s per session (`SESSION_STOP`, longer by a
   compile-time check); Reticulum is stopped only after that, so no link outlives the transport.
+  Then every hub's history thread is stopped at once, each given 5 s to write and sync what it
+  was given (a full queue is not waited on past that), Reticulum is given 5 s to stop, and tasks
+  still running get 2 s (`Runtime::shutdown_timeout`): the process exits within about 22 s of the
+  signal whatever does not stop.
+- **One bouncer per `state_dir`.** `run` takes an exclusive `flock` on `state_dir/lock` (mode
+  0600, created if missing, never removed) before it starts the history or Reticulum, and holds it
+  until it exits; the kernel lets it go when the process ends, however it ends. A second `run` on
+  the same `state_dir` exits 1 with `another rrc-bouncer is running with state_dir <dir> (it holds
+  <dir>/lock)`. `status` and `hashes` do not take the lock and work while the bouncer runs.
 
 ## Local hub
 
@@ -502,9 +511,15 @@ of time in, commands to the upstream session and envelopes for client links out)
     closes the link.
   - An identity from the gate for a link no longer in the gate's map (it closed before the
     identity was read) is ignored, so a closed link is not brought back.
-  - Each send to a client link is given 2 s (`SEND_TIMEOUT`); one that takes longer is given up,
-    counted in `relay_drops` and logged, so a client link that does not drain cannot hold up the
-    other clients or the session's events.
+  - The task never waits on a client link. Each client link has a sender task of its own, started
+    at the link's first envelope and stopped when the link closes; the relay's task hands it
+    envelopes through a queue and goes on. At 1024 envelopes waiting for one link
+    (`LINK_QUEUE`) the next is dropped and counted in `relay_drops` (the client is not told:
+    it is the link that does not drain). Replay starts and ends are never dropped.
+  - Each send to a client link is given 2 s (`SEND_TIMEOUT`), inside the link's sender; one that
+    takes longer is given up, counted in `relay_drops` and logged, so a client link that does not
+    drain holds up only itself. `relayed_out` counts envelopes as they are sent, `relay_drops`
+    where they are dropped.
 - **History hooks.** `Relay::record` is called with every envelope the hub sends to a room as
   a whole: room MSG, ACTION and NOTICE (the hub's room NOTICEs included, not a command's answer
   to one client), other members' JOINED and PARTED, and the ERROR that removes the bouncer from
@@ -513,7 +528,8 @@ of time in, commands to the upstream session and envelopes for client links out)
   `room <r>: …` NOTICE rrcd sends after a JOIN (it goes to the joiner alone).
   The hub's echo of a client's envelope is a room envelope like any other, so each client
   envelope is recorded once, as the hub delivered it. `Relay::replay` is called after each JOINED
-  a client gets.
+  a client gets; the history is asked at once, in the relay's task, and the link's sender is
+  handed the answer to wait for.
 - **Status.** Each `hubs` entry in `status.json` adds `clients`, `client_identities` (one per
   link, sorted), `refused_links`, `relayed_in`, `relayed_out` and `relay_drops`. A change of
   clients writes the file at once.
@@ -539,27 +555,59 @@ of time in, commands to the upstream session and envelopes for client links out)
 - **Room file names.** A room name is kept as it is when it is made of `a-z`, `0-9`, `_`, `-` and
   `.` (a `.` not first); every other byte (upper case, `%`, `/`, a leading `.`, UTF-8) is written
   `%XX`, upper-case hex, and `.log` is added. The mapping is one to one, and a file whose name does
-  not decode back to the same name is ignored. A room whose file name would be over 255 bytes is
-  not recorded (counted in `history_drops`).
+  not decode back to the same name is ignored. A room is not recorded (counted in
+  `history_drops`, warned once) when its file name with `.tmp` added, the longest name the history
+  makes from it, would be over 255 bytes: 247 bytes of plain name, or 82 bytes that each take
+  `%XX`.
 - **Writer.** Each hub has one history thread (`src/history.rs`) fed by a bounded queue (4096
   jobs). `Relay::record` puts a job on it with `try_send` and never waits: when the queue is full
   the record is dropped and counted in `history_drops`, so a slow disk cannot hold up the relay.
-  Replay queries go through the same queue, so a query sees every record queued before it.
+  A warning is logged when the queue fills and one when it has room again, with how many records
+  were dropped in between. Replay queries go through the same queue, so a query sees every record
+  queued before it.
+- **Open files.** At most 64 room files are open at once; at 64 the least recently written is
+  synced and closed. A file not written for 60 s is closed too.
+- **Index.** For each room the thread keeps where its newest 500 replayable records are and their
+  times, built when the file is first read and kept up as records are written. A replay reads
+  just the records it sends. Only when the index cannot answer (a time window reaching back past
+  records it has let go, as when the clock went back) is the file read through, a record at a
+  time; memory stays at most 500 entries per room either way.
 - **Durability.** Each record is one `write` to a file opened with `O_APPEND`. The thread calls
-  `fdatasync` on the files written to 5 s after a write and at shutdown (the bouncer gives it 5 s),
-  not after each record: a power loss can take the last 5 s of history, a crash of the bouncer
-  alone loses nothing written. A write that fails is cut back off the file (`set_len`) and counted
-  as a drop.
-- **A cut record.** Reading stops at the first record that does not decode, so a file whose last
-  record was cut short (power loss, full disk) still replays everything before it. The prune at
-  start and every hour takes such a tail off (logged), and removes `*.tmp` files a crash left.
+  `fdatasync` on the files written to 5 s after a write, before a file is closed and at shutdown
+  (the bouncer gives it 5 s), not after each record: a power loss can take the last 5 s of
+  history, a crash of the bouncer alone loses nothing written. A file stays to be synced until a
+  sync of it succeeds: one that fails is tried again 5 s later, counted in `history_sync_errors`
+  and warned about at most once a minute.
+- **Damage.** A record counts only if it decodes as a record and its envelope decodes as an
+  envelope (a record cut short reads on into the next one, and its envelope then does not).
+  - Before a room file is first appended to, it is read through and the thread knows its good
+    length: where its last whole record ends. Before each append the file's length is checked
+    against that; bytes past it that are no record (a write cut short by a crash or a full disk,
+    or written behind the bouncer's back) are cut off in place (`set_len`, then `fdatasync`),
+    which needs no free space. Nothing is appended after bytes that are no record: if the cut
+    fails the room is marked broken, the record is dropped and counted, and the cut is tried
+    again before the next record of the room.
+  - A write that fails is cut back off the file the same way and counted as a drop.
+  - Damage in the middle of a file (a bad first record included) is read past: reading goes on
+    at the next place a record starts (the bytes of a record's first key, `a2 65 ts_ms`) and reads
+    from there, however far on that is. The records on either side are kept and replayed. The
+    next prune writes the file again without the bytes that are no record (logged with their
+    size); they are not kept anywhere else.
+  - The prune at start and every hour cuts a bad tail off too (logged), and removes `*.tmp` files
+    a crash left. A file is never removed for damage; only one left with no record is.
 - **Retention.** `history.days` (default 30) and `history.max_mb` per hub (default 100, in units of
-  1,000,000 bytes). At start and every hour the thread reads the hub's room files, drops the
-  records older than `days`, then, while the hub's files together are over `max_mb`, the oldest
-  records of the hub, whichever room they are in. A file that changes is written to a `.tmp` file,
-  synced and renamed over the old one (the directory synced after); a file left empty is removed.
-  Between prunes a hub's history can grow past `max_mb` by an hour's traffic. Records are in the
-  order the bouncer got them; a file is not sorted.
+  1,000,000 bytes). At start and every hour the thread reads the hub's room files a record at a
+  time and judges each record by its own `ts_ms`: it drops the records older than `days`, then,
+  while the hub's records together are over `max_mb`, the hub's oldest records, whichever room
+  they are in (one time for the whole hub, below which every record goes). A file that changes is
+  written to a `.tmp` file, synced and renamed over the old one (the directory synced after); a
+  file left empty is removed. Between prunes a hub's history can grow past `max_mb` by an hour's
+  traffic. Records are in the order the bouncer got them, and a file is not sorted: a clock that
+  went back leaves newer records before older ones, and each is still judged by its own time.
+- **Times ahead of the clock.** A record stamped more than a day ahead of the clock at a prune
+  (written while the clock was wrong) is taken as received at that prune: its `ts_ms` is
+  rewritten to the prune's time, so it is neither kept forever nor replayed as the newest record
+  for ever after. Replay windows judge each record's time as it is in the file.
 - **What is replayed.** MSG, ACTION and NOTICE only. JOINED, PARTED and the ERROR that removes the
   bouncer are recorded but not replayed: a client takes them as changes to the room it is in now
   (weechat-rrc updates its member list, an ERROR naming the room is taken as a kick).
@@ -577,14 +625,26 @@ of time in, commands to the upstream session and envelopes for client links out)
     (as for live envelopes);
   - nothing at all when there is nothing to replay;
   - none when `replay_max = 0` or `replay_hours = 0`.
-- **Pacing.** A replay is sent by a task of its own, one envelope every 20 ms, each send given 2 s
-  as any send to a client (counted in `relayed_out`, or in `relay_drops` and the rest of the
-  replay given up). Other clients and the upstream session are not held up. While a client's
-  replay of a room runs, the room's live envelopes for that client are held (up to 512, the rest
-  dropped and counted in `relay_drops`) and sent after `--- end of replay ---`, so the client sees
-  them in order and none twice: the query is queued when the client joins, before any live
-  envelope that follows is recorded. A hold not released in 120 s is sent anyway (logged); a
-  client that closes its link ends its replays.
+- **Pacing.** Replays are sent by the client link's sender task ([Local hub](#local-hub)), one
+  envelope every 20 ms per link: a link's replays go one after another, never interleaved, so two
+  rooms joined at once are one paced stream, the second room's after the first's. Each send is
+  given 2 s as any send to a client (counted in `relayed_out`, or in `relay_drops` and the rest of
+  that replay given up). Other clients and the upstream session are not held up.
+  - The client sees the room's JOINED, then the replay, then the room's live lines. From the
+    moment a replay of a room is asked until it ends, the room's live envelopes for that client
+    are held (up to 512, the rest dropped and counted in `relay_drops`) and sent after
+    `--- end of replay ---`, so the client sees them in order and none twice: the query is queued
+    when the client joins, before any live envelope that follows is recorded.
+  - The bouncer's own notices (the `/history` usage, `--- a replay of <room> is running ---`) are
+    never held. A replay with nothing to send says `--- no history in <room> ---` at once, without
+    waiting for the link's other replays.
+  - Each replay has an id. A replay still running 120 s after it was asked is ended: what is left
+    of it is not sent, what was held is (logged). Its late end is told apart by the id and does
+    not end a newer replay of the room.
+  - A PART of the room ends the client's replay of it and drops what was held for it, and the
+    PARTED goes out at once, before any later line of the room; a JOIN after that starts a fresh
+    replay. A HELLO ends all of the link's replays (before its WELCOME). A link that closes stops
+    its sender and everything queued for it.
 - **Repeats.** The bouncer does not know what a client has already seen. A client that links
   again (or joins again) gets the room's last `replay_hours` once more, including what it saw
   before it went away; the opening NOTICE says where the replay starts. A client's own messages
@@ -608,10 +668,22 @@ of time in, commands to the upstream session and envelopes for client links out)
   - NomadNet (`RRC.py` 1145-1215) drops an own envelope only when its id is in `_sent_ids`;
     otherwise it keeps it as a message stamped with the time it arrived, not `K_TS`.
   - None of them fails on a replay; all show replayed lines at their arrival time.
+- **Clients and `/history`.** The client has to send `/history N` to the room as a MSG:
+  - weechat-rrc: `/history` is a WeeChat core command (the input history), and the plugin hooks
+    only its own commands (`plugin.c:2376`, `:2519`), so WeeChat takes `/history 50` itself. Type
+    `//history 50` in the room's buffer: WeeChat sends a line that starts with `//` as text, with
+    one `/` taken off.
+  - rBrowser2 (`rrc.py:1563`, `:1463-1466`): a line starting with `/` that is not one of its own
+    commands is sent to the hub as a MSG, so `/history 50` works as typed.
+  - NomadNet (`ui/textui/Channels.py:869`, `:982-989`, `:997-998`): every line that starts with
+    `/` is a command, and it sends to the hub only the commands in its own list, which has no
+    `history`. `/history 50` gets "Unknown command" and `//history 50` is the command `/history`,
+    unknown too. A NomadNet user cannot ask for history; the replay on JOIN still comes.
 - **Status.** Each `hubs` entry adds `history_bytes` and `history_rooms` (as of the last write or
-  prune), `history_records` (records written since start) and `history_drops` (records not
-  written: queue full, disk error, room name too long). They go out with the next write of
-  `status.json` (every minute, a change of clients, shutdown).
+  prune), `history_records` (records written since start), `history_drops` (records not
+  written: queue full, disk error, a broken file, room name too long) and `history_sync_errors`
+  (syncs that failed). They go out with the next write of `status.json` (every minute, a change of
+  clients, shutdown).
 
 ## Configuration
 
@@ -628,7 +700,7 @@ See `contrib/config.example.toml`.
 | `announce_interval_minutes` | `360` | With `announce = true`; at least 1 |
 | `allowed_identities` | `[]` | Identity hashes allowed to use the local hubs besides the user's |
 | `part_upstream` | `false` | A client's PART also parts upstream |
-| `[history] days / max_mb / replay_hours / replay_max` | `30 / 100 / 24 / 100` | [History](#history); `days` and `max_mb` at least 1 (`max_mb` in units of 1,000,000 bytes), either `replay_*` 0 turns the replay on JOIN off |
+| `[history] days / max_mb / replay_hours / replay_max` | `30 / 100 / 24 / 100` | [History](#history); `days` and `max_mb` at least 1 (`max_mb` in units of 1,000,000 bytes), `replay_max` at most 500, either `replay_*` 0 turns the replay on JOIN off |
 | `[[hub]] address` | required | The upstream hub's `rrc.hub` destination hash |
 | `[[hub]] rooms` | `[]` | Rooms to be in from the start (more are added by clients' JOINs and kept in the room set file). Trimmed and lowercased as rrcd does (`service.py:507`), duplicates dropped, an empty name refused |
 | `[[hub]] nick` | none | `K_NICK` the bouncer uses on its own envelopes (HELLO, JOIN, PART, PING; not PONG, as rrcd's has none) and puts on every client MSG, ACTION and NOTICE it sends upstream; empty means none, and then each client's own nick goes up, so the bouncer's nick on the hub changes with whichever client spoke last |
@@ -697,10 +769,13 @@ As of M4:
 
 - `run` also runs one history thread per upstream hub ([History](#history)): room envelopes are
   recorded, replayed after each JOINED and on `/history`.
-- Each `hubs` entry adds `history_bytes`, `history_rooms`, `history_records` and
-  `history_drops`. A file without these fields still reads.
+- Each `hubs` entry adds `history_bytes`, `history_rooms`, `history_records`, `history_drops`
+  and `history_sync_errors`. A file without these fields still reads.
 - `status` prints, per hub, `history          <bytes> bytes in <n> rooms` (`1 room`) and
-  `history written  <records> records, <drops> dropped`.
+  `history written  <records> records, <drops> dropped`, and `history syncs    <n> failed` when
+  any failed.
+- `run` holds `state_dir/lock` while it runs, so a second bouncer on the same `state_dir` does
+  not start ([Upstream session](#upstream-session)).
 
 ## Implementation notes
 
@@ -792,7 +867,19 @@ As of M4:
     with `K_SRC` the local hub.
   - With `replay_max = 2`, A7's JOIN gets the newest two; with `replay_max = 0`, A8's JOIN gets
     nothing and `/history 1` still answers.
-  Pruning by `max_mb` is covered by the unit tests in `src/history.rs`.
+  - With 400 records written into `hist2.log` by hand and `replay_max = 500`, A9 joins `hist2`
+    and `hist` at once: each JOINED comes before its room's replay, all 400 of `hist2` come framed
+    and then all five of `hist`, neither replay interleaved with the other.
+  - A9 parts `hist2` and joins it again; a second after its replay starts, A9 parts it: the
+    PARTED comes within 3 s, the replay stops there and nothing of `hist2` follows the PARTED; a
+    JOIN after that gets a fresh replay of all 400.
+  - With 1500 records of about 1.1 kB written by hand into `p1.log`, `p2.log` and `p3.log`, their
+    times shuffled across the rooms and out of order in each, and `max_mb = 1`: at start the hub's
+    history is cut to at most 1,000,000 bytes by taking the oldest records whichever room they are
+    in (every record that went is older than every one that stayed, each room keeps some, and no
+    more went than had to); `hist` and `hist2`, newer, are kept whole.
+  - A second `run` on the same `state_dir` exits 1 with `another rrc-bouncer is running`; the
+    first runs on, and `status` works beside it.
   The phases' start waits are generous (Python peers 180 s, rrcd 120 s) so a loaded host does not
   fail them.
   `RRC_BOUNCER_PING_SECS` (the idle PING and the PONG wait) and `RRC_BOUNCER_BACKOFF_SECS` (the

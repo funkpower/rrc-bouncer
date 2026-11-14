@@ -47,7 +47,13 @@ already seen, so a client that comes back gets those lines again, and your own
 messages from other clients are shown as yours. Clients show replayed lines at
 the time they arrive; the first notice says when they start. Say
 `/history N` in a room to get its last N messages (at most 500); it stays on
-the bouncer and never reaches the hub.
+the bouncer and never reaches the hub. In weechat-rrc type `//history 50`,
+since `/history` is a WeeChat command. rBrowser2 sends `/history 50` as typed.
+NomadNet has no way to send it: it answers "Unknown command".
+
+One bouncer runs per `state_dir`: a second one started on the same directory
+exits with "another rrc-bouncer is running". `rrc-bouncer status` and
+`rrc-bouncer hashes` still work while it runs.
 
 Set `nick` on each `[[hub]]`. The hub takes the nick of every message it gets,
 and all your clients share one link, so without it your nick on the hub

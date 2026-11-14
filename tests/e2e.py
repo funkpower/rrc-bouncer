@@ -906,6 +906,114 @@ def history_phases(run, args, port_r, upstream, user, local, env, found):
         run.stop(name)
     check(run.stop("BR") == 0, "the bouncer stops cleanly")
 
+    print("history: two rooms joined at once (replay_max = 500)", flush=True)
+    now = int(time.time() * 1000)
+    many = 400
+    with open(history_file(run, upstream, "hist2"), "wb") as f:
+        for i in range(many):
+            f.write(history_record(now - (many - i) * 1000, 20, direct, f"hist2 line {i}", "dee", "hist2")[0])
+    rooms = ("lobby", "hist", "hist2")
+    config = bouncer(replay_max=500)
+    check(run.wait_status(upstream, lambda h: "hist2" in h["rooms_joined"], 30) is not None, "the bouncer is in hist2")
+    client("A9")
+    since = time.time()
+    command(run, "A9", op="join", room="hist2")
+    command(run, "A9", op="join", room="hist")
+    for room in ("hist2", "hist"):
+        check(replayed(run, "A9", room, since, 60) is not None, f"A9: a replay ends in {room}")
+    got = [e for e in run.events("A9") if e["event"] == "env" and e["at"] >= since and e["room"] in ("hist", "hist2")]
+    spans = {}
+    for room in ("hist2", "hist"):
+        start = next(i for i, e in enumerate(got) if e["room"] == room and str(e["body"]).startswith("--- replay: "))
+        end = next(i for i, e in enumerate(got) if i > start and e["room"] == room and e["body"] == END_OF_REPLAY)
+        joined = next(i for i, e in enumerate(got) if e["room"] == room and e["t"] == 11)
+        check(joined < start, f"A9: JOINED {room} comes before its replay")
+        check(all(e["room"] == room for e in got[start:end + 1]),
+              f"A9: the {room} replay ({end - start - 1} messages) is not interleaved with the other room's")
+        spans[room] = (start, end)
+    # hist: what was said, and the two-hour-old NOTICE, inside replay_hours = 24.
+    check(spans["hist2"][1] - spans["hist2"][0] - 1 == many
+          and spans["hist"][1] - spans["hist"][0] - 1 == len(said) + 1,
+          f"A9: all {many} of hist2, then all {len(said) + 1} of hist")
+
+    print("history: PART during a replay, then JOIN again", flush=True)
+    command(run, "A9", op="part", room="hist2")
+    check(wait_env(run, "A9", 20, t=13, room="hist2") is not None, "A9 parts hist2")
+    since = time.time()
+    command(run, "A9", op="join", room="hist2")
+    opening = run.wait_event("A9", lambda e: e["event"] == "env" and e["at"] >= since and e["room"] == "hist2"
+                             and str(e["body"]).startswith("--- replay: "), 30)
+    check(opening is not None, "A9 joins hist2 again and its replay starts")
+    time.sleep(1)
+    parted_at = time.time()
+    command(run, "A9", op="part", room="hist2")
+    parted = run.wait_event("A9", lambda e: e["event"] == "env" and e["at"] >= parted_at and e["t"] == 13
+                            and e["room"] == "hist2", 20)
+    check(parted is not None, "A9 parts hist2 mid-replay: PARTED")
+    found["parted_after"] = parted["at"] - parted_at
+    check(parted["at"] - parted_at < 3, f"PARTED comes {parted['at'] - parted_at:.1f} s after the PART")
+    time.sleep(3)
+    sent = [e for e in envs(run, "A9", room="hist2") if e["at"] >= since and e["t"] == 20]
+    after = [e for e in envs(run, "A9", room="hist2") if e["at"] > parted["at"]]
+    check(not after and 0 < len(sent) < many,
+          f"the replay stopped at the PART ({len(sent)} of {many} sent), nothing of hist2 after PARTED")
+    since = time.time()
+    command(run, "A9", op="join", room="hist2")
+    got = replayed(run, "A9", "hist2", since, 60)
+    check(got is not None and len(got[1]) == many and got[0]["body"].startswith(f"--- replay: {many} messages"),
+          f"a JOIN again: a fresh replay, all {many}")
+    errors = [e for e in run.events("A9") if e["event"] == "error"]
+    check(not errors, "A9 raised nothing")
+    run.stop("A9")
+    check(run.stop("BR") == 0, "the bouncer stops cleanly")
+
+    print("history: max_mb = 1 across rooms", flush=True)
+    # 1500 records of about 1.1 kB in three rooms, their times shuffled
+    # across the rooms and out of order in each; all older than hist's.
+    now = int(time.time() * 1000)
+    total = 1500
+    written = {}
+    files = {room: open(history_file(run, upstream, room), "wb") for room in ("p1", "p2", "p3")}
+    for i in range(total):
+        ts = now - 3600 * 1000 - ((i * 7919) % total) * 1000
+        room = f"p{i % 3 + 1}"
+        record, ident = history_record(ts, 20, direct, f"{i} " + "x" * 1000, "dee", room)
+        files[room].write(record)
+        written[ident] = ts
+    for f in files.values():
+        f.close()
+    config = bouncer(max_mb=1)
+    hub_dir = os.path.dirname(history_file(run, upstream, "hist"))
+    kept, size = {}, 0
+    for name in os.listdir(hub_dir):
+        if name.endswith(".log"):
+            path_ = os.path.join(hub_dir, name)
+            size += os.path.getsize(path_)
+            records, whole = read_history(path_)
+            check(whole, f"{name} reads to its end")
+            kept[name[:-4]] = records
+    found["pruned_sizes"] = {room: len(r) for room, r in kept.items()}
+    check(size <= 1_000_000, f"the hub's history is {size} bytes, at most max_mb = 1")
+    check(len(kept.get("hist2", [])) == many and len(kept.get("hist", [])) >= len(said),
+          "the newest rooms are kept whole")
+    left = {r["env"][2].hex() for room in ("p1", "p2", "p3") for r in kept.get(room, [])}
+    gone = [ts for ident, ts in written.items() if ident not in left]
+    stay = [ts for ident, ts in written.items() if ident in left]
+    check(gone and stay and max(gone) < min(stay),
+          f"the {len(gone)} oldest records went, whichever room they were in; {len(stay)} newer stay")
+    check(all(kept.get(room) for room in ("p1", "p2", "p3")), "each of the three rooms keeps some")
+    check(size > 1_000_000 - 3 * 1200, "no more went than had to")
+
+    print("history: a second bouncer on the same state_dir", flush=True)
+    out = run.bouncer("--config", config, "run")
+    found["second_bouncer"] = out.stderr
+    check(out.returncode == 1 and "another rrc-bouncer is running" in out.stderr,
+          f"it refuses to start: {out.stderr.strip().splitlines()[-1]}")
+    check(run.procs["BR"].poll() is None, "the first one runs on")
+    out = run.bouncer("--config", config, "status")
+    check(out.returncode == 0 and "connected" in out.stdout, "status works beside it")
+    check(run.stop("BR") == 0, "the bouncer stops cleanly")
+
 
 def history_only(run, args, ports, found):
     port_r = free_port(ports)
