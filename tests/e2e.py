@@ -164,7 +164,8 @@ class Run:
     def events(self, name):
         try:
             with open(self.path(f"{name}.events")) as f:
-                return [json.loads(line) for line in f if line.strip()]
+                # A client may be part way through a line: read whole lines only.
+                return [json.loads(line) for line in f if line.endswith("\n") and line.strip()]
         except FileNotFoundError:
             return []
 
