@@ -316,9 +316,17 @@ send out; unit-tested), and `run`, the task per hub that owns the link and feeds
   writes its status, within the bouncer's 10 s per session (`SESSION_STOP`, longer by a
   compile-time check); Reticulum is stopped only after that, so no link outlives the transport.
   Then every hub's history thread is stopped at once, each given 5 s to write and sync what it
-  was given (a full queue is not waited on past that), Reticulum is given 5 s to stop, and tasks
-  still running get 2 s (`Runtime::shutdown_timeout`): the process exits within about 22 s of the
-  signal whatever does not stop.
+  was given (a full queue is not waited on past that), the last `status.json` gets 2 s
+  (`STATUS_STOP`), Reticulum is given 5 s to stop, and tasks still running get 2 s
+  (`Runtime::shutdown_timeout`): the process exits within about 24 s of the signal whatever does
+  not stop.
+- **Signals and slow disks.** The kernel gives a signal sent to the process to its main thread
+  first, and a thread in a blocking call such as an `fsync` on a busy disk takes it only when the
+  call returns; until then the signal is not handled at all. So `run` runs on the runtime's
+  workers and the main thread only waits for it, and `status.json` is written by a task of its
+  own, one write at a time and only the latest status (`spawn_blocking`), never by the run loop.
+  A disk that holds an `fsync` for seconds does not delay the signal, and the shutdown waits on
+  `status.json` for at most 2 s.
 - **One bouncer per `state_dir`.** `run` takes an exclusive `flock` on `state_dir/lock` (mode
   0600, created if missing, never removed) before it starts the history or Reticulum, and holds it
   until it exits; the kernel lets it go when the process ends, however it ends. A second `run` on

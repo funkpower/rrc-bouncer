@@ -36,6 +36,8 @@ const UPLINK_REFRESH_ENV: &str = "RRC_BOUNCER_UPLINK_REFRESH_SECS";
 const HISTORY_STOP: Duration = Duration::from_secs(5);
 /// How long Reticulum gets to stop at shutdown.
 const RETICULUM_STOP: Duration = Duration::from_secs(5);
+/// How long the last write of status.json gets at shutdown.
+const STATUS_STOP: Duration = Duration::from_secs(2);
 /// The file in `state_dir` a running bouncer holds locked.
 pub const LOCK_FILE: &str = "lock";
 /// How long the upstream sessions get to close their links at shutdown:
@@ -250,15 +252,53 @@ async fn uplink_path_responses(
     *online = now_online;
 }
 
-fn write_status(settings: &Settings, status: &Status) {
-    let path = settings.status_path();
-    match serde_json::to_vec_pretty(status) {
-        Ok(data) => {
-            if let Err(e) = write_atomic(&path, &data) {
-                tracing::warn!("{}: {e}", path.display());
+/// Writes status.json off the bouncer's task, one write at a time and only
+/// the latest status: a slow disk (an fsync can take seconds) never holds
+/// up the run loop, or the signal that stops it.
+struct StatusWriter {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl StatusWriter {
+    fn start(path: std::path::PathBuf) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let task = tokio::spawn(async move {
+            while let Some(mut data) = rx.recv().await {
+                while let Ok(newer) = rx.try_recv() {
+                    data = newer;
+                }
+                let path = path.clone();
+                let written = tokio::task::spawn_blocking(move || {
+                    write_atomic(&path, &data).map_err(|e| format!("{}: {e}", path.display()))
+                })
+                .await;
+                match written {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("{e}"),
+                    Err(e) => tracing::warn!("status: {e}"),
+                }
             }
+        });
+        Self { tx, task }
+    }
+
+    fn write(&self, status: &Status) {
+        match serde_json::to_vec_pretty(status) {
+            Ok(data) => {
+                let _ = self.tx.send(data);
+            }
+            Err(e) => tracing::warn!("status: {e}"),
         }
-        Err(e) => tracing::warn!("status: {e}"),
+    }
+
+    /// Write `status` last and wait for it, at most `within`: false if the
+    /// write did not end in time.
+    async fn stop(self, status: &Status, within: Duration) -> bool {
+        self.write(status);
+        let Self { tx, task } = self;
+        drop(tx);
+        tokio::time::timeout(within, task).await.is_ok()
     }
 }
 
@@ -407,7 +447,8 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         tracing::info!("not announcing the local hubs (announce = false); they answer path requests");
     }
 
-    write_status(&settings, &status);
+    let status_writer = StatusWriter::start(settings.status_path());
+    status_writer.write(&status);
     let mut ticker = tokio::time::interval(STATUS_INTERVAL);
     ticker.tick().await;
     let mut uplink_check = tokio::time::interval(UPLINK_CHECK);
@@ -421,11 +462,11 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             _ = signals.recv() => break,
             _ = ticker.tick() => {
                 show_sessions(&mut status, &session_status);
-                write_status(&settings, &status);
+                status_writer.write(&status);
             }
             _ = changed.notified() => {
                 show_sessions(&mut status, &session_status);
-                write_status(&settings, &status);
+                status_writer.write(&status);
             }
             // A local hub took its upstream hub's name: tell the network
             // now rather than at the next announce or refresh.
@@ -470,7 +511,9 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         }
     }
     show_sessions(&mut status, &session_status);
-    write_status(&settings, &status);
+    if !status_writer.stop(&status, STATUS_STOP).await {
+        tracing::warn!("status.json was not written in {}s", STATUS_STOP.as_secs());
+    }
     if tokio::time::timeout(RETICULUM_STOP, runtime.shutdown_and_wait())
         .await
         .is_err()
@@ -529,6 +572,28 @@ mod tests {
         assert!(dir.path().join(LOCK_FILE).exists());
         drop(first);
         lock_state_dir(dir.path()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_status_writer_writes_the_last_status_at_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let status = |pid| Status {
+            pid,
+            started_at: 0.0,
+            updated_at: 0.0,
+            identity_hash: String::new(),
+            announce: false,
+            hubs: Vec::new(),
+        };
+        let writer = StatusWriter::start(path.clone());
+        for pid in 1..=50 {
+            writer.write(&status(pid));
+        }
+        assert!(writer.stop(&status(99), STATUS_STOP).await);
+        let written: Status = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written.pid, 99);
+        assert!(!path.with_extension("tmp").exists());
     }
 
     #[test]

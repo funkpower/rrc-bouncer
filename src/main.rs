@@ -246,7 +246,16 @@ fn main() -> ExitCode {
             setup_logging(&settings.log_level);
             match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
                 Ok(runtime) => {
-                    let result = runtime.block_on(bouncer::run(settings));
+                    // The bouncer runs on the runtime's workers and the main
+                    // thread only waits for it. The kernel gives a signal sent
+                    // to the process to its main thread first, and a thread in
+                    // a blocking call (an fsync on a busy disk) does not take
+                    // it until the call returns: so the main thread does none.
+                    let result = runtime.block_on(async {
+                        tokio::spawn(bouncer::run(settings))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("the bouncer's task failed: {e}")))
+                    });
                     // A task that does not stop does not hold the exit up.
                     runtime.shutdown_timeout(RUNTIME_STOP);
                     result
