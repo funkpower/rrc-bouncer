@@ -783,14 +783,14 @@ pub struct UpstreamStatus {
     pub dropped_events: u64,
     /// Resources from the hub received whole and matching their
     /// RESOURCE_ENVELOPE.
-    pub resources_in: u64,
+    pub hub_resources_in: u64,
     /// Client Resources the hub received whole.
-    pub resources_out: u64,
+    pub hub_resources_out: u64,
     /// Resources from the hub dropped: refused (too large, split, a
     /// request, too many at once), unannounced, a size or sha256 other
     /// than announced, failed or timed out; and RESOURCE_ENVELOPEs whose
     /// Resource never came or that were malformed.
-    pub resource_drops: u64,
+    pub hub_resource_drops: u64,
 }
 
 pub type SharedStatus = Arc<Mutex<UpstreamStatus>>;
@@ -959,7 +959,7 @@ impl Upstream {
     /// A Resource from the hub that will not reach the relay.
     fn drop_resource(&self, reason: &str) {
         tracing::warn!("upstream {}: dropped a resource: {reason}", self.tag());
-        self.tally(|s| s.resource_drops += 1);
+        self.tally(|s| s.hub_resource_drops += 1);
     }
 
     fn count_unhandled(&self, t: MessageType) {
@@ -1217,7 +1217,7 @@ impl Upstream {
                         Ok(data) => match expected.take(&data) {
                             Matched::Verified(e) => {
                                 tracing::debug!("upstream {tag}: received a {} resource of {} bytes room={:?}", e.body.kind, data.len(), e.envelope.room);
-                                self.tally(|s| s.resources_in += 1);
+                                self.tally(|s| s.hub_resources_in += 1);
                                 self.emit(UpstreamEvent::Resource { envelope: e.envelope, data: Arc::new(data) });
                             }
                             Matched::Mismatch(e) => self.drop_resource(&format!("a resource of {} bytes does not match the sha256 its envelope (room {:?}) gave", data.len(), e.envelope.room)),
@@ -1231,7 +1231,7 @@ impl Upstream {
                     match result {
                         Ok(()) => {
                             tracing::debug!("upstream {tag}: sent a resource room={:?}", env.room);
-                            self.tally(|s| s.resources_out += 1);
+                            self.tally(|s| s.hub_resources_out += 1);
                         }
                         Err(e) => {
                             tracing::warn!("upstream {tag}: a client resource was not sent: {e}");

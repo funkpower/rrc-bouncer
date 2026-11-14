@@ -24,10 +24,15 @@ host's own rnsd or any other network. Run through tests/e2e.sh.
   D3, E  RRC clients of H under identities of their own, in room hist
   A3-A8  RRC clients of the local hub holding the user's identity, each
          joining hist to see what is replayed
+  RA, RA2  RRC clients of the local hub holding the user's identity, with
+           the resource_envelope cap
+  RN  an RRC client of the local hub holding the user's identity, without it
+  RD  an RRC client of H under an identity of its own, in room res
 """
 
 import argparse
 import calendar
+import hashlib
 import io
 import json
 import os
@@ -44,6 +49,7 @@ import RNS
 HERE = os.path.dirname(os.path.abspath(__file__))
 PEER = os.path.join(HERE, "rrc_peer.py")
 RNSD_LINGER = os.path.join(HERE, "rnsd_linger.py")
+RRCD_SHIM = os.path.join(HERE, "rrcd_shim.py")
 UPSTREAM = "082f8e4293d19281108a5d4faa52dcbe"
 # The bouncer's first announce comes 5 s after start; wait past it.
 QUIET = 10
@@ -60,6 +66,9 @@ RRCD_TIMEOUT = 4
 BOUNCER_PING = 2
 BOUNCER_BACKOFF = 1
 HUB_NAME = "e2e hub"
+# status.json is written at every change of state and, for the counters,
+# once a minute.
+STATUS_TICK = 65
 
 
 class Failure(Exception):
@@ -220,8 +229,10 @@ class Run:
                 f.write(f'nick = "{nick}"\n')
         return path
 
-    def rrcd(self, binary, port, max_rooms=2):
-        """Start rrcd H on rnsd R; every file it uses is under the work directory."""
+    def rrcd(self, binary, port, max_rooms=2, greeting="e2e", shim=False):
+        """Start rrcd H on rnsd R; every file it uses is under the work
+        directory. With shim, rrcd forwards a client's long NOTICE (see
+        rrcd_shim.py)."""
         rns = rns_config(self.path("rns", "H"), port)
         os.makedirs(self.path("rrcd"), exist_ok=True)
         registry = self.path("rrcd", "rooms.toml")
@@ -232,11 +243,12 @@ class Run:
         with open(config, "w") as f:
             f.write(f'[hub]\nconfigdir = "{rns}"\nidentity_path = "{self.identity("rrcd-hub")}"\n'
                     f'room_registry_path = "{registry}"\nannounce_on_start = true\n'
-                    f'hub_name = "{HUB_NAME}"\ngreeting = "e2e"\ninclude_joined_member_list = true\n'
+                    f'hub_name = "{HUB_NAME}"\ngreeting = {json.dumps(greeting)}\ninclude_joined_member_list = true\n'
                     f"max_rooms_per_session = {max_rooms}\nrate_limit_msgs_per_minute = 120\n"
                     f"ping_interval_s = {RRCD_PING}\nping_timeout_s = {RRCD_TIMEOUT}\n\n"
                     f'[logging]\nlevel = "DEBUG"\nconsole = true\nfile = ""\n')
-        self.start("H", [binary, "--config", config, "--identity", self.identity("rrcd-hub"),
+        argv = [self.python, RRCD_SHIM] if shim else [binary]
+        self.start("H", [*argv, "--config", config, "--identity", self.identity("rrcd-hub"),
                          "--room-registry", registry, "--configdir", rns, "--log-level", "DEBUG"])
         if not self.wait_log("H", "Hub running at", 120):
             raise Failure("rrcd did not start")
@@ -389,10 +401,10 @@ def rrcd_phases(run, args, ports, found):
     run.stop("R")
 
 
-def driven(run, name, port, identity, hub, nick, hello_delay=0.5):
+def driven(run, name, port, identity, hub, nick, hello_delay=0.5, resource_cap=False):
     """An RRC client the test drives with `command`."""
     run.peer(name, port, identity, "--driven", hub, "--commands", run.path(f"{name}.commands"),
-             "--nick", nick, "--hello-delay", str(hello_delay))
+             "--nick", nick, "--hello-delay", str(hello_delay), *(["--resource-cap"] if resource_cap else []))
 
 
 def command(run, name, **cmd):
@@ -433,8 +445,8 @@ def relay_phases(run, args, port_r, upstream, user, local, config, env, found):
     check(welcomes["A"]["src"] == hub_id and welcomes["B"]["src"] == hub_id,
           "the WELCOME's K_SRC is the local hub's identity")
     check(a["0"] == f"{HUB_NAME} (via rrc-bouncer)", f"the WELCOME names the hub \"{a['0']}\"")
-    check(a["2"] == dict(d.get("2", {}), **{"0": False}) and a["3"] == d["3"] and a["3"]["3"] == 4,
-          f"it carries rrcd's caps (resource_envelope off) and limits: {a['2']} {a['3']}")
+    check(a["2"] == d["2"] and d["2"].get("0") is True and a["3"] == d["3"] and a["3"]["3"] == 4,
+          f"it carries rrcd's caps (resource_envelope on) and limits: {a['2']} {a['3']}")
     for name in ("A", "B"):
         greeting = wait_env(run, name, 10, t=21, body="e2e")
         check(greeting is not None and greeting["src"] == hub_id and greeting["room"] is None,
@@ -598,6 +610,7 @@ def relay_phases(run, args, port_r, upstream, user, local, config, env, found):
     check(run.stop("BR") == 0, "the bouncer stops cleanly")
     part_upstream_phases(run, args, port_r, upstream, user, local, env, found, hub_id)
     history_phases(run, args, port_r, upstream, user, local, env, found)
+    resource_phases(run, args, port_r, upstream, user, local, env, found)
 
 
 def part_upstream_phases(run, args, port_r, upstream, user, local, env, found, hub_id):
@@ -1024,7 +1037,200 @@ def history_phases(run, args, port_r, upstream, user, local, env, found):
     check(run.stop("BR") == 0, "the bouncer stops cleanly")
 
 
-def history_only(run, args, ports, found):
+# rrcd sends a greeting longer than 512 bytes as a Resource.
+GREETING = "\n".join(f"{i:02d} The e2e hub's greeting is too long for one packet: ünïcödé ✓ ü ✓."
+                     for i in range(1, 25))
+# A NOTICE too long for one packet, from either side.
+LONG = "\n".join(f"line {i:02d} of a long notice to res, sent as a Resource — ✓ ü" for i in range(1, 31))
+
+
+def resources(run, name, since=0):
+    return [e for e in run.events(name) if e["event"] == "resource" and e["at"] >= since]
+
+
+def resource_phases(run, args, port_r, upstream, user, local, env, found):
+    print("resource: rrcd H greets with a text too long for one packet", flush=True)
+    run.stop("H")
+    run.rrcd(args.rrcd, port_r, max_rooms=16, greeting=GREETING, shim=True)
+    direct = RNS.Identity.from_file(run.identity("direct")).hash.hex()
+    reticulum = f'tcp = "127.0.0.1:{port_r}"'
+    config = run.config("resource", reticulum, upstream=upstream, nick="bnc", rooms=("lobby", "res"))
+    greeting = GREETING.encode()
+    greeting_sha = hashlib.sha256(greeting).hexdigest()
+    run.start("BR", [args.bouncer, "--config", config, "run"], env=env)
+    hub = run.wait_status(upstream, lambda h: h["state"] == "connected" and "res" in h["rooms_joined"]
+                          and h["hub_resources_in"] >= 1, 60)
+    found["resource_status_greeting"] = hub
+    check(hub["state"] == "connected" and "res" in hub["rooms_joined"], "the bouncer is in res")
+    check(f"kind=motd size={len(greeting)}" in run.log("H"), f"rrcd sent its {len(greeting)}-byte greeting as a Resource")
+    check(hub["hub_resources_in"] == 1 and hub["hub_resource_drops"] == 0,
+          "status.json: the bouncer took it whole (hub_resources_in 1, no drops)")
+
+    def client(name, cap):
+        driven(run, name, port_r, "user", local, name.lower(), resource_cap=cap)
+        check(wait_env(run, name, 40, t=2) is not None, f"{name} ({'with' if cap else 'without'} the cap) links to the local hub")
+        return next(e["hub_identity"] for e in run.events(name) if e["event"] == "link")
+
+    def got_greeting(name, hub_id, copies):
+        """The greeting `copies` times as a Resource, after its RESOURCE_ENVELOPE."""
+        run.wait_event(name, lambda e: len([r for r in resources(run, name) if r["sha256"] == greeting_sha]) >= copies, 30)
+        announced = envs(run, name, t=50)
+        got = resources(run, name)
+        found[f"resource_{name}"] = {"envelopes": announced, "resources": [dict(r, text=r["text"][:80]) for r in got]}
+        check(len(announced) == copies and all(e["src"] == hub_id and e["room"] is None and e["body"]["1"] == "motd"
+                                               and e["body"]["2"] == len(greeting) and e["body"]["3"] == greeting_sha
+                                               for e in announced),
+              f"{name}: {copies} RESOURCE_ENVELOPE(s) from the local hub: motd, room-less, size and sha256 of the greeting")
+        check(len(got) == copies and all(r["complete"] and r["text"] == GREETING and r["sha256"] == greeting_sha
+                                         for r in got),
+              f"{name}: and {copies} Resource(s), byte for byte the greeting")
+        check(all(e["at"] <= r["at"] for e, r in zip(announced, got)), f"{name}: each envelope came before its Resource")
+
+    def got_notices(name, hub_id, copies):
+        lines = GREETING.splitlines()
+        run.wait_event(name, lambda e: len(envs(run, name, t=21, room=None)) >= len(lines) * copies, 30)
+        notices = [e["body"] for e in envs(run, name, t=21, room=None) if e["src"] == hub_id]
+        found[f"resource_{name}_notices"] = len(notices)
+        # In any order: Python RNS hands each packet to a thread of its own
+        # (RNS/Link.py:1044).
+        check(sorted(notices) == sorted(lines * copies),
+              f"{name}: the greeting {copies} time(s) as {len(lines)} NOTICEs, one per line, from the local hub")
+        check(not envs(run, name, t=50) and not resources(run, name), f"{name}: no RESOURCE_ENVELOPE, no Resource")
+
+    hub_id = client("RA", True)
+    client("RN", False)
+    print("resource: the greeting from the bouncer's cache", flush=True)
+    got_greeting("RA", hub_id, 1)
+    got_notices("RN", hub_id, 1)
+
+    print("resource: rrcd H restarts; the greeting reaches linked clients as it comes", flush=True)
+    before = run.status(upstream)
+    run.stop("H")
+    run.rrcd(args.rrcd, port_r, max_rooms=16, greeting=GREETING, shim=True)
+    hub = run.wait_status(upstream, lambda h: h["connects"] > before["connects"] and h["state"] == "connected"
+                          and h["hub_resources_in"] > before["hub_resources_in"], 90)
+    check(hub["connects"] > before["connects"] and hub["hub_resources_in"] == before["hub_resources_in"] + 1,
+          "the bouncer connected again and took the greeting")
+    got_greeting("RA", hub_id, 2)
+    got_notices("RN", hub_id, 2)
+    hub = run.wait_status(upstream, lambda h: h["client_resources_out"] >= 2 and h["client_resources_split"] >= 2,
+                          STATUS_TICK)
+    check(hub["client_resources_out"] == 2 and hub["client_resources_split"] == 2,
+          f"status.json: client_resources_out {hub['client_resources_out']}, "
+          f"client_resources_split {hub['client_resources_split']}")
+
+    print("resource: a long notice from a client of the bouncer to res", flush=True)
+    driven(run, "RD", port_r, "direct", upstream, "dee", resource_cap=True)
+    check(wait_env(run, "RD", 40, t=2) is not None, "RD links to rrcd H")
+    for name in ("RA", "RN", "RD"):
+        command(run, name, op="join", room="res")
+        check(wait_env(run, name, 40, t=11, room="res") is not None, f"{name} joins res")
+    long = LONG.encode()
+    long_sha = hashlib.sha256(long).hexdigest()
+    before = run.status(upstream)
+    since = time.time()
+    command(run, "RA", op="resource", room="res", text=LONG)
+    sent = run.wait_event("RA", lambda e: e["event"] == "resource_sent" and e["at"] >= since, 40)
+    check(sent is not None and sent["complete"], "RA's Resource reached the bouncer whole")
+    got = run.wait_event("RD", lambda e: e["event"] == "resource" and e["at"] >= since and e["sha256"] == long_sha, 40)
+    announced = [e for e in envs(run, "RD", t=50, room="res") if e["at"] >= since]
+    found["resource_RD_from_RA"] = announced
+    check(got is not None and got["text"] == LONG, f"RD, on rrcd H, gets the {len(long)}-byte notice as a Resource, "
+          "byte for byte")
+    check(announced and announced[-1]["src"] == user and announced[-1]["body"]["1"] == "notice"
+          and announced[-1]["body"]["3"] == long_sha, "its RESOURCE_ENVELOPE is the user's, in res, kind notice")
+    check("Received large NOTICE via resource" in run.log("H"), "rrcd took it as a NOTICE to res")
+    lines = LONG.splitlines()
+    run.wait_event("RN", lambda e: len([n for n in envs(run, "RN", t=21, room="res") if n["at"] >= since])
+                   >= len(lines), 20)
+    notices = [e for e in envs(run, "RN", t=21, room="res") if e["at"] >= since]
+    check(sorted(e["body"] for e in notices) == sorted(lines) and all(e["src"] == user for e in notices),
+          f"RN, the user's other client, gets it as {len(lines)} NOTICEs from the user")
+    check(not [e for e in resources(run, "RA", since) if e["sha256"] == long_sha], "RA, which sent it, gets no copy")
+    hub = run.wait_status(upstream, lambda h: h["hub_resources_out"] > before["hub_resources_out"]
+                          and h["client_resources_in"] > before["client_resources_in"], STATUS_TICK)
+    check(hub["client_resources_in"] == before["client_resources_in"] + 1
+          and hub["hub_resources_out"] == before["hub_resources_out"] + 1,
+          "status.json: client_resources_in and hub_resources_out each one more")
+
+    print("resource: a long notice from a client of rrcd H to res", flush=True)
+    driven(run, "RA2", port_r, "user", local, "ra2", resource_cap=True)
+    check(wait_env(run, "RA2", 40, t=2) is not None, "RA2 (with the cap) links to the local hub")
+    got_greeting("RA2", hub_id, 1)
+    command(run, "RA2", op="join", room="res")
+    check(wait_env(run, "RA2", 40, t=11, room="res") is not None, "RA2 joins res")
+    text = LONG.replace("long notice to res", "long notice from RD")
+    data_sha = hashlib.sha256(text.encode()).hexdigest()
+    before = run.status(upstream)
+    since = time.time()
+    command(run, "RD", op="resource", room="res", text=text)
+    for name in ("RA", "RA2"):
+        got = run.wait_event(name, lambda e: e["event"] == "resource" and e["sha256"] == data_sha, 40)
+        announced = [e for e in envs(run, name, t=50, room="res") if e["at"] >= since]
+        check(got is not None and got["text"] == text and announced and announced[-1]["src"] == direct
+              and announced[-1]["body"]["3"] == data_sha,
+              f"{name} gets it as RESOURCE_ENVELOPE (from RD's identity, in res) + Resource, byte for byte")
+    lines = text.splitlines()
+    run.wait_event("RN", lambda e: len([n for n in envs(run, "RN", t=21, room="res") if n["at"] >= since])
+                   >= len(lines), 20)
+    notices = [e for e in envs(run, "RN", t=21, room="res") if e["at"] >= since]
+    check(sorted(e["body"] for e in notices) == sorted(lines) and all(e["src"] == direct for e in notices),
+          f"RN gets it as {len(lines)} NOTICEs from RD's identity")
+    hub = run.wait_status(upstream, lambda h: h["hub_resources_in"] > before["hub_resources_in"], STATUS_TICK)
+    check(hub["hub_resources_in"] == before["hub_resources_in"] + 1, "status.json: hub_resources_in one more")
+    path = history_file(run, upstream, "res")
+    end = time.time() + 10
+    while time.time() < end and not (os.path.exists(path) and
+                                     sum(r["env"].get(6) == lines[-1] for r in read_history(path)[0])):
+        time.sleep(0.3)
+    records = [r["env"] for r in read_history(path)[0]] if os.path.exists(path) else []
+    check([e.get(6) for e in records if e.get(1) == 21 and e.get(4) == bytes.fromhex(direct)] == lines,
+          "history keeps it in res as the same NOTICEs")
+    mine = [e.get(6) for e in records if e.get(1) == 21 and e.get(4) == bytes.fromhex(user)]
+    check(mine == LONG.splitlines(), "and RA's long notice too")
+
+    print("resource: Resources from a client that do not hold up", flush=True)
+    before = run.status(upstream)
+    since = time.time()
+    big = "x" * (256 * 1024 + 1)
+    command(run, "RA", op="resource", room="res", text=big)
+    error = run.wait_event("RA", lambda e: e["event"] == "env" and e["t"] == 40 and e["at"] >= since, 20)
+    found["resource_too_large"] = error
+    check(error is not None and error["src"] == hub_id, f"a RESOURCE_ENVELOPE past 256 KiB gets ERROR \"{error and error['body']}\"")
+    sent = run.wait_event("RA", lambda e: e["event"] == "resource_sent" and e["at"] >= since, 60)
+    check(sent is not None and not sent["complete"], "and its Resource is refused")
+    since = time.time()
+    bad = "a notice whose envelope lies about its sha256 " * 20
+    command(run, "RA", op="resource", room="res", text=bad, sha256="00" * 32)
+    sent = run.wait_event("RA", lambda e: e["event"] == "resource_sent" and e["at"] >= since, 40)
+    found["resource_bad_hash_sent"] = sent
+    hub = run.wait_status(upstream, lambda h: h["client_resource_drops"] >= before["client_resource_drops"] + 3,
+                          STATUS_TICK)
+    found["resource_status_drops"] = hub
+    check(hub["client_resource_drops"] >= before["client_resource_drops"] + 3,
+          f"status.json: client_resource_drops {before['client_resource_drops']} -> {hub['client_resource_drops']} "
+          "(the large envelope, its Resource, the bad sha256)")
+    check(hub["client_resources_in"] == before["client_resources_in"] and hub["hub_resources_out"] == before["hub_resources_out"],
+          "neither went to the hub")
+    time.sleep(2)
+    check(not [e for e in run.events("RD") if e["at"] >= since and e["event"] in ("resource", "env")
+               and e.get("t") in (21, 50)], "RD saw nothing of them")
+    ident = os.urandom(8).hex()
+    command(run, "RA", op="send", id=ident, t=20, room="res", body="still here after the bad Resources")
+    check(wait_env(run, "RD", 20, t=20, room="res", body="still here after the bad Resources") is not None,
+          "the relay works on: RA's next message reaches RD")
+    out = run.bouncer("--config", config, "status")
+    found["resource_status_out"] = out.stdout
+    print("  " + "\n  ".join(l for l in out.stdout.splitlines() if "resources" in l), flush=True)
+    check("hub resources    " in out.stdout and "client resources " in out.stdout, "status prints both Resource lines")
+    check(not [e for name in ("RA", "RA2", "RN", "RD") for e in run.events(name) if e["event"] == "error"],
+          "the driven clients raised nothing")
+    for name in ("RA", "RA2", "RN", "RD"):
+        run.stop(name)
+    check(run.stop("BR") == 0, "the bouncer stops cleanly")
+
+
+def only(run, args, ports, found, phases):
     port_r = free_port(ports)
     run.rnsd("R", port_r)
     upstream = RNS.Destination.hash(RNS.Identity.from_file(run.identity("rrcd-hub")), "rrc", "hub").hex()
@@ -1033,7 +1239,7 @@ def history_only(run, args, ports, found):
     local = {k.strip(): v for k, v in (line.rsplit(None, 1) for line in
                                        run.bouncer("--config", config, "hashes").stdout.splitlines())}["local hub"]
     env = {"RRC_BOUNCER_PING_SECS": str(BOUNCER_PING), "RRC_BOUNCER_BACKOFF_SECS": str(BOUNCER_BACKOFF)}
-    history_phases(run, args, port_r, upstream, user, local, env, found)
+    phases(run, args, port_r, upstream, user, local, env, found)
     run.stop("H")
     run.stop("R")
 
@@ -1045,7 +1251,7 @@ def main():
     parser.add_argument("--rnsd", required=True)
     parser.add_argument("--rrcd", required=True)
     parser.add_argument("--bouncer", required=True)
-    parser.add_argument("--only", choices=["rrcd", "history"])
+    parser.add_argument("--only", choices=["rrcd", "history", "resource"])
     args = parser.parse_args()
     shutil.rmtree(args.work, ignore_errors=True)
     os.makedirs(args.work)
@@ -1060,8 +1266,9 @@ def main():
         if args.only == "rrcd":
             rrcd_phases(run, args, {port_t, port_s, port_d, port_l}, found)
             raise Done()
-        if args.only == "history":
-            history_only(run, args, {port_t, port_s, port_d, port_l}, found)
+        if args.only in ("history", "resource"):
+            only(run, args, {port_t, port_s, port_d, port_l}, found,
+                 history_phases if args.only == "history" else resource_phases)
             raise Done()
         tcp = f'tcp = "127.0.0.1:{port_t}"'
         config = run.config("tcp", tcp)

@@ -232,17 +232,17 @@ pub struct RelayStatus {
     pub relay_drops: u64,
     /// Client Resources received whole and matching their
     /// RESOURCE_ENVELOPE.
-    pub resources_in: u64,
+    pub client_resources_in: u64,
     /// Resources a client received whole, one per client.
-    pub resources_out: u64,
+    pub client_resources_out: u64,
     /// Resources sent as NOTICEs to a client without the
     /// `resource_envelope` cap, one per client.
-    pub resources_split: u64,
+    pub client_resources_split: u64,
     /// Resources dropped: from clients (refused, unannounced, a size or
     /// sha256 other than announced, not a room notice, failed, timed out,
     /// announced and never sent), and to clients (not taken in time, too
     /// many waiting); and the hub's `blob` Resources.
-    pub resource_drops: u64,
+    pub client_resource_drops: u64,
 }
 
 pub type SharedRelayStatus = Arc<Mutex<RelayStatus>>;
@@ -549,9 +549,9 @@ impl Relay {
 
     /// The WELCOME a client gets: the upstream hub's name, version, caps
     /// and limits; before the first upstream WELCOME, the local hub's name,
-    /// rrcd's defaults, and every cap but ACTION and direct NOTICE off
-    /// save `resource_envelope` (the bouncer takes Resources whether or not
-    /// the hub does, and refuses them while the hub does not).
+    /// rrcd's default limits and every cap on (the bouncer takes Resources
+    /// whether or not the hub does, and refuses them while the hub does
+    /// not).
     fn welcome_envelope(&self) -> Envelope {
         let (name, ver, caps, limits) = match &self.welcome {
             Some(w) => (
@@ -665,7 +665,7 @@ impl Relay {
                         out.push(Output::Resource(*link, envelope.clone(), data.clone()));
                     } else {
                         let chunks = chunks.get_or_insert_with(|| resource::split(&self.outward(notice)));
-                        self.tally(|s| s.resources_split += 1);
+                        self.tally(|s| s.client_resources_split += 1);
                         for chunk in chunks.iter() {
                             out.push(Output::Client(*link, chunk.clone()));
                         }
@@ -713,7 +713,7 @@ impl Relay {
         if let Some(client) = self.clients.remove(&link) {
             let waiting = client.expected.len() as u64;
             if waiting > 0 {
-                self.tally(|s| s.resource_drops += waiting);
+                self.tally(|s| s.client_resource_drops += waiting);
             }
             self.show_clients();
         }
@@ -1166,7 +1166,7 @@ impl Relay {
         };
         if let Some(text) = refused {
             tracing::info!("client {}: refused a RESOURCE_ENVELOPE: {text}", hex::encode(link));
-            self.tally(|s| s.resource_drops += 1);
+            self.tally(|s| s.client_resource_drops += 1);
             out.push(Output::Client(link, self.error(env.room.as_deref(), &text)));
         }
     }
@@ -1184,7 +1184,7 @@ impl Relay {
         let tag = hex::encode(link);
         let drop = |relay: &Self, why: &str| {
             tracing::info!("client {tag}: dropped a resource of {} bytes: {why}", data.len());
-            relay.tally(|s| s.resource_drops += 1);
+            relay.tally(|s| s.client_resource_drops += 1);
         };
         let Some(client) = self.clients.get_mut(&link) else {
             drop(self, "the link is gone");
@@ -1205,7 +1205,7 @@ impl Relay {
                 return out;
             }
         };
-        self.tally(|s| s.resources_in += 1);
+        self.tally(|s| s.client_resources_in += 1);
         if expected.body.kind != resource::KIND_NOTICE {
             drop(
                 self,
@@ -1239,7 +1239,7 @@ impl Relay {
                 return out;
             }
             Err(Some(text)) => {
-                self.tally(|s| s.resource_drops += 1);
+                self.tally(|s| s.client_resource_drops += 1);
                 out.push(Output::Client(link, self.error(None, &text)));
                 return out;
             }
@@ -1297,7 +1297,7 @@ impl Relay {
     /// or was refused): counted.
     pub fn client_resource_failed(&mut self, link: Link, why: &str) {
         tracing::info!("client {}: a resource did not come: {why}", hex::encode(link));
-        self.tally(|s| s.resource_drops += 1);
+        self.tally(|s| s.client_resource_drops += 1);
     }
 
     /// The client whose envelope most likely caused a hub ERROR (see
@@ -1388,7 +1388,7 @@ impl Relay {
                 "dropped a {:?} resource from the hub: only notices and the MOTD are relayed",
                 body.kind
             );
-            self.tally(|s| s.resource_drops += 1);
+            self.tally(|s| s.client_resource_drops += 1);
             return;
         }
         let notice = resource::notice_of(&envelope, &resource::text(&data));
@@ -1684,7 +1684,7 @@ impl Relay {
         let expired: u64 = self.clients.values_mut().map(|c| c.expected.expire(now) as u64).sum();
         if expired > 0 {
             tracing::info!("{expired} announced client resources did not come in time");
-            self.tally(|s| s.resource_drops += expired);
+            self.tally(|s| s.client_resource_drops += expired);
         }
         self.sent.retain(|s| now.saturating_duration_since(s.at) < s.wait);
         self.pending_commands
@@ -1796,7 +1796,7 @@ pub fn resource_policy(
             Some(why) => {
                 tracing::info!("client {}: refused a resource: {why}", hex::encode(link));
                 if let Ok(mut s) = status.lock() {
-                    s.resource_drops += 1;
+                    s.client_resource_drops += 1;
                 }
                 false
             }
@@ -2000,9 +2000,9 @@ impl<S: LinkSink> LinkTask<S> {
             }
         };
         match failure {
-            None => self.tally(|s| s.resources_out += 1),
+            None => self.tally(|s| s.client_resources_out += 1),
             Some(e) => {
-                self.tally(|s| s.resource_drops += 1);
+                self.tally(|s| s.client_resource_drops += 1);
                 tracing::info!(
                     "a resource of {} bytes to link {} was dropped: {e}",
                     data.len(),
@@ -2016,7 +2016,7 @@ impl<S: LinkSink> LinkTask<S> {
     /// `LINK_RESOURCES` wait already.
     fn queue(&self, resources: &mut ResourceQueue, env: Envelope, data: Arc<Vec<u8>>) {
         if resources.len() >= LINK_RESOURCES {
-            self.tally(|s| s.resource_drops += 1);
+            self.tally(|s| s.client_resource_drops += 1);
             tracing::info!(
                 "link {}: {LINK_RESOURCES} resources wait: one dropped",
                 hex::encode(self.link)
@@ -2154,7 +2154,7 @@ async fn link_sender<S: LinkSink>(
                 let room = env.room.as_deref().and_then(normalize_room);
                 match room.and_then(|r| held.get_mut(&r)) {
                     Some(items) if items.len() < MAX_HELD => items.push(Held::Resource(env, data)),
-                    Some(_) => task.tally(|s| s.resource_drops += 1),
+                    Some(_) => task.tally(|s| s.client_resource_drops += 1),
                     None => task.queue(&mut resources, env, data),
                 }
             }
@@ -2285,7 +2285,7 @@ impl<S: LinkSink> Links<S> {
         if sender.queued.load(Ordering::Relaxed) >= LINK_QUEUE {
             if let Ok(mut s) = status.lock() {
                 if matches!(message, ToLink::Resource(..)) {
-                    s.resource_drops += 1;
+                    s.client_resource_drops += 1;
                 } else {
                     s.relay_drops += 1;
                 }
@@ -3233,7 +3233,7 @@ mod tests {
         }
 
         fn drops(&self) -> u64 {
-            self.status.lock().unwrap().resource_drops
+            self.status.lock().unwrap().client_resource_drops
         }
     }
 
@@ -3270,7 +3270,7 @@ mod tests {
         let joined: Vec<String> = notices.iter().filter_map(|(_, e)| e.text_body()).collect();
         assert_eq!(joined.join("\n"), text);
         let status = f.status.lock().unwrap().clone();
-        assert_eq!((status.resources_split, status.resource_drops), (1, 0));
+        assert_eq!((status.client_resources_split, status.client_resource_drops), (1, 0));
     }
 
     #[test]
@@ -3381,7 +3381,11 @@ mod tests {
         assert!(sent_to(&out).iter().all(|(l, e)| *l == B && e.src == USER.to_vec()));
         let status = f.status.lock().unwrap().clone();
         assert_eq!(
-            (status.resources_in, status.relayed_in, status.resource_drops),
+            (
+                status.client_resources_in,
+                status.relayed_in,
+                status.client_resource_drops
+            ),
             (1, 1, 0)
         );
         // An echo is never waited for: a hub ERROR is not blamed on it.
@@ -4191,7 +4195,7 @@ mod tests {
             assert!(pair[1].2 >= pair[0].3, "one at a time");
         }
         let status = s.status.lock().unwrap().clone();
-        assert_eq!((status.resources_out, status.resource_drops), (3, 0));
+        assert_eq!((status.client_resources_out, status.client_resource_drops), (3, 0));
         // Each went after its RESOURCE_ENVELOPE.
         assert_eq!(s.to(A).iter().filter(|t| t.contains("ResourceEnvelope")).count(), 3);
     }
@@ -4216,8 +4220,8 @@ mod tests {
         tokio::time::sleep(FAKE_RESOURCE_TIME * (LINK_RESOURCES as u32 + 3)).await;
         let status = s.status.lock().unwrap().clone();
         // One was sending when the rest came: one more than the queue holds.
-        assert_eq!(status.resource_drops, 1);
-        assert_eq!(status.resources_out, 1 + LINK_RESOURCES as u64 + 1);
+        assert_eq!(status.client_resource_drops, 1);
+        assert_eq!(status.client_resources_out, 1 + LINK_RESOURCES as u64 + 1);
     }
 
     #[test]

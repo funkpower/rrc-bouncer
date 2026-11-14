@@ -588,6 +588,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_status_field_has_a_key_of_its_own() {
+        // The parts are flattened into one object: a name in two of them
+        // would be written twice and read back into one.
+        let hub = HubStatus {
+            upstream: "u".into(),
+            local_hub: "l".into(),
+            link: UpstreamStatus {
+                hub_resources_in: 1,
+                hub_resources_out: 2,
+                hub_resource_drops: 3,
+                ..Default::default()
+            },
+            relay: RelayStatus {
+                client_resources_in: 4,
+                client_resources_out: 5,
+                client_resources_split: 6,
+                client_resource_drops: 7,
+                ..Default::default()
+            },
+            history: HistoryStatus::default(),
+        };
+        let value = serde_json::to_value(&hub).unwrap();
+        let keys = |v: serde_json::Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        let mut all = keys(serde_json::to_value(&hub.link).unwrap());
+        all.extend(keys(serde_json::to_value(&hub.relay).unwrap()));
+        all.extend(keys(serde_json::to_value(&hub.history).unwrap()));
+        let parts = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), parts);
+        let back: HubStatus = serde_json::from_value(value).unwrap();
+        assert_eq!((back.link, back.relay), (hub.link, hub.relay));
+    }
+
+    #[test]
     fn the_rename_waits_for_the_next_whole_second() {
         assert_eq!(until_next_second(100.25), Duration::from_millis(760));
         assert_eq!(until_next_second(100.0), Duration::from_millis(1010));

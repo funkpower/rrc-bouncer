@@ -12,11 +12,14 @@ closes. Everything it sees goes to --events as JSON lines.
 With --driven it is an RRC client driven by the test: it links to the hub
 once, identifies, says HELLO after --hello-delay seconds (0: in the same
 breath as the identify, as NomadNet does), answers PING, and carries out
-the JSON commands appended to --commands (join, part, send). It does not
-link again.
+the JSON commands appended to --commands (join, part, send, resource). It
+does not link again. With --resource-cap its HELLO carries the
+resource_envelope cap; either way it takes every Resource the hub offers
+and reports it.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import socket
@@ -32,6 +35,7 @@ K_V, K_T, K_ID, K_TS, K_SRC, K_ROOM, K_BODY, K_NICK, K_DST = 0, 1, 2, 3, 4, 5, 6
 K_FMT = 64
 T_HELLO, T_WELCOME, T_JOIN, T_PART = 1, 2, 10, 12
 T_PING, T_PONG = 30, 31
+T_RESOURCE_ENVELOPE = 50
 
 lock = threading.Lock()
 
@@ -226,9 +230,16 @@ def driven(args, identity):
         except Exception:
             emit(args.events, event="error", error=traceback.format_exc())
 
+    def on_resource(resource):
+        data = resource.data.read() if hasattr(resource.data, "read") else (resource.data or b"")
+        emit(args.events, event="resource", complete=resource.status == RNS.Resource.COMPLETE, size=len(data),
+             sha256=hashlib.sha256(data).hexdigest(), text=data.decode("utf-8", "replace"))
+
     link = RNS.Link(destination, established_callback=lambda _l: established.set(),
                     closed_callback=lambda _l: closed.set())
     link.set_packet_callback(on_packet)
+    link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+    link.set_resource_concluded_callback(on_resource)
     if not established.wait(max(1, end - time.time())):
         emit(args.events, event="no_link")
         return
@@ -236,11 +247,30 @@ def driven(args, identity):
     link.identify(identity)
     if args.hello_delay > 0:
         time.sleep(args.hello_delay)
-    send(envelope(identity, T_HELLO, body={0: "e2e-driven", 1: 1, 2: {}}, nick=args.nick))
+    caps = {0: True} if args.resource_cap else {}
+    send(envelope(identity, T_HELLO, body={0: "e2e-driven", 1: 1, 2: caps}, nick=args.nick))
+
+    def resource(command):
+        """A RESOURCE_ENVELOPE, then the Resource; the envelope's size and
+        sha256 can be made to lie."""
+        data = command["text"].encode("utf-8")
+        sha = bytes.fromhex(command["sha256"]) if "sha256" in command else hashlib.sha256(data).digest()
+        body = {0: os.urandom(8), 1: command.get("kind", "notice"), 2: command.get("size", len(data)), 3: sha,
+                4: "utf-8"}
+        env = envelope(identity, T_RESOURCE_ENVELOPE, room=command.get("room"), body=body, nick=args.nick)
+        send(env)
+        emit(args.events, event="sent", op="resource_envelope", id=env[K_ID].hex(), size=len(data))
+        if command.get("send", True):
+            RNS.Resource(data, link, advertise=True, auto_compress=False,
+                         callback=lambda r: emit(args.events, event="resource_sent", id=env[K_ID].hex(),
+                                                 complete=r.status == RNS.Resource.COMPLETE, status=r.status))
 
     def carry_out(line):
         command = json.loads(line)
         op = command["op"]
+        if op == "resource":
+            resource(command)
+            return
         if op in ("join", "part"):
             env = envelope(identity, T_JOIN if op == "join" else T_PART, room=command["room"], nick=args.nick)
         else:
@@ -299,6 +329,7 @@ def main():
     parser.add_argument("--driven")
     parser.add_argument("--commands")
     parser.add_argument("--hello-delay", type=float, default=0.5)
+    parser.add_argument("--resource-cap", action="store_true")
     args = parser.parse_args()
 
     RNS.Reticulum(args.rnsconfig)
