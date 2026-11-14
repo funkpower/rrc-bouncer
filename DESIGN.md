@@ -411,8 +411,8 @@ of time in, commands to the upstream session and envelopes for client links out)
     to the session, PARTED to every other client in the room, and the relay takes the room as
     left at once, as the session does whether the hub answers or not, so a JOIN right after goes
     upstream again. A PART from a client not in the room is answered with PARTED and nothing else.
-- **MSG, ACTION, NOTICE.** A MSG or NOTICE whose text body, trimmed, starts with `/` is a slash
-  command, whatever its room or `K_DST`, as rrcd decides before anything else (`router.py`
+- **MSG, ACTION, NOTICE.** A MSG or NOTICE whose text body, trimmed as Python's `strip()` trims
+  (`envelope::is_command`), starts with `/` is a slash command, whatever its room or `K_DST`, as rrcd decides before anything else (`router.py`
   `_handle_message`). The others are checked as rrcd checks them before it looks at a room's
   state, in its order, and refused locally with rrcd's text (no room named): MSG or ACTION with
   no room or an empty one, `"message requires room name"`; a text body over `max_msg_body_bytes`,
@@ -516,7 +516,8 @@ of time in, commands to the upstream session and envelopes for client links out)
   - The blamed envelope leaves the list. No envelope fits: the ERROR goes to every client, so it
     is never lost.
   - Entries leave by age: a room envelope 120 s after it was sent (`ECHO_WAIT`; the session may
-    hold it 60 s) when the bouncer is in its room or about to be, and 75 s (`ANSWER_WAIT`) for a
+    hold it 60 s), and a long notice's part 10 s more for each part before it (each waits for the
+    one before's echo), when the bouncer is in its room or about to be, and 75 s (`ANSWER_WAIT`) for a
     room envelope to a room outside the room set (it gets no echo) or a direct NOTICE.
   - When the session goes down, every entry and waiting command is marked stale: nothing sent on
     the old link is answered on the next, so no ERROR is blamed on it, but a `SendDropped` for it
@@ -607,8 +608,14 @@ sends that upstream as ordinary NOTICEs, never as a Resource.
   keeps its place (an inbound slot, a link's one outbound Resource) until it ends. rsReticulum ends
   a stalled transfer with its watchdog, and every transfer of a link when the link closes, each
   with `Concluded` failed. rsReticulum hands the local hub's resource events over a bounded
-  channel and drops one when it is full; a lost end leaves its slot taken, or its link's next
-  Resource waiting, until the link closes.
+  channel and drops one when it is full. A lost end of a Resource to a client leaves its link's
+  next Resource waiting until the link closes. A client Resource's slot is given up instead: one
+  not heard of (accepted, `Started`, `Progress`) for 120 s (`RESOURCE_TIMEOUT`) is freed
+  (`relay::expire_slots`), counted once in `client_resource_drops` and logged (`no word of it in
+  120 s`); its envelope, no longer waiting on a transfer, then expires as any other. If its end
+  does come after all, it is not counted again and its text is dropped (the last 64 given up are
+  remembered). The transfer itself, if it still runs, keeps going in rsReticulum until its
+  watchdog or the link ends it; only the bouncer's count of it is freed.
 - **From the hub** (the upstream session). The session's link takes advertisements itself
   (`ResourceStrategy::AcceptApp`, offers on `LinkSession::resource_offers`). An offer outside the
   bounds, or with 8 already on the way, is refused. One whose envelope is there is accepted; one
@@ -662,35 +669,74 @@ sends that upstream as ordinary NOTICEs, never as a Resource.
   - A whole Resource that matches an envelope of its link is a NOTICE: kind `notice`, UTF-8, a
     room and no `K_DST`, as rrcd relays only that. Its text is cut into NOTICEs
     (`resource::parts`): each body at most the hub's `max_msg_body_bytes` (350 before the first
-    WELCOME, rrcd's default) and each envelope, with the client's envelope fields and `K_NICK` the
-    hub's `nick` when one is set, within one packet (`LINK_MDU`). Cuts fall on UTF-8 boundaries,
+    WELCOME, rrcd's default) and each envelope within one packet (`LINK_MDU`) as the hub sends it
+    on to the room: rrcd puts in the sender's 16-byte peer hash for `K_SRC` (a client's may be
+    shorter), the room trimmed and lowercased, and keeps `K_NICK` (the hub's `nick` when one is
+    set) and `K_TS` as sent, so each part is sized against a 16-byte (or longer) source, the longer
+    of the two room spellings, the nick, the time and an 8-byte id. Cuts fall on UTF-8 boundaries,
     at the last newline in the second half of a part, else the last whitespace, else as full as
-    the part goes; the separator is left out, and no part but the first starts with `/` (rrcd
-    takes a NOTICE whose text starts with `/` as a command). Parts are in order, each with a new
-    8-byte id. If 16 parts (`MAX_PARTS`) cannot hold the text cut that way, it is cut as full as
-    each part goes; if that still needs more than 16, nothing is sent and the sender gets
+    the part goes; the separator is left out. Parts are in order, each with a new 8-byte id. If 16
+    parts (`MAX_PARTS`) cannot hold the text cut that way, it is cut as full as each part goes; if
+    that still needs more than 16, nothing is sent and the sender gets
     `ERROR "notice too long: <n> bytes > <m>"`, `<m>` 16 times the most one part holds.
+  - **No part is a command.** rrcd takes a MSG or NOTICE whose text, stripped, starts with `/` as
+    a slash command: it runs it or answers `unrecognized command`, and does not relay it
+    (`router.py` `_handle_message`, `body.strip().startswith("/")`). It has no escape for a text
+    that starts with `/`, and Python's `strip()` takes off every Unicode space and U+001C to U+001F
+    (`envelope::is_command` follows it exactly). So a cut that would start the next part that way
+    is passed over for the next best one. A part that starts that way all the same (the first,
+    when the text does, or one no cut can spare, a run of `/` longer than a part) starts with
+    U+200B ZERO WIDTH SPACE (`resource::COMMAND_GUARD`), counted in the part's size: rrcd does not
+    strip it, so the part is relayed, and clients show it as nothing. That is the smallest change
+    rrcd does not parse; a leading space would be stripped. A client's short MSG or NOTICE is not
+    touched: one that starts with `/` is a command, as the user meant.
+  - A long notice goes only to a room in the bouncer's room set (joined or being joined): each
+    part waits for the echo of the one before, and the hub echoes only into a room the bouncer is
+    in. To another room the sender gets `ERROR "notice not sent: a long notice goes only to a room
+    the bouncer is in"` and nothing is sent.
   - The parts go through the path of a client's NOTICE (`message`), each in turn: membership, the
-    rate limit, command handling, the session's queue and `CLIENT_HOLD` before the WELCOME, ERROR
-    blame, echo and history. They go upstream as `Command::SendPart`: rrcd handles each packet on a
-    thread of its own (`service.py:450`, `_on_packet`), and parts sent back to back reached the
-    room out of order in the e2e test. So once a part is sent, the next client envelope of its room
-    waits until the hub echoes the part (rrcd forwards it to the room, the bouncer's link included,
-    with its `K_ID`) or 2 s (`ECHO_WAIT`) have passed; other rooms go on meanwhile. 16 parts the hub
-    never echoes take 32 s, inside `CLIENT_HOLD`. What the hub would refuse each part for is answered once, and the
-    parts go all or none: if the relay's queue to the session has no room for all of them the
-    sender gets `ERROR "not sent to the hub: the bouncer's queue is full"`. Before the upstream's
-    first WELCOME a client's `RESOURCE_ENVELOPE` is taken like a short NOTICE: the parts are queued
-    for the session or dropped with the same ERROR a short NOTICE would get.
+    rate limit, the session's queue and `CLIENT_HOLD` before the WELCOME, ERROR blame, echo and
+    history. They go upstream as `Command::SendPart`, each with the relay's number for the notice,
+    its index and the count (`upstream::Part`): rrcd handles each packet on a thread of its own
+    (`service.py:450`, `_on_packet`), and parts sent back to back reached the room out of order in
+    the e2e test. So once a part is sent, the next client envelope of its room (rooms compared as
+    the hub names them, `normalize_room`) waits until the hub echoes the part (rrcd forwards it to
+    the room, the bouncer's link included, with its `K_ID`); other rooms go on meanwhile. What the
+    hub would refuse each part for is answered once, and the parts go all or none: if the relay's
+    queue to the session has no room for all of them the sender gets
+    `ERROR "not sent to the hub: the bouncer's queue is full"`. Before the upstream's first
+    WELCOME a client's `RESOURCE_ENVELOPE` is taken like a short NOTICE: the parts are queued for
+    the session or dropped as below.
+  - **A notice cut short.** The parts after one that failed are not sent, and the sender hears so
+    once: `ERROR "<u> of <n> parts of the notice not sent: <reason>"`, with the notice's room. A
+    part fails when:
+    - the hub refuses it: an ERROR the relay puts on that part (blame, as for any envelope; the
+      hub's own ERROR goes to the sender as always). The relay tells the session
+      (`Command::CutNotice`); reason `the hub refused part <i>`, and `<u>` counts the parts after
+      it;
+    - no echo of it comes in 10 s (`upstream::ECHO_WAIT`, long enough for a slow path's round
+      trip): reason `no echo of part <i> from the hub in 10 s`, `<u>` the parts after it. Whether
+      that part itself reached the room is not known;
+    - the session does not send it (held past `CLIENT_HOLD`, larger than the link carries, the
+      queue full, not connected, the link ended): that part and the rest, with the reason a short
+      NOTICE would get.
+
+    The session drops the notice's parts it holds and remembers the last 64 notices cut short, so
+    parts that come later are dropped too; each dropped part counts in `dropped_sends`, and the
+    report is `UpstreamEvent::PartsDropped`. No ERROR is sent when nothing is left unsent (the
+    last part refused or late). While a room waits for a part's echo, that time does not count
+    towards the `CLIENT_HOLD` of anything waiting for the room (`upstream::pause_hold`), so a
+    notice going out slowly does not age out what is behind it; each wait is bounded by
+    `ECHO_WAIT`, so 16 parts hold a room at most 160 s.
   - rrcd echoes each NOTICE to the room, the bouncer's link included, so the user's clients in the
     room (the sender too) get the parts at their echo, in order, as for any room NOTICE, and
     history records them there. A direct client of rrcd gets the parts as ordinary NOTICEs.
   - `client_resources_in` counts the text once when its parts go; `relayed_in` counts each part.
     Dropped silently and counted in `client_resource_drops`: a Resource no envelope announced, one
     whose sha256 is not the announced one (rrcd drops it silently too), a kind other than
-    `notice`, text that is not UTF-8, a NOTICE with `K_DST` or no room, a transfer that fails. A
-    refusal with an ERROR (too long, a full queue, a room the user is not in) counts it dropped
-    too.
+    `notice`, text that is not UTF-8, a NOTICE with `K_DST` or no room, a transfer that fails or
+    is given up on. A refusal with an ERROR (too long, a full queue, a room the bouncer is not in)
+    counts it dropped too.
   - Sending the text on as NOTICEs keeps it readable to every client of the hub. rrcd 0.3.2 with
     RNS 1.6 takes no client Resource: its accept callback reads `resource.total_size` or
     `resource.size` (`resources.py:253`) of a `ResourceAdvertisement`, which has neither, so the
@@ -723,7 +769,9 @@ sends that upstream as ordinary NOTICEs, never as a Resource.
   the record is dropped and counted in `history_drops`, so a slow disk cannot hold up the relay.
   A warning is logged when the queue fills and one when it has room again, with how many records
   were dropped in between. Replay queries go through the same queue, so a query sees every record
-  queued before it.
+  queued before it. At stop the thread syncs, then closes the queue before it answers: a record
+  queued after the stop is counted in `history_drops`, a query after it gets no answer (its
+  replay is empty), so nothing is taken after the stop is acknowledged.
 - **Open files.** At most 64 room files are open at once; at 64 the least recently written is
   synced and closed. A file not written for 60 s is closed too.
 - **Index.** For each room the thread keeps where its newest 500 replayable records are and their
@@ -759,6 +807,15 @@ sends that upstream as ordinary NOTICEs, never as a Resource.
     size); they are not kept anywhere else.
   - The prune at start and every hour cuts a bad tail off too (logged), and removes `*.tmp` files
     a crash left. A file is never removed for damage; only one left with no record is.
+  - **Known limitation.** A record cut inside a last byte-string field that reads on to swallow
+    whole records and ends exactly where another record starts (or at the end of the file) is
+    taken as one record, and the records it swallowed are lost with it. Its bytes are the same as
+    a sound record whose byte-string body holds a whole record, which any peer can send, so no
+    check on the bytes alone tells them apart, and taking such a body as damage would let a peer
+    hide or forge records through it. Closing it needs a check the format does not carry (a
+    length or checksum per record), so it is left. It takes damage that is not at the file's end:
+    a cut tail is cut off before the next append, and a text body mostly fails to decode as
+    UTF-8 when it runs on into a record.
 - **Retention.** `history.days` (default 30) and `history.max_mb` per hub (default 100, in units of
   1,000,000 bytes). At start and every hour the thread reads the hub's room files a record at a
   time and judges each record by its own `ts_ms`: it drops the records older than `days`, then,
@@ -1151,6 +1208,19 @@ rrc-bouncer status (updated 12 s ago)
   - RA sends a 6299-byte notice, more than 16 parts hold: it gets
     `ERROR "notice too long: 6299 bytes > 5600"` from the local hub; RD gets nothing, rrcd forwards
     nothing, `client_resource_drops` goes up by exactly one and nothing is relayed.
+  - RA sends a long notice to `res` whose text starts `/topic res` and whose 24 other lines each
+    start `/kick dee,`. RD gets it as NOTICEs, the first starting with U+200B then `/topic`, none
+    starting with `/` once stripped as rrcd strips, and together the text in order with one space
+    or newline left out at each cut; rrcd forwards them all and nobody gets an ERROR (no
+    `unrecognized command`); `relayed_in` goes up by the parts, `dropped_sends` not at all.
+  - RD founds `mod` and sets it `+m` (`/mode mod +m` as a MSG); RA joins it through the bouncer and
+    sends the 6-part notice there. RA gets the hub's `ERROR "room is moderated (+m)"` and then one
+    `ERROR "5 of 6 parts of the notice not sent: the hub refused part 1"`, both in `mod`, and
+    nothing more in the next 12 s; RD gets no part, rrcd forwards nothing, `dropped_sends` goes up
+    by exactly 5, and `res` goes on (RD's next MSG reaches RA).
+  - RA sends the notice to `elsewhere`, a room the bouncer is not in: it gets
+    `ERROR "notice not sent: a long notice goes only to a room the bouncer is in"` in `elsewhere`,
+    rrcd forwards nothing, `client_resource_drops` goes up by exactly one and nothing is relayed.
   - From RA: an envelope of size 0 gets `ERROR "resource envelope invalid size"`; one announcing
     262145 bytes gets `ERROR "resource too large: 262145 > 262144"` and its Resource is refused;
     a Resource whose sha256 is not the announced one reaches the bouncer and is dropped with no

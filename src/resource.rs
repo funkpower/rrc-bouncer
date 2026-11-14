@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::envelope::{Envelope, MessageType, Raw, ResourceEnvelope};
+use crate::envelope::{Envelope, MessageType, Raw, ResourceEnvelope, is_command, rrcd_space};
 
 /// The largest Resource taken or sent, in bytes: rrcd's
 /// `max_resource_bytes`, and what weechat-rrc, rBrowser2 and NomadNet
@@ -139,23 +139,45 @@ pub fn split(notice: &Envelope) -> Vec<Envelope> {
     out
 }
 
+/// What a part that rrcd would take as a command starts with: U+200B ZERO
+/// WIDTH SPACE. rrcd has no escape for a leading "/", and strips
+/// whitespace before it looks, but U+200B is not whitespace to it, and
+/// clients show it as nothing.
+pub const COMMAND_GUARD: char = '\u{200b}';
+
 /// Text cut into parts of at most `max` bytes, in order, on character
 /// boundaries. A part ends at the last newline of its second half, or
 /// else at its last whitespace, or else where it is full; the newline or
 /// whitespace it ends at is left out, and so is a part that would be
-/// only whitespace. No part but the first starts (after whitespace) with
-/// "/", which the hub would take as a command, where another cut avoids
-/// it. `fill`: cut where each part is full, ignoring whitespace.
+/// only whitespace. A cut that would start the next part with what rrcd
+/// takes as a command (`envelope::is_command`) is passed over for the next
+/// best; a part that starts so all the same (the first, or one no cut
+/// spares) starts with `COMMAND_GUARD`, which counts in its `max`. `max`
+/// is at least 7 bytes: a guard and any one character. `fill`: cut where
+/// each part is full, ignoring whitespace.
 pub fn split_text(text: &str, max: usize, fill: bool) -> Vec<String> {
-    let max = max.max(4);
+    let guard_len = COMMAND_GUARD.len_utf8();
+    let max = max.max(4 + guard_len);
     let mut out = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {
-        if rest.len() <= max {
-            out.push(rest.to_string());
+        let guarded = is_command(rest);
+        let cap = if guarded { max - guard_len } else { max };
+        let push = |out: &mut Vec<String>, part: &str| {
+            if part.trim_matches(rrcd_space).is_empty() {
+                return;
+            }
+            out.push(if guarded {
+                format!("{COMMAND_GUARD}{part}")
+            } else {
+                part.to_string()
+            });
+        };
+        if rest.len() <= cap {
+            push(&mut out, rest);
             break;
         }
-        let mut full = max;
+        let mut full = cap;
         while !rest.is_char_boundary(full) {
             full -= 1;
         }
@@ -167,46 +189,52 @@ pub fn split_text(text: &str, max: usize, fill: bool) -> Vec<String> {
                 window
                     .char_indices()
                     .rev()
-                    .filter(|(i, c)| *c == '\n' && *i >= max / 2)
+                    .filter(|(i, c)| *c == '\n' && *i >= cap / 2)
                     .map(|(i, _)| (i, i + 1)),
             );
             cuts.extend(
                 window
                     .char_indices()
                     .rev()
-                    .filter(|(i, c)| c.is_whitespace() && *i > 0)
+                    .filter(|(i, c)| rrcd_space(*c) && *i > 0)
                     .map(|(i, c)| (i, i + c.len_utf8())),
             );
         }
         cuts.push((full, full));
         cuts.extend(window.char_indices().rev().filter(|(i, _)| *i > 0).map(|(i, _)| (i, i)));
-        let commandlike = |next: usize| rest[next..].trim_start().starts_with('/');
         let (end, next) = cuts
             .iter()
             .copied()
-            .find(|(_, next)| !commandlike(*next))
+            .find(|(_, next)| !is_command(&rest[*next..]))
             .unwrap_or((full, full));
-        let part = rest[..end].strip_suffix('\r').unwrap_or(&rest[..end]);
-        if !part.trim().is_empty() {
-            out.push(part.to_string());
-        }
+        push(&mut out, rest[..end].strip_suffix('\r').unwrap_or(&rest[..end]));
         rest = &rest[next..];
     }
     out
 }
 
 /// The NOTICEs a client's long notice goes upstream as: each body at
-/// most `max_body` bytes and each NOTICE within one packet, in order,
-/// each with a new id; None when that takes more than `MAX_PARTS`. Also
-/// the most bytes `MAX_PARTS` NOTICEs carry.
+/// most `max_body` bytes and each NOTICE, as the hub sends it on, within
+/// one packet, in order, each with a new id; None when that takes more
+/// than `MAX_PARTS`. Also the most bytes `MAX_PARTS` NOTICEs carry.
+///
+/// The hub sends a NOTICE on with its own source, the sender's peer hash
+/// (16 bytes), in place of the client's, the room trimmed and lowercased,
+/// and the nick the notice carries; ids are 8 bytes; time and the rest go
+/// as they came. The room left is reckoned on that.
 pub fn parts(notice: &Envelope, max_body: usize) -> (Option<Vec<Envelope>>, usize) {
     let text = notice.text_body().unwrap_or_default();
-    let mut empty = notice.clone();
-    empty.id = vec![0; 8];
-    empty.body = Some(Raw::text(""));
+    let mut echo = notice.clone();
+    echo.id = vec![0; 8];
+    echo.src = vec![0; notice.src.len().max(16)];
+    echo.room = notice.room.as_ref().map(|r| {
+        let hub = r.trim().to_lowercase();
+        if hub.len() > r.len() { hub } else { r.clone() }
+    });
+    echo.body = Some(Raw::text(""));
     // A text item's head grows from one byte to three past 23 bytes.
-    let room = LINK_MDU.saturating_sub(empty.encode().len() + 2).max(4);
-    let max = max_body.min(room).max(4);
+    let room = LINK_MDU.saturating_sub(echo.encode().len() + 2).max(4);
+    let max = max_body.min(room).max(7);
     let most = max * MAX_PARTS;
     if text.len() > most {
         return (None, most);
@@ -555,17 +583,82 @@ mod tests {
         let parts = split_text(&text, 7, false);
         assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [6, 6, 6, 2]);
         assert_eq!(parts.concat(), text);
-        let parts = split_text("aaaa bbbb cccc", 6, true);
+        let parts = split_text("aaaa bbbb cccc", 7, true);
         assert_eq!(parts.concat(), "aaaa bbbb cccc");
-        assert!(parts.iter().all(|p| p.len() <= 6));
-        // No part but the first starts with "/".
+        assert!(parts.iter().all(|p| p.len() == 7));
+        // No part starts with what rrcd takes as a command: later parts
+        // are cut elsewhere, the first is guarded.
         let parts = split_text("/me waves at /everyone /here and /there", 14, false);
-        assert!(parts[1..].iter().all(|p| !p.trim_start().starts_with('/')), "{parts:?}");
-        assert!(parts[0].starts_with("/me"));
+        assert!(parts.iter().all(|p| !is_command(p) && p.len() <= 14), "{parts:?}");
+        assert_eq!(parts[0].strip_prefix(COMMAND_GUARD).map(|p| &p[..3]), Some("/me"));
+        let text: String = parts.concat().chars().filter(|c| *c != COMMAND_GUARD).collect();
+        assert_eq!(
+            text.replace(' ', ""),
+            "/me waves at /everyone /here and /there".replace(' ', "")
+        );
         // The whitespace a part is cut at is all that is lost.
         let text = "word ".repeat(100);
         let parts = split_text(text.trim_end(), 50, false);
         assert_eq!(parts.join(" "), text.trim_end());
+    }
+
+    #[test]
+    fn no_part_is_a_command_to_the_hub() {
+        // rrcd strips U+001C..U+001F and Unicode spaces before it looks.
+        for lead in ["/", " /", "\u{1f}/", "\u{a0}\u{3000}/", "\n\t/"] {
+            let text = format!("{lead}topic x {}", "y ".repeat(30));
+            let parts = split_text(&text, 20, false);
+            assert!(parts.iter().all(|p| !is_command(p)), "{lead:?}: {parts:?}");
+            assert!(parts[0].starts_with(COMMAND_GUARD) && parts[0].len() <= 20, "{parts:?}");
+            assert!(parts[1..].iter().all(|p| !p.starts_with(COMMAND_GUARD)), "{parts:?}");
+        }
+        // A cut that would start the next part with "/" is passed over,
+        // across lines too.
+        let text = "first line here\n/kick someone\n/ban them all";
+        let parts = split_text(text, 18, false);
+        assert!(parts.iter().all(|p| !is_command(p)), "{parts:?}");
+        assert!(!parts[0].starts_with(COMMAND_GUARD));
+        // Where every cut would: guarded, nothing lost.
+        let text = "/".repeat(40);
+        let parts = split_text(&text, 10, false);
+        assert!(parts.iter().all(|p| !is_command(p) && p.len() <= 10), "{parts:?}");
+        let back: String = parts.concat().chars().filter(|c| *c != COMMAND_GUARD).collect();
+        assert_eq!(back, text);
+        // Filling guards the same way.
+        let parts = split_text(&format!("/x {}", "/y ".repeat(20)), 9, true);
+        assert!(parts.iter().all(|p| !is_command(p) && p.len() <= 9), "{parts:?}");
+        // A text that is no command is left as it is.
+        assert_eq!(split_text("a/b", 10, false), vec!["a/b"]);
+        assert_eq!(split_text("\u{200b}/x", 10, false), vec!["\u{200b}/x"]);
+    }
+
+    #[test]
+    fn parts_fit_a_packet_as_the_hub_sends_them_on() {
+        // A client with a short source and a mixed-case room: the hub sends
+        // each part on with a 16-byte source and the room lowercased, and
+        // the nick and time the part carries.
+        let text = "word ".repeat(400);
+        for src in [vec![1u8; 4], vec![2u8; 16], vec![3u8; 32]] {
+            for room in ["Lobby", "  Lobby  ", "İİİİİİİİ"] {
+                let mut notice = Envelope::new(MessageType::Notice, &src)
+                    .with_room(room)
+                    .with_nick(Some("a-long-nick-name"))
+                    .with_body(Raw::text(text.trim_end()));
+                notice.ts = u64::MAX;
+                let (parts, _) = parts(&notice, 10_000);
+                for p in parts.unwrap() {
+                    let mut echo = p.clone();
+                    echo.src = vec![9; 16];
+                    echo.room = Some(room.trim().to_lowercase());
+                    assert!(
+                        echo.encode().len() <= LINK_MDU,
+                        "{src:?} {room:?}: {}",
+                        echo.encode().len()
+                    );
+                    assert!(p.encode().len() <= LINK_MDU);
+                }
+            }
+        }
     }
 
     #[test]

@@ -133,7 +133,7 @@ impl History {
         let mut store = Store::new(dir, settings, status.clone());
         std::thread::Builder::new()
             .name("history".into())
-            .spawn(move || store.run(&rx))
+            .spawn(move || store.run(rx))
             .map_err(|e| format!("could not start the history thread: {e}"))?;
         Ok(Self {
             jobs: Some(tx),
@@ -605,7 +605,10 @@ impl Store {
         }
     }
 
-    fn run(&mut self, jobs: &Receiver<Job>) {
+    /// Take jobs until the senders are gone or one says stop. A stop is
+    /// acknowledged only once the queue is closed: what is recorded after
+    /// `History::stop` returns is dropped and counted, never left to wait.
+    fn run(&mut self, jobs: Receiver<Job>) {
         self.prune();
         let mut next_prune = Instant::now() + PRUNE_EVERY;
         let mut next_sync: Option<Instant> = None;
@@ -627,7 +630,18 @@ impl Store {
                 }
                 Some(Job::Stop(ack)) => {
                     self.sync();
-                    let _ = ack.send(());
+                    let mut acks = vec![ack];
+                    while let Ok(job) = jobs.try_recv() {
+                        match job {
+                            Job::Record { .. } => self.show(|s| s.history_drops += 1),
+                            Job::Query(..) => {}
+                            Job::Stop(ack) => acks.push(ack),
+                        }
+                    }
+                    drop(jobs);
+                    for ack in acks {
+                        let _ = ack.send(());
+                    }
                     return;
                 }
                 None => {}
@@ -1519,6 +1533,31 @@ mod tests {
         assert_eq!(status.lock().unwrap().history_drops, 1);
         assert!(history.query(all("lobby")).await.unwrap_or_default().is_empty());
         assert!(history.stop(Duration::from_secs(1)).await);
+    }
+
+    #[test]
+    fn a_stop_closes_the_queue_before_it_is_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = SharedHistoryStatus::default();
+        let mut store = Store::new(dir.path().to_path_buf(), settings(30, 1_000_000), status.clone());
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let record = || Job::Record {
+            room: "lobby".into(),
+            ts_ms: now_ms(),
+            envelope: msg("x"),
+        };
+        let (ack, acked) = oneshot::channel();
+        let (ack2, acked2) = oneshot::channel();
+        tx.send(record()).unwrap();
+        tx.send(Job::Stop(ack)).unwrap();
+        // Behind the stop: dropped and counted; a second stop answered.
+        tx.send(record()).unwrap();
+        tx.send(Job::Stop(ack2)).unwrap();
+        store.run(rx);
+        assert!(acked.blocking_recv().is_ok() && acked2.blocking_recv().is_ok());
+        let s = status.lock().unwrap().clone();
+        assert_eq!((s.history_records, s.history_drops), (1, 1));
+        assert!(matches!(tx.try_send(record()), Err(TrySendError::Disconnected(_))));
     }
 
     #[tokio::test]

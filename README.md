@@ -245,7 +245,17 @@ newline or a space where it can. Everyone in the room sees them as notices,
 your other clients too, and they go into the history. A text that needs more
 than 16 notices is refused with `ERROR "notice too long: …"` and nothing is
 sent. One that is too large, or announced with a size of 0 (rrcd takes that),
-is refused with an ERROR; one whose sha256 doesn't match is dropped.
+is refused with an ERROR; one whose sha256 doesn't match is dropped. It goes
+only to a room the bouncer is in; to any other room it is refused with an
+ERROR.
+
+rrcd runs a notice that starts with `/` as a command, so no notice cut from a
+long one does: the cuts avoid it, and a notice that would start with `/` all
+the same (the first, when your text does) starts with an invisible zero-width
+space (U+200B) instead, which rrcd passes on. Each notice waits for the hub to
+pass the one before on to the room. If the hub refuses one, or doesn't pass it
+on within 10 s, the rest are not sent and you get one ERROR, such as
+`3 of 5 parts of the notice not sent: the hub refused part 2`.
 weechat-rrc, rBrowser2 and NomadNet never send one: they refuse a line over
 the hub's message limit or split it themselves.
 

@@ -39,7 +39,7 @@ use crate::envelope::{Caps, Envelope, Hello, Limits, MessageType, Raw, ResourceE
 use crate::history::{self, History, Query, Record};
 use crate::identity::hub_address;
 use crate::resource::{self, Expectations, Expected, LINK_MDU, MAX_RESOURCE_BYTES};
-use crate::upstream::{CLIENT_HOLD, Command, EventReceiver, Inbound, SharedStatus, UpstreamEvent, local_name};
+use crate::upstream::{CLIENT_HOLD, Command, EventReceiver, Inbound, Part, SharedStatus, UpstreamEvent, local_name};
 
 /// A link that has not identified this long after it was established is
 /// closed.
@@ -308,8 +308,8 @@ enum Kind {
     Room,
     /// A direct NOTICE.
     Direct,
-    /// A MSG or NOTICE whose body, trimmed, starts with `/`: rrcd's slash
-    /// command, whatever its room or K_DST.
+    /// A MSG or NOTICE whose body rrcd takes as a slash command
+    /// (`envelope::is_command`), whatever its room or K_DST.
     Command,
 }
 
@@ -327,11 +327,13 @@ struct Sent {
     /// Sent on a link that has since gone: no answer can come for it on
     /// the next, but the session may still report it dropped.
     stale: bool,
+    /// The part of a client's long notice it is, if one.
+    part: Option<Part>,
 }
 
 fn kind_of(env: &Envelope) -> Kind {
     let command = matches!(env.t, MessageType::Msg | MessageType::Notice)
-        && env.text_body().is_some_and(|b| b.trim().starts_with('/'));
+        && env.text_body().is_some_and(|b| crate::envelope::is_command(&b));
     if command {
         Kind::Command
     } else if env.t == MessageType::Notice && env.dst.is_some() {
@@ -433,6 +435,10 @@ pub struct Relay {
     /// Rooms a client's JOIN added to the room set that are not joined yet.
     added: BTreeSet<String>,
     sent: VecDeque<Sent>,
+    /// The client's long notices sent upstream as parts, the last
+    /// `MAX_SENT`: the relay's number for each, its client and its room.
+    notices: VecDeque<(u64, Link, Option<String>)>,
+    notice_seq: u64,
     /// Commands in the order they went upstream.
     pending_commands: VecDeque<PendingCommand>,
     /// Rooms just joined, whose JOINED rrcd follows with a NOTICE about the
@@ -490,6 +496,8 @@ impl Relay {
             member_lists: false,
             added: BTreeSet::new(),
             sent: VecDeque::new(),
+            notices: VecDeque::new(),
+            notice_seq: 0,
             pending_commands: VecDeque::new(),
             join_notice: BTreeMap::new(),
             greeting: Vec::new(),
@@ -817,7 +825,7 @@ impl Relay {
             MessageType::Part => self.part(link, identity, &env, &mut out),
             MessageType::Msg if self.history_command(link, &env, now, &mut out) => {}
             MessageType::Msg | MessageType::Action | MessageType::Notice => {
-                self.message(link, env, now, &mut out, false);
+                self.message(link, env, now, &mut out, None);
             }
             other => tracing::debug!("client {}: ignored a {other:?}", hex::encode(link)),
         }
@@ -1077,7 +1085,7 @@ impl Relay {
         }
     }
 
-    fn message(&mut self, link: Link, mut env: Envelope, now: Instant, out: &mut Vec<Output>, part: bool) {
+    fn message(&mut self, link: Link, mut env: Envelope, now: Instant, out: &mut Vec<Output>, part: Option<Part>) {
         let kind = kind_of(&env);
         let room = match self.check(&env, kind) {
             Ok(room) => room,
@@ -1100,10 +1108,9 @@ impl Relay {
             copy.src = self.user.to_vec();
             copy
         });
-        let command = if part {
-            Command::SendPart(env)
-        } else {
-            Command::Send(env)
+        let command = match part {
+            Some(part) => Command::SendPart(env, part),
+            None => Command::Send(env),
         };
         if self.commands.try_send(command).is_err() {
             self.tally(|s| s.relay_drops += 1);
@@ -1141,8 +1148,11 @@ impl Relay {
                 room,
                 kind,
                 at: now,
-                wait: if echoed { ECHO_WAIT } else { ANSWER_WAIT },
+                // A part goes once the one before it is echoed.
+                wait: if echoed { ECHO_WAIT } else { ANSWER_WAIT }
+                    + crate::upstream::ECHO_WAIT * part.map_or(0, |p| p.index as u32),
                 stale: false,
+                part,
             });
         }
         if let Some(copy) = local {
@@ -1265,6 +1275,16 @@ impl Relay {
         }
         let max = usize::try_from(self.limits().max_msg_body_bytes).unwrap_or(usize::MAX);
         let room = envelope.room.as_deref().and_then(normalize_room);
+        // Each part waits for the echo of the one before it, and the hub
+        // echoes only into a room the bouncer is in.
+        if room.as_ref().is_some_and(|r| !self.room_set().contains(r)) {
+            drop(self, "the bouncer is not in its room");
+            let error = self.error(
+                room.as_deref(),
+                "notice not sent: a long notice goes only to a room the bouncer is in",
+            );
+            return out.push(Output::Client(link, error));
+        }
         let parts = match resource::parts(&notice, max) {
             (Some(parts), _) if !parts.is_empty() => parts,
             (Some(_), _) => return drop(self, "no text"),
@@ -1300,8 +1320,15 @@ impl Relay {
             parts.len()
         );
         self.tally(|s| s.client_resources_in += 1);
-        for part in parts {
-            self.message(link, part, now, out, true);
+        self.notice_seq += 1;
+        let notice = self.notice_seq;
+        if self.notices.len() >= MAX_SENT {
+            self.notices.pop_front();
+        }
+        self.notices.push_back((notice, link, room));
+        let total = parts.len();
+        for (index, env) in parts.into_iter().enumerate() {
+            self.message(link, env, now, out, Some(Part { notice, index, total }));
         }
     }
 
@@ -1314,7 +1341,7 @@ impl Relay {
 
     /// The client whose envelope most likely caused a hub ERROR (see
     /// DESIGN.md § Local hub), taken off the list; None if none fits.
-    fn blame(&mut self, room: Option<&str>, answers: Answers) -> Option<Link> {
+    fn blame(&mut self, room: Option<&str>, answers: Answers) -> Option<Sent> {
         let room = room.and_then(normalize_room);
         let fits = |s: &Sent| {
             !s.stale
@@ -1336,7 +1363,7 @@ impl Relay {
         } else {
             self.sent.iter().position(fits)
         };
-        pos.and_then(|p| self.sent.remove(p)).map(|s| s.link)
+        pos.and_then(|p| self.sent.remove(p))
     }
 
     /// The command a hub NOTICE or ERROR naming `room` answers: the oldest
@@ -1380,6 +1407,27 @@ impl Relay {
                         self.deliver(&mut out, &[link], &error);
                     }
                     _ => tracing::debug!("a dropped client envelope's client is gone"),
+                }
+            }
+            UpstreamEvent::PartsDropped {
+                notice,
+                unsent,
+                total,
+                reason,
+            } => {
+                self.sent.retain(|s| s.part.is_none_or(|p| p.notice != notice));
+                let owner = self
+                    .notices
+                    .iter()
+                    .find(|(n, _, _)| *n == notice)
+                    .map(|(_, link, room)| (*link, room.clone()));
+                match owner {
+                    Some((link, room)) if self.clients.contains_key(&link) => {
+                        let text = format!("{unsent} of {total} parts of the notice not sent: {reason}");
+                        let error = self.error(room.as_deref(), &text);
+                        self.deliver(&mut out, &[link], &error);
+                    }
+                    _ => tracing::debug!("a long notice cut short: its client is gone"),
                 }
             }
             UpstreamEvent::Envelope(env, inbound) => self.hub_envelope(env, inbound, now, &mut out),
@@ -1571,7 +1619,17 @@ impl Relay {
             }
             Answers::Everyone => None,
             Answers::Command => self.command_answered(room).map(|c| c.link),
-            _ => self.blame(room, answers),
+            _ => {
+                let sent = self.blame(room, answers);
+                // A part refused: the rest of its notice is not sent.
+                if let Some(part) = sent.as_ref().and_then(|s| s.part) {
+                    let reason = format!("the hub refused part {}", part.index + 1);
+                    if self.commands.try_send(Command::CutNotice(part, reason)).is_err() {
+                        tracing::warn!("could not cut a refused notice short: the bouncer's queue is full");
+                    }
+                }
+                sent.map(|s| s.link)
+            }
         };
         match owner {
             Some(link) if self.clients.contains_key(&link) => self.deliver(out, &[link], &answer),
@@ -1785,17 +1843,73 @@ pub struct LocalHub {
 }
 
 /// The client Resources a local hub accepted and is receiving, by link and
-/// resource hash, with their size. One is kept until its transfer ends
-/// (rsReticulum ends a stalled one with its watchdog, and all of a link's
-/// with the link): the local hub cannot cancel a transfer.
-pub type ResourceSlots = Arc<Mutex<HashMap<(Link, [u8; 32]), u64>>>;
+/// resource hash. One is kept until its transfer ends (rsReticulum ends a
+/// stalled one with its watchdog, and all of a link's with the link): the
+/// local hub cannot cancel a transfer. rsReticulum may drop the event that
+/// says one ended when its event queue is full, so one with no word for
+/// `RESOURCE_TIMEOUT` is given up ([`expire_slots`]).
+pub type ResourceSlots = Arc<Mutex<HashMap<(Link, [u8; 32]), Slot>>>;
+
+/// A client Resource being received: its size, and when it was accepted
+/// or last heard of (started, progressed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slot {
+    pub size: u64,
+    pub last: Instant,
+}
 
 /// The sizes of the client Resources each link is sending.
 fn busy_sizes(slots: &ResourceSlots) -> std::collections::HashSet<(Link, u64)> {
     slots
         .lock()
-        .map(|slots| slots.iter().map(|((link, _), size)| (*link, *size)).collect())
+        .map(|slots| slots.iter().map(|((link, _), slot)| (*link, slot.size)).collect())
         .unwrap_or_default()
+}
+
+/// A client Resource heard of: its slot's clock starts again.
+fn touch_slot(slots: &ResourceSlots, link: Link, hash: [u8; 32], now: Instant) {
+    if let Ok(mut slots) = slots.lock()
+        && let Some(slot) = slots.get_mut(&(link, hash))
+    {
+        slot.last = now;
+    }
+}
+
+/// The client Resources not heard of for `RESOURCE_TIMEOUT`, taken out:
+/// their end was lost, or they will not end.
+fn expire_slots(slots: &ResourceSlots, now: Instant) -> Vec<(Link, [u8; 32])> {
+    let Ok(mut slots) = slots.lock() else { return Vec::new() };
+    let gone: Vec<(Link, [u8; 32])> = slots
+        .iter()
+        .filter(|(_, slot)| now.saturating_duration_since(slot.last) >= resource::RESOURCE_TIMEOUT)
+        .map(|(key, _)| *key)
+        .collect();
+    for key in &gone {
+        slots.remove(key);
+    }
+    gone
+}
+
+/// Client Resources given up on, the last `MAX_GIVEN_UP`: counted once
+/// already, so their end, if it comes after all, is not counted again.
+#[derive(Debug, Default)]
+struct GivenUp(VecDeque<(Link, [u8; 32])>);
+
+const MAX_GIVEN_UP: usize = 64;
+
+impl GivenUp {
+    fn add(&mut self, key: (Link, [u8; 32])) {
+        if self.0.len() >= MAX_GIVEN_UP {
+            self.0.pop_front();
+        }
+        self.0.push_back(key);
+    }
+
+    /// Whether `key` was given up on; forgotten if so.
+    fn take(&mut self, key: (Link, [u8; 32])) -> bool {
+        let pos = self.0.iter().position(|k| *k == key);
+        pos.map(|p| self.0.remove(p)).is_some()
+    }
 }
 
 /// The most client Resources a local hub receives at once, all links.
@@ -1835,7 +1949,13 @@ pub fn resource_policy(
             } else if slots.len() >= HUB_RESOURCES {
                 Some(format!("{} come already", slots.len()))
             } else {
-                slots.insert((link, adv.resource_hash), adv.data_size as u64);
+                slots.insert(
+                    (link, adv.resource_hash),
+                    Slot {
+                        size: adv.data_size as u64,
+                        last: Instant::now(),
+                    },
+                );
                 None
             }
         };
@@ -2618,6 +2738,7 @@ pub async fn run(hub: LocalHub) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let (replayed, mut replays_done) = mpsc::unbounded_channel::<(Link, String, u64)>();
     let waiters = ResourceWaiters::default();
+    let mut given_up = GivenUp::default();
     let mut links = Links::new(
         HubSink {
             handle: handle.clone(),
@@ -2685,7 +2806,14 @@ pub async fn run(hub: LocalHub) {
                 tracing::info!("hub {tag}: link {} closed", hex::encode(link));
                 out
             }
-            _ = ticker.tick() => relay.tick_busy(now, &busy_sizes(&slots)),
+            _ = ticker.tick() => {
+                for (link, hash) in expire_slots(&slots, now) {
+                    given_up.add((link, hash));
+                    let why = format!("no word of it in {} s", resource::RESOURCE_TIMEOUT.as_secs());
+                    relay.client_resource_failed(link, &why);
+                }
+                relay.tick_busy(now, &busy_sizes(&slots))
+            }
             Some((link, room, id)) = replays_done.recv() => {
                 relay.replay_done(link, &room, id);
                 Vec::new()
@@ -2699,7 +2827,13 @@ pub async fn run(hub: LocalHub) {
                 while let Ok((data, from)) = events.link_packets.try_recv() {
                     out.extend(link_packet(&mut relay, &identities, &tag, from, &data));
                 }
-                if relay.is_allowed(&done.link_id) {
+                if given_up.take((done.link_id, done.resource_hash)) {
+                    // Counted when it was given up on; its envelope is gone.
+                    tracing::info!(
+                        "hub {tag}: a resource from client {} given up on came after all: dropped",
+                        hex::encode(done.link_id)
+                    );
+                } else if relay.is_allowed(&done.link_id) {
                     out.extend(relay.client_resource(done.link_id, done.data, now));
                 }
                 out
@@ -2709,17 +2843,24 @@ pub async fn run(hub: LocalHub) {
                 Vec::new()
             }
             Some(event) = events.resource_events.recv() => {
-                if let LinkResourceEvent::Concluded { link_id, resource_id, direction, conclusion } = event {
-                    let complete = conclusion == LinkResourceConclusion::Complete;
-                    match direction {
-                        LinkResourceDirection::Outbound => waiters.concluded(link_id, resource_id, complete),
-                        LinkResourceDirection::Inbound => {
-                            release_slot(&slots, link_id, resource_id);
-                            if !complete {
-                                relay.client_resource_failed(link_id, &format!("{conclusion:?}"));
+                match event {
+                    LinkResourceEvent::Concluded { link_id, resource_id, direction, conclusion } => {
+                        let complete = conclusion == LinkResourceConclusion::Complete;
+                        match direction {
+                            LinkResourceDirection::Outbound => waiters.concluded(link_id, resource_id, complete),
+                            LinkResourceDirection::Inbound => {
+                                release_slot(&slots, link_id, resource_id);
+                                if !complete && !given_up.take((link_id, resource_id)) {
+                                    relay.client_resource_failed(link_id, &format!("{conclusion:?}"));
+                                }
                             }
                         }
                     }
+                    LinkResourceEvent::Started { link_id, resource_id, direction: LinkResourceDirection::Inbound, .. }
+                    | LinkResourceEvent::Progress { link_id, resource_id, direction: LinkResourceDirection::Inbound, .. } => {
+                        touch_slot(&slots, link_id, resource_id, now);
+                    }
+                    _ => {}
                 }
                 Vec::new()
             }
@@ -3604,10 +3745,124 @@ mod tests {
         commands
             .iter()
             .map(|c| match c {
-                Command::SendPart(env) => env.clone(),
+                Command::SendPart(env, _) => env.clone(),
                 other => panic!("{other:?}"),
             })
             .collect()
+    }
+
+    fn part_of(command: &Command) -> Part {
+        match command {
+            Command::SendPart(_, part) => *part,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_part_cuts_its_notice_short_with_one_error() {
+        let mut f = fixture();
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.with_resources(A, &["lobby"]);
+        f.in_rooms(B, &["lobby"]);
+        let commands = f.commands_sent();
+        assert!(commands.is_empty());
+        f.client_notice(A, &long_text(20));
+        let commands = f.commands_sent();
+        let total = commands.len();
+        assert!(total > 2);
+        let parts: Vec<Part> = commands.iter().map(part_of).collect();
+        assert!(
+            parts
+                .iter()
+                .enumerate()
+                .all(|(i, p)| p.index == i && p.total == total && p.notice == parts[0].notice)
+        );
+        let envs = sends(&commands);
+        // Part 1 is echoed; the hub refuses part 2.
+        f.hub(envs[0].clone(), Inbound::Relay);
+        let text = "room is moderated (+m)";
+        let out = f.hub(hub_error(Some("lobby"), text), Inbound::HubError(text.into()));
+        assert_eq!(links(&out), vec![A]);
+        assert_eq!(
+            f.command(),
+            Some(Command::CutNotice(parts[1], "the hub refused part 2".into()))
+        );
+        // The session reports the rest dropped: the client hears it once.
+        let out = f.relay.upstream(
+            UpstreamEvent::PartsDropped {
+                notice: parts[0].notice,
+                unsent: total - 2,
+                total,
+                reason: "the hub refused part 2".into(),
+            },
+            f.now,
+        );
+        let sent = sent_to(&out);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            (sent[0].0, sent[0].1.t, sent[0].1.room.as_deref()),
+            (A, MessageType::Error, Some("lobby"))
+        );
+        assert_eq!(
+            sent[0].1.text_body().unwrap(),
+            format!(
+                "{} of {total} parts of the notice not sent: the hub refused part 2",
+                total - 2
+            )
+        );
+        // Its parts are not waited for any more: the next ERROR in the
+        // room is not put on them.
+        assert!(f.relay.sent.iter().all(|s| s.part.is_none()));
+    }
+
+    #[test]
+    fn a_long_notice_to_a_room_the_bouncer_is_not_in_is_refused() {
+        let mut f = fixture();
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.with_resources(A, &["lobby"]);
+        let text = long_text(20);
+        let env = resource::announce(&USER, resource::KIND_NOTICE, Some("Elsewhere"), text.as_bytes());
+        let mut out = f.packet(A, &env);
+        out.extend(f.relay.client_resource(A, text.into_bytes(), f.now));
+        let sent = sent_to(&out);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            (sent[0].0, sent[0].1.t, sent[0].1.room.as_deref()),
+            (A, MessageType::Error, Some("elsewhere"))
+        );
+        assert_eq!(
+            sent[0].1.text_body().as_deref(),
+            Some("notice not sent: a long notice goes only to a room the bouncer is in")
+        );
+        assert!(f.command().is_none());
+        assert_eq!(f.counts(), (0, 0, 1));
+    }
+
+    #[test]
+    fn a_long_notice_that_reads_as_a_command_is_guarded() {
+        let mut f = fixture();
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.with_resources(A, &["lobby"]);
+        let text = format!(
+            "/topic lobby {}\n/kick someone\n{}",
+            "x ".repeat(200),
+            "/part ".repeat(100)
+        );
+        assert!(sent_to(&f.client_notice(A, &text)).is_empty());
+        let parts = sends(&f.commands_sent());
+        assert!(parts.len() > 2);
+        assert!(parts[0].text_body().unwrap().starts_with("\u{200b}/topic"));
+        assert!(
+            parts
+                .iter()
+                .all(|p| !crate::envelope::is_command(&p.text_body().unwrap()))
+        );
+        // They wait for their echoes as room NOTICEs, not as commands.
+        assert!(f.relay.pending_commands.is_empty());
+        assert!(f.relay.sent.iter().all(|s| s.kind == Kind::Room));
     }
 
     #[test]
@@ -3705,6 +3960,66 @@ mod tests {
     }
 
     #[test]
+    fn a_resource_slot_with_no_word_is_given_up_once() {
+        let slots = ResourceSlots::default();
+        let now = Instant::now();
+        let quiet = (A, [1u8; 32]);
+        let busy = (A, [2u8; 32]);
+        let other = (B, [3u8; 32]);
+        for key in [quiet, busy, other] {
+            slots.lock().unwrap().insert(key, Slot { size: 10, last: now });
+        }
+        let half = resource::RESOURCE_TIMEOUT / 2;
+        // Heard of since: its clock starts again.
+        touch_slot(&slots, busy.0, busy.1, now + half);
+        touch_slot(&slots, other.0, other.1, now + half);
+        assert!(expire_slots(&slots, now + half).is_empty());
+        let gone = expire_slots(&slots, now + resource::RESOURCE_TIMEOUT);
+        assert_eq!(gone, vec![quiet]);
+        assert!(expire_slots(&slots, now + resource::RESOURCE_TIMEOUT).is_empty());
+        assert_eq!(busy_sizes(&slots).len(), 2);
+        let mut gone = expire_slots(&slots, now + half + resource::RESOURCE_TIMEOUT);
+        gone.sort();
+        assert_eq!(gone, vec![busy, other]);
+        assert!(slots.lock().unwrap().is_empty());
+        // A slot given up on is not counted again when it ends after all.
+        let mut given_up = GivenUp::default();
+        given_up.add(quiet);
+        assert!(given_up.take(quiet));
+        assert!(!given_up.take(quiet));
+        for i in 0..=MAX_GIVEN_UP {
+            given_up.add((A, [i as u8; 32]));
+        }
+        assert!(!given_up.take((A, [0; 32])));
+        assert!(given_up.take((A, [MAX_GIVEN_UP as u8; 32])));
+    }
+
+    #[test]
+    fn a_given_up_resource_is_counted_once_and_its_envelope_expires() {
+        let mut f = fixture();
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.with_resources(A, &["lobby"]);
+        let text = long_text(10);
+        let env = resource::announce(&USER, resource::KIND_NOTICE, Some("lobby"), text.as_bytes());
+        assert!(f.packet(A, &env).is_empty());
+        let size = text.len() as u64;
+        let slots = ResourceSlots::default();
+        slots.lock().unwrap().insert((A, [7; 32]), Slot { size, last: f.now });
+        // Busy: the envelope waits on past RESOURCE_TIMEOUT.
+        let later = f.now + resource::RESOURCE_TIMEOUT;
+        f.relay.tick_busy(later, &busy_sizes(&slots));
+        assert_eq!(f.relay.clients[&A].expected.len(), 1);
+        // Given up: counted once; the envelope then expires.
+        for (link, _) in expire_slots(&slots, later) {
+            f.relay.client_resource_failed(link, "no word of it in 120 s");
+        }
+        f.relay.tick_busy(later, &busy_sizes(&slots));
+        assert_eq!(f.relay.clients[&A].expected.len(), 0);
+        assert_eq!(f.counts(), (0, 0, 1));
+    }
+
+    #[test]
     fn a_client_resource_goes_all_or_nothing_when_the_queue_is_short() {
         let mut f = fixture_with(false, 2);
         f.up();
@@ -3724,8 +4039,9 @@ mod tests {
     fn a_client_resource_before_the_upstream_welcome_goes_as_a_short_notice_does() {
         // No session yet: the NOTICEs go to the session (which holds them
         // or reports them dropped) as a short NOTICE would, cut to the
-        // default max_msg_body_bytes.
+        // default max_msg_body_bytes. The room is in the room set.
         let mut f = fixture();
+        f.session.lock().unwrap().rooms.push("lobby".into());
         f.with_resources(A, &[]);
         let text = long_text(10);
         assert!(f.client_notice(A, &text).is_empty());

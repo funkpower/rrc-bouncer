@@ -665,21 +665,90 @@ impl EventReceiver {
     }
 }
 
-/// Client envelopes on their way to the hub, and when they came.
-/// Client envelopes, when each came, and whether it is a part to pace
-/// ([`Command::SendPart`]).
-type ClientQueue = VecDeque<(Envelope, Instant, bool)>;
+/// One part of a client's long notice ([`Command::SendPart`]): the
+/// relay's number for the notice, which part this is (from 0), and how
+/// many parts the notice has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Part {
+    pub notice: u64,
+    pub index: usize,
+    pub total: usize,
+}
 
-/// A part sent and not yet echoed: the room it was queued for, its id, and
-/// until when the room's next client envelope waits.
-type Echo = (Option<String>, Vec<u8>, Instant);
+/// Client envelopes on their way to the hub, when each came (moved on by
+/// the time its room waits for a part's echo, see `CLIENT_HOLD`), and the
+/// part of a long notice each is, if it is one.
+type ClientQueue = VecDeque<(Envelope, Instant, Option<Part>)>;
+
+/// A part sent and not yet echoed: its room as the hub names it, its id,
+/// and until when the echo is waited for.
+#[derive(Debug, Clone)]
+struct Echo {
+    room: Option<String>,
+    id: Vec<u8>,
+    until: Instant,
+    part: Part,
+}
+
+/// Whether a client envelope for `room` waits for a part's echo. Rooms
+/// are compared as the hub names them.
+fn waits_for_echo(echoes: &[Echo], room: Option<&str>) -> bool {
+    let room = room.and_then(crate::config::normalize_room);
+    echoes.iter().any(|e| e.room == room)
+}
 
 /// The first client envelope that may go: its room may be sent to and has
 /// no part waiting for its echo. Envelopes of one room go in order.
 fn next_client(client: &ClientQueue, echoes: &[Echo], may_send: impl Fn(Option<&str>) -> bool) -> Option<usize> {
     client
         .iter()
-        .position(|(e, _, _)| may_send(e.room.as_deref()) && !echoes.iter().any(|(room, _, _)| *room == e.room))
+        .position(|(e, _, _)| may_send(e.room.as_deref()) && !waits_for_echo(echoes, e.room.as_deref()))
+}
+
+/// Mark a long notice cut short from its part `from` on, and take its
+/// parts out of the queue: how many were taken out, and how many of its
+/// parts are not sent.
+fn cut_queue(client: &mut ClientQueue, cut: &mut Cut, part: Part, from: usize) -> (u64, usize) {
+    cut.add(part.notice);
+    let before = client.len();
+    client.retain(|(_, _, p)| p.is_none_or(|p| p.notice != part.notice));
+    ((before - client.len()) as u64, part.total.saturating_sub(from))
+}
+
+/// Move on the time each client envelope has waited by `waited` while its
+/// room waits for a part's echo: that wait is the notice's, and does not
+/// count towards `CLIENT_HOLD`.
+fn pause_hold(client: &mut ClientQueue, echoes: &[Echo], waited: Duration) {
+    if echoes.is_empty() {
+        return;
+    }
+    for (env, at, _) in client {
+        if waits_for_echo(echoes, env.room.as_deref()) {
+            *at += waited;
+        }
+    }
+}
+
+/// The long notices cut short lately, the last `CUT_MEMORY`: their parts
+/// still to come are dropped as they come.
+#[derive(Debug, Default)]
+struct Cut(VecDeque<u64>);
+
+const CUT_MEMORY: usize = 64;
+
+impl Cut {
+    fn has(&self, notice: u64) -> bool {
+        self.0.contains(&notice)
+    }
+
+    fn add(&mut self, notice: u64) {
+        if !self.has(notice) {
+            if self.0.len() >= CUT_MEMORY {
+                self.0.pop_front();
+            }
+            self.0.push_back(notice);
+        }
+    }
 }
 
 /// What the rest of the bouncer can ask of an upstream session.
@@ -696,8 +765,14 @@ pub enum Command {
     /// rrcd handles each packet on a thread of its own, so parts sent back
     /// to back can reach the room out of order: once a part is sent, the
     /// next client envelope of its room waits until the hub echoes the
-    /// part (its `K_ID` back) or `ECHO_WAIT` has passed.
-    SendPart(Envelope),
+    /// part (its `K_ID` back). A part not echoed in `ECHO_WAIT`, or not
+    /// sent, cuts the notice short: its parts not yet sent are dropped,
+    /// counted in `dropped_sends`, and reported once, as
+    /// [`UpstreamEvent::PartsDropped`].
+    SendPart(Envelope, Part),
+    /// The hub refused this part of a long notice: the parts after it are
+    /// dropped as above, and its room waits no more.
+    CutNotice(Part, String),
     /// Add a room to the hub's room set (saved) and join it.
     Join(String),
     /// Take a room out of the room set and leave it. A room from the config
@@ -718,6 +793,14 @@ pub enum UpstreamEvent {
     /// A client envelope from [`Command::Send`] that was not sent, and why;
     /// its `id` is the client's.
     SendDropped { envelope: Envelope, reason: String },
+    /// A long notice cut short: `unsent` of its `total` parts were not
+    /// sent, and why.
+    PartsDropped {
+        notice: u64,
+        unsent: usize,
+        total: usize,
+        reason: String,
+    },
     /// A RESOURCE_ENVELOPE from the hub and the Resource it announced,
     /// whose size and sha256 agree with it.
     Resource { envelope: Envelope, data: Arc<Vec<u8>> },
@@ -736,7 +819,7 @@ impl UpstreamEvent {
                     | Inbound::PartConfirmed(_)
                     | Inbound::Removed { .. }
             ),
-            Self::SendDropped { .. } | Self::Resource { .. } => false,
+            Self::SendDropped { .. } | Self::PartsDropped { .. } | Self::Resource { .. } => false,
         }
     }
 }
@@ -841,10 +924,11 @@ pub const CLIENT_QUEUE: usize = 256;
 /// A client envelope held this long (its room not joined yet) is dropped:
 /// a chat line sent much later than it was written is worse than none.
 pub const CLIENT_HOLD: Duration = Duration::from_secs(60);
-/// How long the next client envelope of a room waits for the hub's echo of
-/// a part ([`Command::SendPart`]) before it goes anyway. 16 parts the hub
-/// never echoes then take 32 s, inside `CLIENT_HOLD`.
-pub const ECHO_WAIT: Duration = Duration::from_secs(2);
+/// How long the hub's echo of a part ([`Command::SendPart`]) is waited for
+/// before the notice is cut short. Long enough for a slow path's round
+/// trip; the time a room waits for an echo does not count towards
+/// `CLIENT_HOLD` for what waits behind it.
+pub const ECHO_WAIT: Duration = Duration::from_secs(10);
 /// The longest local hub name, in bytes. The announce app data
 /// `{"proto": "rrc", "v": 1, "hub": name}` is then at most 120 bytes,
 /// well inside an announce's room for it.
@@ -963,13 +1047,55 @@ impl Upstream {
         });
     }
 
-    /// Queue a client envelope for the hub.
-    fn queue_client(&self, client: &mut ClientQueue, env: Envelope, paced: bool) {
-        if client.len() >= CLIENT_QUEUE {
+    /// A client envelope that will not be sent; a part cuts its notice
+    /// short from itself on.
+    fn drop_client(&self, client: &mut ClientQueue, cut: &mut Cut, env: Envelope, part: Option<Part>, reason: &str) {
+        let Some(part) = part else {
+            return self.drop_send(env, reason);
+        };
+        self.tally(|s| s.dropped_sends += 1);
+        if cut.has(part.notice) {
+            tracing::debug!(
+                "upstream {}: dropped part {} of a notice cut short",
+                self.tag(),
+                part.index + 1
+            );
+            return;
+        }
+        self.cut_notice(client, cut, part, part.index, reason);
+    }
+
+    /// Cut a long notice short from its part `from` on: its parts waiting
+    /// are dropped, and those still to come as they come; the relay hears
+    /// once how many were not sent.
+    fn cut_notice(&self, client: &mut ClientQueue, cut: &mut Cut, part: Part, from: usize, reason: &str) {
+        let (dropped, unsent) = cut_queue(client, cut, part, from);
+        self.tally(|s| s.dropped_sends += dropped);
+        tracing::info!(
+            "upstream {}: a long notice cut short, {unsent} of {} parts not sent: {reason}",
+            self.tag(),
+            part.total
+        );
+        if unsent > 0 {
+            self.emit(UpstreamEvent::PartsDropped {
+                notice: part.notice,
+                unsent,
+                total: part.total,
+                reason: reason.into(),
+            });
+        }
+    }
+
+    /// Queue a client envelope for the hub; a part of a notice cut short
+    /// is dropped.
+    fn queue_client(&self, client: &mut ClientQueue, cut: &mut Cut, env: Envelope, part: Option<Part>) {
+        if part.is_some_and(|p| cut.has(p.notice)) {
+            self.drop_client(client, cut, env, part, "cut short");
+        } else if client.len() >= CLIENT_QUEUE {
             tracing::warn!("upstream {}: client queue full, dropped a {:?}", self.tag(), env.t);
-            self.drop_send(env, "the queue is full");
+            self.drop_client(client, cut, env, part, "the bouncer's queue is full");
         } else {
-            client.push_back((env, Instant::now(), paced));
+            client.push_back((env, Instant::now(), part));
         }
     }
 
@@ -1000,9 +1126,13 @@ impl Upstream {
     }
 
     /// A command while there is no session: the room set still changes.
-    fn command_offline(&mut self, command: Command) {
+    fn command_offline(&mut self, cut: &mut Cut, command: Command) {
         match command {
-            Command::Send(env) | Command::SendPart(env) => self.drop_send(env, "not connected"),
+            Command::Send(env) => self.drop_send(env, "not connected"),
+            Command::SendPart(env, part) => {
+                self.drop_client(&mut ClientQueue::new(), cut, env, Some(part), "not connected")
+            }
+            Command::CutNotice(..) => {}
             Command::Join(room) => {
                 self.add_room(&room);
             }
@@ -1064,6 +1194,7 @@ impl Upstream {
         mut link: LinkSession,
         commands: &mut mpsc::Receiver<Command>,
         shutdown: &mut watch::Receiver<bool>,
+        cut: &mut Cut,
     ) -> Ended {
         let tag = self.tag();
         let started = Instant::now();
@@ -1083,9 +1214,9 @@ impl Upstream {
         let mut control: VecDeque<Envelope> = VecDeque::new();
         // Client envelopes and when they came.
         let mut client: ClientQueue = VecDeque::new();
-        // Parts sent and not yet echoed: the room they were queued for,
-        // their id, and until when the room's next envelope waits.
+        // Parts sent and not yet echoed.
         let mut echoes: Vec<Echo> = Vec::new();
+        let mut last_turn = started;
         // RESOURCE_ENVELOPEs from the hub waiting for their Resource (and
         // finished Resources waiting for theirs); offers waiting for their
         // RESOURCE_ENVELOPE (the two come on different channels); the
@@ -1103,17 +1234,30 @@ impl Upstream {
         let (reason, shut) = 'link: loop {
             control.extend(session.take_outbox());
             let now = Instant::now();
-            // The queue is in arrival order: what was held too long is at
-            // its front.
-            while client
-                .front()
-                .is_some_and(|(_, at, _)| now.saturating_duration_since(*at) >= CLIENT_HOLD)
+            // The time a room waited for a part's echo is not counted
+            // against what waits for that room.
+            pause_hold(&mut client, &echoes, now.saturating_duration_since(last_turn));
+            last_turn = now;
+            while let Some(pos) = client
+                .iter()
+                .position(|(_, at, _)| now.saturating_duration_since(*at) >= CLIENT_HOLD)
             {
-                if let Some((env, _, _)) = client.pop_front() {
-                    self.drop_send(env, "held too long: its room was not joined");
+                if let Some((env, _, part)) = client.remove(pos) {
+                    self.drop_client(&mut client, cut, env, part, "held too long: its room was not joined");
                 }
             }
-            echoes.retain(|(_, _, until)| now < *until);
+            let (late, waiting): (Vec<Echo>, Vec<Echo>) = echoes.drain(..).partition(|e| now >= e.until);
+            echoes = waiting;
+            for echo in late {
+                if !cut.has(echo.part.notice) {
+                    let reason = format!(
+                        "no echo of part {} from the hub in {} s",
+                        echo.part.index + 1,
+                        ECHO_WAIT.as_secs()
+                    );
+                    self.cut_notice(&mut client, cut, echo.part, echo.part.index + 1, &reason);
+                }
+            }
             // Send what the bucket allows: the bouncer's own envelopes
             // first, then the clients' that may go (in order per room).
             while send_at.is_none_or(|at| now >= at) {
@@ -1130,18 +1274,23 @@ impl Upstream {
                     break;
                 }
                 send_at = None;
-                let (env, paced) = match pick {
-                    None => (control.pop_front(), false),
+                let (env, part) = match pick {
+                    None => (control.pop_front(), None),
                     Some(pos) => client
                         .remove(pos)
-                        .map_or((None, false), |(env, _, paced)| (Some(env), paced)),
+                        .map_or((None, None), |(env, _, part)| (Some(env), part)),
                 };
                 let Some(env) = env else { break };
                 match link.handle.send_packet(env.encode()).await {
                     Ok(_) => {
                         tracing::debug!("upstream {tag}: sent {:?} room={:?}", env.t, env.room);
-                        if paced {
-                            echoes.push((env.room.clone(), env.id.clone(), now + ECHO_WAIT));
+                        if let Some(part) = part {
+                            echoes.push(Echo {
+                                room: env.room.as_deref().and_then(crate::config::normalize_room),
+                                id: env.id.clone(),
+                                until: now + ECHO_WAIT,
+                                part,
+                            });
                         }
                     }
                     Err(LinkSessionError::PayloadTooLarge { actual, max }) => {
@@ -1150,12 +1299,13 @@ impl Upstream {
                             env.t
                         );
                         if pick.is_some() {
-                            self.drop_send(env, &format!("{actual} bytes is more than the link carries ({max})"));
+                            let reason = format!("{actual} bytes is more than the link carries ({max})");
+                            self.drop_client(&mut client, cut, env, part, &reason);
                         }
                     }
                     Err(e) => {
                         if pick.is_some() {
-                            self.drop_send(env, "the link ended");
+                            self.drop_client(&mut client, cut, env, part, "the link ended");
                         }
                         break 'link (format!("send failed: {e}"), false);
                     }
@@ -1173,7 +1323,7 @@ impl Upstream {
                                 continue;
                             }
                         };
-                        echoes.retain(|(_, id, _)| *id != env.id);
+                        echoes.retain(|e| e.id != env.id);
                         if env.t == MessageType::ResourceEnvelope {
                             session.handle(&env, Instant::now());
                             // An envelope is not counted: its Resource is,
@@ -1254,8 +1404,14 @@ impl Upstream {
                     }
                 }
                 command = commands.recv(), if commands_open => match command {
-                    Some(Command::Send(env)) => self.queue_client(&mut client, env, false),
-                    Some(Command::SendPart(env)) => self.queue_client(&mut client, env, true),
+                    Some(Command::Send(env)) => self.queue_client(&mut client, cut, env, None),
+                    Some(Command::SendPart(env, part)) => self.queue_client(&mut client, cut, env, Some(part)),
+                    Some(Command::CutNotice(part, reason)) => {
+                        echoes.retain(|e| e.part.notice != part.notice);
+                        if !cut.has(part.notice) {
+                            self.cut_notice(&mut client, cut, part, part.index + 1, &reason);
+                        }
+                    }
                     Some(Command::Join(room)) => {
                         self.add_room(&room);
                         if let Some(room) = crate::config::normalize_room(&room) {
@@ -1317,8 +1473,8 @@ impl Upstream {
             link.handle.close().await;
             drain_until_closed(&mut link).await;
         }
-        for (env, _, _) in client {
-            self.drop_send(env, "the link ended");
+        while let Some((env, _, part)) = client.pop_front() {
+            self.drop_client(&mut client, cut, env, part, "the link ended");
         }
         // Resources still on the way go with the link; the counts say so.
         // An envelope whose Resource never started is not a Resource.
@@ -1387,6 +1543,7 @@ impl Upstream {
         delay: Duration,
         commands: &mut mpsc::Receiver<Command>,
         shutdown: &mut watch::Receiver<bool>,
+        cut: &mut Cut,
     ) -> bool {
         self.update(|s| {
             s.state = "waiting".into();
@@ -1396,7 +1553,7 @@ impl Upstream {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => return true,
-                Some(command) = commands.recv() => self.command_offline(command),
+                Some(command) = commands.recv() => self.command_offline(cut, command),
                 _ = shutdown.changed() => return false,
             }
         }
@@ -1451,6 +1608,7 @@ async fn drain_until_closed(link: &mut LinkSession) {
 pub async fn run(mut up: Upstream, mut commands: mpsc::Receiver<Command>, mut shutdown: watch::Receiver<bool>) {
     let tag = up.tag();
     let mut backoff = Backoff::new(up.timings.backoff_initial, up.timings.backoff_max);
+    let mut cut = Cut::default();
     up.show_room_set();
     loop {
         up.update(|s| {
@@ -1469,7 +1627,7 @@ pub async fn run(mut up: Upstream, mut commands: mpsc::Receiver<Command>, mut sh
                     "upstream {tag}: link {} established",
                     hex::encode(link.handle.link_id())
                 );
-                let ended = up.drive(link, &mut commands, &mut shutdown).await;
+                let ended = up.drive(link, &mut commands, &mut shutdown, &mut cut).await;
                 if ended.welcomed_for.is_some() {
                     up.emit(UpstreamEvent::Down);
                 }
@@ -1512,7 +1670,7 @@ pub async fn run(mut up: Upstream, mut commands: mpsc::Receiver<Command>, mut sh
         }
         let delay = backoff.next_delay();
         tracing::info!("upstream {tag}: connecting again in {:.1}s", delay.as_secs_f64());
-        if !up.wait(delay, &mut commands, &mut shutdown).await {
+        if !up.wait(delay, &mut commands, &mut shutdown, &mut cut).await {
             break;
         }
     }
@@ -2103,23 +2261,105 @@ mod tests {
         assert!(tx.send(traffic()));
     }
 
+    fn part(notice: u64, index: usize, total: usize) -> Option<Part> {
+        Some(Part { notice, index, total })
+    }
+
+    fn echo_of(env: &Envelope, part: Option<Part>, until: Instant) -> Echo {
+        Echo {
+            room: env.room.as_deref().and_then(crate::config::normalize_room),
+            id: env.id.clone(),
+            until,
+            part: part.unwrap(),
+        }
+    }
+
     #[test]
     fn a_room_waits_for_the_echo_of_its_part_and_others_go_on() {
         let now = Instant::now();
         let notice = |room: &str| Envelope::new(MessageType::Notice, &USER).with_room(room);
         let client: ClientQueue = [
-            (notice("a"), now, true),
-            (notice("a"), now, false),
-            (notice("b"), now, false),
+            (notice("a"), now, part(1, 0, 2)),
+            (notice("a"), now, None),
+            (notice("b"), now, None),
         ]
         .into();
         let all = |_: Option<&str>| true;
         assert_eq!(next_client(&client, &[], all), Some(0));
         // The first part went and is not echoed: room a waits, b goes.
-        let echoes = vec![(Some("a".to_string()), client[0].0.id.clone(), now + ECHO_WAIT)];
+        let echoes = vec![echo_of(&client[0].0, client[0].2, now + ECHO_WAIT)];
         let client: ClientQueue = client.into_iter().skip(1).collect();
         assert_eq!(next_client(&client, &echoes, all), Some(1));
         // Room b may not be sent to either: nothing goes.
         assert_eq!(next_client(&client, &echoes, |room| room != Some("b")), None);
+    }
+
+    #[test]
+    fn rooms_are_compared_as_the_hub_names_them() {
+        let now = Instant::now();
+        let notice = |room: &str| Envelope::new(MessageType::Notice, &USER).with_room(room);
+        let first = notice(" Lobby");
+        let echoes = vec![echo_of(&first, part(1, 0, 2), now + ECHO_WAIT)];
+        assert_eq!(echoes[0].room.as_deref(), Some("lobby"));
+        let client: ClientQueue = [
+            (notice("LOBBY"), now, None),
+            (notice("lobby "), now, None),
+            (notice("other"), now, None),
+        ]
+        .into();
+        assert_eq!(next_client(&client, &echoes, |_| true), Some(2));
+    }
+
+    #[test]
+    fn a_notice_cut_short_leaves_the_queue_once() {
+        let now = Instant::now();
+        let notice = |room: &str| Envelope::new(MessageType::Notice, &USER).with_room(room);
+        let mut client: ClientQueue = [
+            (notice("a"), now, part(7, 1, 4)),
+            (notice("a"), now, None),
+            (notice("a"), now, part(7, 2, 4)),
+            (notice("a"), now, part(8, 0, 2)),
+            (notice("a"), now, part(7, 3, 4)),
+        ]
+        .into();
+        let mut cut = Cut::default();
+        // Part 1 (from 0) of notice 7 was refused: parts 2 to 4 go.
+        assert_eq!(cut_queue(&mut client, &mut cut, part(7, 0, 4).unwrap(), 1), (3, 3));
+        assert!(cut.has(7) && !cut.has(8));
+        assert_eq!(
+            client.iter().map(|(_, _, p)| p.map(|p| p.notice)).collect::<Vec<_>>(),
+            [None, Some(8)]
+        );
+        // The last part refused: nothing left unsent.
+        assert_eq!(cut_queue(&mut client, &mut cut, part(9, 2, 3).unwrap(), 3), (0, 0));
+        // A part that is itself not sent counts too.
+        assert_eq!(cut_queue(&mut client, &mut cut, part(8, 0, 2).unwrap(), 0), (1, 2));
+        assert_eq!(client.len(), 1);
+        // Only the last CUT_MEMORY notices are remembered.
+        for n in 100..100 + CUT_MEMORY as u64 {
+            cut.add(n);
+        }
+        assert!(!cut.has(7) && cut.has(100) && cut.has(99 + CUT_MEMORY as u64));
+    }
+
+    #[test]
+    fn a_room_waiting_for_an_echo_does_not_use_up_the_hold() {
+        let now = Instant::now();
+        let notice = |room: &str| Envelope::new(MessageType::Notice, &USER).with_room(room);
+        let sent = notice("A");
+        let echoes = vec![echo_of(&sent, part(1, 0, 3), now + ECHO_WAIT)];
+        let mut client: ClientQueue = [
+            (notice("a"), now, part(1, 1, 3)),
+            (notice("a "), now, None),
+            (notice("b"), now, None),
+        ]
+        .into();
+        let waited = Duration::from_secs(9);
+        pause_hold(&mut client, &echoes, waited);
+        let ats: Vec<Instant> = client.iter().map(|(_, at, _)| *at).collect();
+        assert_eq!(ats, [now + waited, now + waited, now]);
+        // Nothing waits for an echo: nothing moves.
+        pause_hold(&mut client, &[], waited);
+        assert_eq!(client[2].1, now);
     }
 }

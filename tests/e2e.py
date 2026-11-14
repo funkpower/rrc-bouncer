@@ -1043,6 +1043,8 @@ LONG = "\n".join(f"line {i:02d} of a long notice to res, sent as notices — ✓
 # most parts the bouncer cuts a client's long notice into.
 MAX_BODY = 350
 MAX_PARTS = 16
+GUARD = "\u200b"
+ECHO_WAIT = 10
 
 
 def resources(run, name, since=0):
@@ -1208,6 +1210,95 @@ def resource_phases(run, args, port_r, upstream, user, local, env, found):
     hub = run.wait_status(upstream, lambda h: h["client_resource_drops"] > before["client_resource_drops"], STATUS_TICK)
     check(hub["client_resource_drops"] == before["client_resource_drops"] + 1
           and hub["client_resources_in"] == before["client_resources_in"]
+          and hub["relayed_in"] == before["relayed_in"],
+          "status.json: client_resource_drops one more, nothing relayed")
+
+    print("resource: a long notice whose text and lines read as commands", flush=True)
+    commands = "\n".join(["/topic res not a topic"] +
+                          [f"/kick dee, line {i:02d} of a notice whose lines read as commands" for i in range(1, 25)])
+    before = run.status(upstream)
+    forwarded = run.log("H").count("Forwarded t=21")
+    since = time.time()
+    command(run, "RA", op="resource", room="res", text=commands)
+    run.wait_event("RD", lambda e: e["event"] == "env" and e["t"] == 21 and e["at"] >= since
+                   and e["body"].endswith("line 24 of a notice whose lines read as commands"), 60)
+    time.sleep(1)
+    got = [e["body"] for e in in_order(envs(run, "RD", t=21, room="res", src=user)) if e["at"] >= since]
+    found["resource_commands"] = got
+
+    def rejoins(parts, text):
+        """The parts are the text in order, the guard aside, each cut
+        leaving out at most one space or newline."""
+        at = 0
+        for part in parts:
+            part = part.removeprefix(GUARD)
+            if not text.startswith(part, at):
+                return False
+            at += len(part)
+            if at < len(text) and text[at].isspace():
+                at += 1
+        return at == len(text)
+
+    check(len(got) > 1 and got[0].startswith(GUARD + "/topic res"),
+          f"RD gets it as {len(got)} NOTICEs, the first starting with U+200B then \"/topic\"")
+    check(not [p for p in got if p.strip().startswith("/")],
+          "no part starts with \"/\" as rrcd strips it, so none is taken as a command")
+    check(rejoins(got, commands), "the parts are the text, in order, cut at a newline or a space")
+    check(run.log("H").count("Forwarded t=21") == forwarded + len(got), f"rrcd forwarded all {len(got)}")
+    check(not [e for name in ("RA", "RD") for e in envs(run, name, t=40) if e["at"] >= since],
+          "no ERROR to RA or RD (no \"unrecognized command\", no \"not authorized\")")
+    hub = run.wait_status(upstream, lambda h: h["relayed_in"] >= before["relayed_in"] + len(got), STATUS_TICK)
+    check(hub["relayed_in"] == before["relayed_in"] + len(got) and hub["dropped_sends"] == before["dropped_sends"],
+          f"status.json: relayed_in {len(got)} more, no dropped_sends")
+
+    print("resource: a long notice the hub refuses is cut short with one ERROR", flush=True)
+    command(run, "RD", op="join", room="mod")
+    check(wait_env(run, "RD", 40, t=11, room="mod") is not None, "RD founds mod")
+    command(run, "RD", op="send", t=20, room="mod", body="/mode mod +m")
+    time.sleep(2)
+    command(run, "RA", op="join", room="mod")
+    check(wait_env(run, "RA", 40, t=11, room="mod") is not None, "RA joins mod through the bouncer")
+    hub = run.wait_status(upstream, lambda h: "mod" in h["rooms_joined"], 30)
+    check("mod" in hub["rooms_joined"], "the bouncer is in mod")
+    parts = notice_parts(LONG)
+    before = run.status(upstream)
+    forwarded = run.log("H").count("Forwarded t=21")
+    since = time.time()
+    command(run, "RA", op="resource", room="mod", text=LONG)
+    summary = f"{len(parts) - 1} of {len(parts)} parts of the notice not sent: the hub refused part 1"
+    run.wait_event("RA", lambda e: e["event"] == "env" and e["t"] == 40 and e["at"] >= since
+                   and e["body"] == summary, 30)
+    time.sleep(ECHO_WAIT + 2)
+    errors = [e for e in envs(run, "RA", t=40) if e["at"] >= since]
+    found["resource_cut_short"] = errors
+    check([e["body"] for e in errors] == ["room is moderated (+m)", summary]
+          and all(e["room"] == "mod" and e["src"] == hub_id for e in errors),
+          f"RA gets the hub's ERROR \"room is moderated (+m)\" and one ERROR \"{summary}\", in mod")
+    check(not [e for e in envs(run, "RD", t=21, room="mod") if e["at"] >= since], "RD gets no part")
+    check(run.log("H").count("Forwarded t=21") == forwarded, "rrcd forwarded nothing")
+    hub = run.wait_status(upstream, lambda h: h["dropped_sends"] >= before["dropped_sends"] + len(parts) - 1,
+                          STATUS_TICK)
+    check(hub["dropped_sends"] == before["dropped_sends"] + len(parts) - 1,
+          f"status.json: dropped_sends {len(parts) - 1} more (the parts not sent)")
+    ident = os.urandom(8).hex()
+    command(run, "RD", op="send", id=ident, t=20, room="res", body="res goes on after mod refused")
+    check(wait_env(run, "RA", 20, t=20, room="res", body="res goes on after mod refused") is not None,
+          "res goes on: RD's next message reaches RA")
+
+    print("resource: a long notice to a room the bouncer is not in", flush=True)
+    before = run.status(upstream)
+    forwarded = run.log("H").count("Forwarded t=21")
+    since = time.time()
+    command(run, "RA", op="resource", room="elsewhere", text=LONG)
+    error = run.wait_event("RA", lambda e: e["event"] == "env" and e["t"] == 40 and e["at"] >= since, 30)
+    found["resource_not_in_room"] = error
+    check(error is not None and error["src"] == hub_id and error["room"] == "elsewhere"
+          and error["body"] == "notice not sent: a long notice goes only to a room the bouncer is in",
+          f"RA gets ERROR \"{error and error['body']}\" in elsewhere")
+    time.sleep(3)
+    check(run.log("H").count("Forwarded t=21") == forwarded, "rrcd forwarded nothing")
+    hub = run.wait_status(upstream, lambda h: h["client_resource_drops"] > before["client_resource_drops"], STATUS_TICK)
+    check(hub["client_resource_drops"] == before["client_resource_drops"] + 1
           and hub["relayed_in"] == before["relayed_in"],
           "status.json: client_resource_drops one more, nothing relayed")
 

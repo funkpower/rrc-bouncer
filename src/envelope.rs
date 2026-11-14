@@ -167,6 +167,19 @@ pub fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// Whitespace as rrcd's Python sees it (`str.isspace`, what `strip()`
+/// takes off): Unicode White_Space, and U+001C to U+001F.
+pub fn rrcd_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// Whether rrcd takes a MSG or NOTICE body as a slash command:
+/// `body.strip().startswith("/")` (`router.py` `_handle_message`). It has
+/// no escape for a text that starts with "/".
+pub fn is_command(text: &str) -> bool {
+    text.trim_start_matches(rrcd_space).starts_with('/')
+}
+
 impl Envelope {
     /// A new envelope with a random 8-byte id, stamped now.
     pub fn new(t: MessageType, src: &[u8]) -> Self {
@@ -752,6 +765,32 @@ mod tests {
         0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
     ];
     const TS: u64 = 1_763_000_000_000;
+
+    #[test]
+    fn a_command_is_what_rrcd_strips_to_a_slash() {
+        // Python's str.isspace, as CPython 3.14 has it.
+        let python: Vec<u32> = [
+            0x9..=0xd,
+            0x1c..=0x20,
+            0x85..=0x85,
+            0xa0..=0xa0,
+            0x1680..=0x1680,
+            0x2000..=0x200a,
+        ]
+        .into_iter()
+        .flatten()
+        .chain([0x2028, 0x2029, 0x202f, 0x205f, 0x3000])
+        .collect();
+        for c in (0..=0x10ffff).filter_map(char::from_u32) {
+            assert_eq!(rrcd_space(c), python.contains(&(c as u32)), "{:#x}", c as u32);
+        }
+        for text in ["/me", "  /me", "\u{1c}/x", "\u{3000}\t/x", "/"] {
+            assert!(is_command(text), "{text:?}");
+        }
+        for text in ["me /x", "\u{200b}/me", "", "  ", "a"] {
+            assert!(!is_command(text), "{text:?}");
+        }
+    }
 
     /// Envelopes made by rrcd's `make_envelope` and encoded by its codec
     /// (`tests/fixtures/make_envelopes.py`).
