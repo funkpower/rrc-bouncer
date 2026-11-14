@@ -19,17 +19,18 @@ use tokio::sync::{Notify, mpsc, watch};
 use crate::bouncer::{hub_app_data, now};
 use crate::envelope::{Caps, Envelope, Limits, MessageType, RRC_VERSION, Raw, Welcome};
 use crate::rate::TokenBucket;
+use crate::resource::{self, Expectations, Matched};
 use crate::rooms::RoomSet;
 
 /// The client name in the bouncer's HELLO.
 pub const CLIENT_NAME: &str = "rrc-bouncer";
 
-/// What the bouncer says it can do. `resource_envelope` stays off until
-/// the bouncer relays Resources (M5). ACTION and direct NOTICE are plain
-/// envelopes the relay passes on (M3). rrcd keeps a client's caps but does
-/// not act on them.
+/// What the bouncer says it can do: it takes and sends Resources
+/// (DESIGN.md § Resources), and ACTION and direct NOTICE are plain
+/// envelopes the relay passes on. rrcd keeps a client's caps but does not
+/// act on them.
 pub const CAPS: Caps = Caps {
-    resource_envelope: false,
+    resource_envelope: true,
     action: true,
     direct_notice: true,
 };
@@ -664,6 +665,10 @@ impl EventReceiver {
     }
 }
 
+/// Client envelopes on their way to the hub (with the Resource a
+/// RESOURCE_ENVELOPE announces), and when they came.
+type ClientQueue = VecDeque<(Envelope, Option<Arc<Vec<u8>>>, Instant)>;
+
 /// What the rest of the bouncer can ask of an upstream session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -674,6 +679,10 @@ pub enum Command {
     /// envelope is counted in `dropped_sends` and reported as
     /// [`UpstreamEvent::SendDropped`].
     Send(Envelope),
+    /// Send a client's RESOURCE_ENVELOPE upstream and then `data` as a
+    /// Resource on the same link, as [`Command::Send`] holds and drops it.
+    /// One Resource is sent at a time.
+    SendResource { envelope: Envelope, data: Arc<Vec<u8>> },
     /// Add a room to the hub's room set (saved) and join it.
     Join(String),
     /// Take a room out of the room set and leave it. A room from the config
@@ -694,6 +703,9 @@ pub enum UpstreamEvent {
     /// A client envelope from [`Command::Send`] that was not sent, and why;
     /// its `id` is the client's.
     SendDropped { envelope: Envelope, reason: String },
+    /// A RESOURCE_ENVELOPE from the hub and the Resource it announced,
+    /// whose size and sha256 agree with it.
+    Resource { envelope: Envelope, data: Arc<Vec<u8>> },
 }
 
 impl UpstreamEvent {
@@ -709,7 +721,7 @@ impl UpstreamEvent {
                     | Inbound::PartConfirmed(_)
                     | Inbound::Removed { .. }
             ),
-            Self::SendDropped { .. } => false,
+            Self::SendDropped { .. } | Self::Resource { .. } => false,
         }
     }
 }
@@ -762,13 +774,23 @@ pub struct UpstreamStatus {
     /// Connection attempts that did not get a WELCOME.
     pub failed_attempts: u64,
     pub next_attempt_at: Option<f64>,
-    /// Envelopes from the hub nothing in the bouncer consumes yet, by type.
+    /// Envelopes from the hub with no relay to take them, by type.
     pub unhandled: BTreeMap<String, u64>,
     /// Client envelopes not sent: no link, the queue full, held too long,
     /// or still queued when the link ended.
     pub dropped_sends: u64,
     /// Events the relay did not take in time (its channel was full).
     pub dropped_events: u64,
+    /// Resources from the hub received whole and matching their
+    /// RESOURCE_ENVELOPE.
+    pub resources_in: u64,
+    /// Client Resources the hub received whole.
+    pub resources_out: u64,
+    /// Resources from the hub dropped: refused (too large, split, a
+    /// request, too many at once), unannounced, a size or sha256 other
+    /// than announced, failed or timed out; and RESOURCE_ENVELOPEs whose
+    /// Resource never came or that were malformed.
+    pub resource_drops: u64,
 }
 
 pub type SharedStatus = Arc<Mutex<UpstreamStatus>>;
@@ -924,6 +946,22 @@ impl Upstream {
         });
     }
 
+    /// Queue a client envelope for the hub.
+    fn queue_client(&self, client: &mut ClientQueue, env: Envelope, data: Option<Arc<Vec<u8>>>) {
+        if client.len() >= CLIENT_QUEUE {
+            tracing::warn!("upstream {}: client queue full, dropped a {:?}", self.tag(), env.t);
+            self.drop_send(env, "the queue is full");
+        } else {
+            client.push_back((env, data, Instant::now()));
+        }
+    }
+
+    /// A Resource from the hub that will not reach the relay.
+    fn drop_resource(&self, reason: &str) {
+        tracing::warn!("upstream {}: dropped a resource: {reason}", self.tag());
+        self.tally(|s| s.resource_drops += 1);
+    }
+
     fn count_unhandled(&self, t: MessageType) {
         self.tally(|s| *s.unhandled.entry(type_name(t)).or_default() += 1);
     }
@@ -931,7 +969,7 @@ impl Upstream {
     /// A command while there is no session: the room set still changes.
     fn command_offline(&mut self, command: Command) {
         match command {
-            Command::Send(env) => self.drop_send(env, "not connected"),
+            Command::Send(env) | Command::SendResource { envelope: env, .. } => self.drop_send(env, "not connected"),
             Command::Join(room) => {
                 self.add_room(&room);
             }
@@ -1010,8 +1048,19 @@ impl Upstream {
         // its default until the WELCOME says otherwise.
         let mut bucket = TokenBucket::new(Limits::default().rate_limit_msgs_per_minute, started);
         let mut control: VecDeque<Envelope> = VecDeque::new();
-        // Client envelopes and when they came.
-        let mut client: VecDeque<(Envelope, Instant)> = VecDeque::new();
+        // Client envelopes (with the Resource a RESOURCE_ENVELOPE
+        // announces) and when they came.
+        let mut client: ClientQueue = VecDeque::new();
+        // The client Resource being sent: one at a time.
+        let mut sending = false;
+        let (sent_tx, mut sent_rx) = mpsc::channel::<(Envelope, Result<(), String>)>(4);
+        // RESOURCE_ENVELOPEs from the hub waiting for their Resource;
+        // offers waiting for their RESOURCE_ENVELOPE (the two come on
+        // different channels); Resources being received.
+        let mut expected = Expectations::default();
+        let mut offers: Vec<(LinkSessionResourceOffer, Instant)> = Vec::new();
+        let mut receiving = 0usize;
+        let (received_tx, mut received_rx) = mpsc::channel::<Result<Vec<u8>, String>>(resource::MAX_EXPECTED);
         let mut send_at: Option<Instant> = None;
         let mut commands_open = true;
         let mut ticker = tokio::time::interval(TICK);
@@ -1025,9 +1074,9 @@ impl Upstream {
             // its front.
             while client
                 .front()
-                .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= CLIENT_HOLD)
+                .is_some_and(|(_, _, at)| now.saturating_duration_since(*at) >= CLIENT_HOLD)
             {
-                if let Some((env, _)) = client.pop_front() {
+                if let Some((env, _, _)) = client.pop_front() {
                     self.drop_send(env, "held too long: its room was not joined");
                 }
             }
@@ -1035,7 +1084,10 @@ impl Upstream {
             // first, then the clients' that may go (in order per room).
             while send_at.is_none_or(|at| now >= at) {
                 let pick = if control.is_empty() {
-                    match client.iter().position(|(e, _)| session.may_send(e.room.as_deref())) {
+                    match client
+                        .iter()
+                        .position(|(e, data, _)| session.may_send(e.room.as_deref()) && (data.is_none() || !sending))
+                    {
                         Some(pos) => Some(pos),
                         None => break,
                     }
@@ -1047,13 +1099,29 @@ impl Upstream {
                     break;
                 }
                 send_at = None;
-                let env = match pick {
-                    None => control.pop_front(),
-                    Some(pos) => client.remove(pos).map(|(env, _)| env),
+                let (env, data) = match pick {
+                    None => (control.pop_front(), None),
+                    Some(pos) => match client.remove(pos) {
+                        Some((env, data, _)) => (Some(env), data),
+                        None => (None, None),
+                    },
                 };
                 let Some(env) = env else { break };
                 match link.handle.send_packet(env.encode()).await {
-                    Ok(_) => tracing::debug!("upstream {tag}: sent {:?} room={:?}", env.t, env.room),
+                    Ok(_) => {
+                        tracing::debug!("upstream {tag}: sent {:?} room={:?}", env.t, env.room);
+                        if let Some(data) = data {
+                            // The Resource follows its RESOURCE_ENVELOPE on
+                            // the link; the transfer runs on its own.
+                            sending = true;
+                            let handle = link.handle.clone();
+                            let done = sent_tx.clone();
+                            tokio::spawn(async move {
+                                let result = send_resource(&handle, &data).await;
+                                let _ = done.send((env, result)).await;
+                            });
+                        }
+                    }
                     Err(LinkSessionError::PayloadTooLarge { actual, max }) => {
                         tracing::warn!(
                             "upstream {tag}: dropped a {:?} of {actual} bytes (link MDU {max})",
@@ -1083,6 +1151,23 @@ impl Upstream {
                                 continue;
                             }
                         };
+                        if env.t == MessageType::ResourceEnvelope {
+                            session.handle(&env, Instant::now());
+                            match resource::check(&env) {
+                                Ok(body) => {
+                                    let size = body.size;
+                                    if !expected.add(env, body, Instant::now()) {
+                                        self.drop_resource("too many resources announced at once");
+                                    } else if let Some(pos) = offers.iter().position(|(o, _)| o.data_size() as u64 == size) {
+                                        let (offer, _) = offers.remove(pos);
+                                        receiving += 1;
+                                        accept(offer, received_tx.clone());
+                                    }
+                                }
+                                Err(e) => self.drop_resource(&format!("a malformed resource envelope: {e}")),
+                            }
+                            continue;
+                        }
                         let inbound = session.handle(&env, Instant::now());
                         match &inbound {
                             Inbound::Handled => {}
@@ -1115,20 +1200,48 @@ impl Upstream {
                     Some(_) => {}
                     None => break 'link ("link session ended".into(), false),
                 },
-                // The bouncer accepts no Resources yet (M5); an offer left
-                // undecided expires.
                 Some(offer) = link.resource_offers.recv() => {
-                    tracing::debug!("upstream {tag}: ignored a resource offer of {} bytes", offer.data_size());
+                    if let Some(reason) = refuse_offer(&offer, receiving + offers.len()) {
+                        self.drop_resource(&format!("refused an offer of {} bytes: {reason}", offer.data_size()));
+                        tokio::spawn(async move { let _ = offer.reject().await; });
+                    } else if expected.expects(offer.data_size() as u64) {
+                        receiving += 1;
+                        accept(offer, received_tx.clone());
+                    } else {
+                        offers.push((offer, Instant::now()));
+                    }
                 }
-                command = commands.recv(), if commands_open => match command {
-                    Some(Command::Send(env)) => {
-                        if client.len() >= CLIENT_QUEUE {
-                            tracing::warn!("upstream {tag}: client queue full, dropped a {:?}", env.t);
-                            self.drop_send(env, "the queue is full");
-                        } else {
-                            client.push_back((env, Instant::now()));
+                Some(received) = received_rx.recv() => {
+                    receiving = receiving.saturating_sub(1);
+                    match received {
+                        Ok(data) => match expected.take(&data) {
+                            Matched::Verified(e) => {
+                                tracing::debug!("upstream {tag}: received a {} resource of {} bytes room={:?}", e.body.kind, data.len(), e.envelope.room);
+                                self.tally(|s| s.resources_in += 1);
+                                self.emit(UpstreamEvent::Resource { envelope: e.envelope, data: Arc::new(data) });
+                            }
+                            Matched::Mismatch(e) => self.drop_resource(&format!("a resource of {} bytes does not match the sha256 its envelope (room {:?}) gave", data.len(), e.envelope.room)),
+                            Matched::Unmatched => self.drop_resource(&format!("no envelope announced a resource of {} bytes", data.len())),
+                        },
+                        Err(e) => self.drop_resource(&format!("a resource failed: {e}")),
+                    }
+                }
+                Some((env, result)) = sent_rx.recv() => {
+                    sending = false;
+                    match result {
+                        Ok(()) => {
+                            tracing::debug!("upstream {tag}: sent a resource room={:?}", env.room);
+                            self.tally(|s| s.resources_out += 1);
+                        }
+                        Err(e) => {
+                            tracing::warn!("upstream {tag}: a client resource was not sent: {e}");
+                            self.drop_send(env, &format!("the resource was not sent: {e}"));
                         }
                     }
+                }
+                command = commands.recv(), if commands_open => match command {
+                    Some(Command::Send(env)) => self.queue_client(&mut client, env, None),
+                    Some(Command::SendResource { envelope, data }) => self.queue_client(&mut client, envelope, Some(data)),
                     Some(Command::Join(room)) => {
                         self.add_room(&room);
                         if let Some(room) = crate::config::normalize_room(&room) {
@@ -1155,6 +1268,18 @@ impl Upstream {
                     None => commands_open = false,
                 },
                 _ = ticker.tick() => {
+                    let now = Instant::now();
+                    for _ in 0..expected.expire(now) {
+                        self.drop_resource("an announced resource did not come in time");
+                    }
+                    let (late, waiting): (Vec<_>, Vec<_>) = offers
+                        .drain(..)
+                        .partition(|(_, at)| now.saturating_duration_since(*at) >= resource::OFFER_GRACE);
+                    offers = waiting;
+                    for (offer, _) in late {
+                        self.drop_resource(&format!("no envelope announced an offer of {} bytes", offer.data_size()));
+                        tokio::spawn(async move { let _ = offer.reject().await; });
+                    }
                     if let Err(dead) = session.tick(Instant::now()) {
                         link.handle.close().await;
                         drain_until_closed(&mut link).await;
@@ -1174,8 +1299,12 @@ impl Upstream {
             link.handle.close().await;
             drain_until_closed(&mut link).await;
         }
-        for (env, _) in client {
+        for (env, _, _) in client {
             self.drop_send(env, "the link ended");
+        }
+        // Resources still on the way go with the link; the counts say so.
+        for _ in 0..expected.len() + offers.len() + receiving {
+            self.drop_resource("the link ended");
         }
         Ended {
             welcomed_for: welcomed_at.map(|t| t.elapsed()),
@@ -1252,6 +1381,56 @@ impl Upstream {
                 _ = shutdown.changed() => return false,
             }
         }
+    }
+}
+
+/// Why an offer from the hub is refused before its envelope is looked for;
+/// `busy` is how many Resources are being received or wait.
+fn refuse_offer(offer: &LinkSessionResourceOffer, busy: usize) -> Option<String> {
+    if offer.is_request() || offer.is_response() {
+        Some("a request or response".into())
+    } else if offer.total_segments() > 1 {
+        Some(format!("split into {} segments", offer.total_segments()))
+    } else if offer.data_size() as u64 > resource::MAX_RESOURCE_BYTES || offer.data_size() == 0 {
+        Some(format!("not between 1 and {} bytes", resource::MAX_RESOURCE_BYTES))
+    } else if busy >= resource::MAX_EXPECTED {
+        Some(format!("{busy} resources are on the way already"))
+    } else {
+        None
+    }
+}
+
+/// Take an offer and report the Resource, or why it did not come, on
+/// `done`.
+fn accept(offer: LinkSessionResourceOffer, done: mpsc::Sender<Result<Vec<u8>, String>>) {
+    tokio::spawn(async move {
+        let result = match offer.accept().await {
+            Ok(handle) => match tokio::time::timeout(resource::RESOURCE_TIMEOUT, handle.concluded()).await {
+                Ok(Ok(received)) => Ok(received.data),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err(format!("not received in {}s", resource::RESOURCE_TIMEOUT.as_secs())),
+            },
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = done.send(result).await;
+    });
+}
+
+/// Send `data` as a Resource on the link and wait until the hub has it
+/// all.
+async fn send_resource(handle: &LinkSessionHandle, data: &[u8]) -> Result<(), String> {
+    let options = ResourceOptions {
+        auto_compress: false,
+        metadata: None,
+    };
+    let sent = async {
+        let resource = handle.send_resource_bytes(data.to_vec(), options).await?;
+        resource.concluded().await
+    };
+    match tokio::time::timeout(resource::RESOURCE_TIMEOUT, sent).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("not sent in {}s", resource::RESOURCE_TIMEOUT.as_secs())),
     }
 }
 
@@ -1404,7 +1583,7 @@ mod tests {
         assert_eq!(body.name.as_deref(), Some("rrc-bouncer"));
         assert_eq!(body.ver, Some(Value::Integer(1.into())));
         assert_eq!(body.caps, CAPS);
-        assert!(!body.caps.resource_envelope);
+        assert!(body.caps.resource_envelope);
         // No JOIN and no PING before the WELCOME.
         s.tick(t0 + Duration::from_secs(29)).unwrap();
         assert!(s.take_outbox().is_empty());

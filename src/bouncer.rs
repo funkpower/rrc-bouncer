@@ -45,6 +45,10 @@ pub const LOCK_FILE: &str = "lock";
 /// write `stopped` to its status.
 const SESSION_STOP: Duration = Duration::from_secs(10);
 const _: () = assert!(SESSION_STOP.as_secs() > upstream::CLOSE_WAIT.as_secs());
+/// The capacity of a local hub's event channels (rsReticulum's default is
+/// 128): every client link's Resource advertisements, progress and ends
+/// pass through them, and one that is full loses events.
+const HUB_EVENTS: usize = 1024;
 
 fn uplink_refresh() -> Duration {
     std::env::var(UPLINK_REFRESH_ENV)
@@ -374,6 +378,8 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         let upstream = hub.address;
         let hub_identity = local.hash;
         let identities = LinkIdentities::default();
+        let slots = relay::ResourceSlots::default();
+        let relay_status = SharedRelayStatus::default();
         let (identified_tx, identified_rx) = mpsc::unbounded_channel();
         let registered = runtime
             .register_destination(
@@ -381,7 +387,15 @@ pub async fn run(settings: Settings) -> Result<(), String> {
                 HUB_ASPECT,
                 DestinationRuntimeOptions {
                     proof_strategy: ProofStrategy::ProveNone,
-                    resource_strategy: ResourceStrategy::AcceptNone,
+                    resource_strategy: ResourceStrategy::AcceptApp,
+                    resource_accept: Some(relay::resource_policy(
+                        identities.clone(),
+                        allowed.clone(),
+                        slots.clone(),
+                        relay_status.clone(),
+                    )),
+                    // Room for the Resource events of every link at once.
+                    event_capacity: HUB_EVENTS,
                     default_app_data: Some(hub_app_data(&local_hub_name(&upstream))),
                     identity_gate: Some(relay::identity_gate(identities.clone(), identified_tx)),
                     ..DestinationRuntimeOptions::default()
@@ -404,7 +418,6 @@ pub async fn run(settings: Settings) -> Result<(), String> {
         });
         announced.push(registered.handle.clone());
         let shared = SharedStatus::default();
-        let relay_status = SharedRelayStatus::default();
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
         let (event_tx, event_rx) = upstream::event_channel();
         let relay = Relay::new(RelayConfig {
@@ -447,6 +460,7 @@ pub async fn run(settings: Settings) -> Result<(), String> {
             events: event_rx,
             relay,
             changed: changed.clone(),
+            slots,
         })));
     }
     let uplink = !settings.announce && matches!(settings.rns, RnsAccess::Tcp { .. });

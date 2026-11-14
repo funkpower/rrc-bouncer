@@ -14,5 +14,6 @@ pub mod history;
 pub mod identity;
 pub mod rate;
 pub mod relay;
+pub mod resource;
 pub mod rooms;
 pub mod upstream;

@@ -102,6 +102,7 @@ fn status(settings: &config::Settings, json: bool) -> Result<(), String> {
         println!("  hub {}  local hub {}", hub.upstream, hub.local_hub);
         print_upstream(&hub.link, running);
         print_relay(&hub.relay);
+        print_resources(&hub.link, &hub.relay);
         print_history(&hub.history);
     }
     Ok(())
@@ -124,6 +125,17 @@ fn print_relay(r: &rrc_bouncer::relay::RelayStatus) {
     if r.refused_links > 0 {
         println!("    refused links    {}", r.refused_links);
     }
+}
+
+fn print_resources(u: &rrc_bouncer::upstream::UpstreamStatus, r: &rrc_bouncer::relay::RelayStatus) {
+    println!(
+        "    hub resources    {} received, {} sent, {} dropped",
+        u.resources_in, u.resources_out, u.resource_drops
+    );
+    println!(
+        "    client resources {} received, {} sent, {} as notices, {} dropped",
+        r.resources_in, r.resources_out, r.resources_split, r.resource_drops
+    );
 }
 
 fn print_history(h: &rrc_bouncer::history::HistoryStatus) {
@@ -210,7 +222,7 @@ fn print_upstream(u: &rrc_bouncer::upstream::UpstreamStatus, running: bool) {
     }
     if !u.unhandled.is_empty() {
         let counts: Vec<String> = u.unhandled.iter().map(|(t, n)| format!("{t} {n}")).collect();
-        println!("    not relayed yet  {}", counts.join(", "));
+        println!("    not relayed      {}", counts.join(", "));
     }
     if u.dropped_sends > 0 {
         println!("    dropped sends    {}", u.dropped_sends);
