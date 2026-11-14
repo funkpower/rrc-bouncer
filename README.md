@@ -159,7 +159,8 @@ Every client links to the **local hub** address `hashes` prints, never to the
 hub itself, and speaks as **your identity**, the one in the bouncer's
 `identity`. A client that can't hold that identity can keep its own: add its
 identity hash to `allowed_identities`. Everything it says still goes to the
-hub as you. Any other identity gets `ERROR "identity not allowed on this hub"`
+hub as you, and the bouncer shows that client your identity as its own, so it
+recognises its own lines, their echo and direct notices to you. Any other identity gets `ERROR "identity not allowed on this hub"`
 and its link is closed.
 
 Turn off any setting that connects a client to the real hub as well, or that

@@ -2161,6 +2161,9 @@ struct LinkTask<S> {
     sink: S,
     link: Link,
     ids: ([u8; 16], [u8; 16]),
+    /// The user's identity and the link's own, when the link identified
+    /// as another allowed identity (see [`LinkTask::as_seen`]).
+    swap: Option<([u8; 16], [u8; 16])>,
     status: SharedRelayStatus,
     done: mpsc::UnboundedSender<(Link, String, u64)>,
     /// The Resources given to the task and not ended yet.
@@ -2174,9 +2177,35 @@ impl<S: LinkSink> LinkTask<S> {
         }
     }
 
+    /// The envelope as this link's client is to see it. A client that
+    /// identified as another allowed identity than the user's knows its
+    /// own lines, the hub's echo of what it sent and the direct notices to
+    /// it by its own identity (weechat-rrc `rrc.c:791`, rBrowser2 `rrc.py:1859`),
+    /// while the hub and the history name the user's: here the user's
+    /// identity in K_SRC and K_DST becomes the client's.
+    fn as_seen<'a>(&self, env: &'a Envelope) -> std::borrow::Cow<'a, Envelope> {
+        let Some((user, client)) = self.swap else {
+            return std::borrow::Cow::Borrowed(env);
+        };
+        let src = env.src == user;
+        let dst = env.dst.as_deref() == Some(&user[..]);
+        if !src && !dst {
+            return std::borrow::Cow::Borrowed(env);
+        }
+        let mut env = env.clone();
+        if src {
+            env.src = client.to_vec();
+        }
+        if dst {
+            env.dst = Some(client.to_vec());
+        }
+        std::borrow::Cow::Owned(env)
+    }
+
     /// Send one envelope, given `SEND_TIMEOUT`: false if it was not sent.
     async fn send(&self, env: &Envelope) -> bool {
-        let failure = match tokio::time::timeout(SEND_TIMEOUT, self.sink.send(self.link, env.encode())).await {
+        let data = self.as_seen(env).encode();
+        let failure = match tokio::time::timeout(SEND_TIMEOUT, self.sink.send(self.link, data)).await {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e),
             Err(_) => Some(format!("no room in {}s", SEND_TIMEOUT.as_secs())),
@@ -2508,6 +2537,9 @@ struct LinkSender {
 struct Links<S: LinkSink> {
     sink: S,
     ids: ([u8; 16], [u8; 16]),
+    /// The user's identity, and the identity each link identified as.
+    user: [u8; 16],
+    identities: LinkIdentities,
     status: SharedRelayStatus,
     done: mpsc::UnboundedSender<(Link, String, u64)>,
     senders: HashMap<Link, LinkSender>,
@@ -2517,12 +2549,15 @@ impl<S: LinkSink> Links<S> {
     fn new(
         sink: S,
         ids: ([u8; 16], [u8; 16]),
+        (user, identities): ([u8; 16], LinkIdentities),
         status: SharedRelayStatus,
         done: mpsc::UnboundedSender<(Link, String, u64)>,
     ) -> Self {
         Self {
             sink,
             ids,
+            user,
+            identities,
             status,
             done,
             senders: HashMap::new(),
@@ -2530,6 +2565,11 @@ impl<S: LinkSink> Links<S> {
     }
 
     fn sender(&mut self, link: Link) -> &LinkSender {
+        // A link's first envelope comes after it identified: the gate has
+        // put its identity in `identities` by then.
+        let swap = link_identity(&self.identities, &link)
+            .filter(|identity| *identity != self.user)
+            .map(|identity| (self.user, identity));
         self.senders.entry(link).or_insert_with(|| {
             use std::sync::atomic::AtomicUsize;
             let (tx, rx) = mpsc::unbounded_channel();
@@ -2540,6 +2580,7 @@ impl<S: LinkSink> Links<S> {
                 sink: self.sink.clone(),
                 link,
                 ids: self.ids,
+                swap,
                 status: self.status.clone(),
                 done: self.done.clone(),
                 resources: resources.clone(),
@@ -2760,6 +2801,7 @@ pub async fn run(hub: LocalHub) {
             waiters: waiters.clone(),
         },
         (relay.hub, relay.upstream),
+        (relay.user, identities.clone()),
         relay.status.clone(),
         replayed,
     );
@@ -5164,11 +5206,68 @@ mod tests {
         let status = SharedRelayStatus::default();
         let (tx, done) = mpsc::unbounded_channel();
         Senders {
-            links: Links::new(sink.clone(), (HUB, UPSTREAM), status.clone(), tx),
+            links: Links::new(sink.clone(), (HUB, UPSTREAM), (USER, identities()), status.clone(), tx),
             sink,
             done,
             status,
         }
+    }
+
+    /// Link `D` identified as `FRIEND`, an allowed identity other than the
+    /// user's; the others have no identity recorded.
+    const D: Link = [4; 16];
+
+    fn identities() -> LinkIdentities {
+        let identities = LinkIdentities::default();
+        identities.lock().unwrap().insert(D, FRIEND);
+        identities
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_of_another_identity_sees_its_own_for_the_users() {
+        let mut s = senders();
+        let own = Envelope::new(MessageType::Msg, &USER)
+            .with_room("lobby")
+            .with_body(Raw::text("mine"));
+        let mut direct = Envelope::new(MessageType::Notice, &OTHER).with_body(Raw::text("to me"));
+        direct.dst = Some(USER.to_vec());
+        let theirs = room_msg("lobby", "theirs");
+        for link in [A, D] {
+            for env in [&own, &direct, &theirs] {
+                assert!(s.links.envelope(link, ToLink::Send(env.clone())));
+            }
+            // The user's own line in a replay too.
+            let tx = s.replay_waiting(link, link[0] as u64, "side");
+            let _ = tx.send(vec![Record {
+                ts_ms: 1_794_567_845_000,
+                envelope: Envelope::new(MessageType::Msg, &USER)
+                    .with_room("side")
+                    .with_body(Raw::text("said before"))
+                    .encode(),
+            }]);
+        }
+        settle().await;
+        let seen = |link: Link| -> Vec<(String, Vec<u8>, Option<Vec<u8>>)> {
+            s.sink
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                // Not the replay's framing notices.
+                .filter(|(l, e, _)| *l == link && (e.t == MessageType::Msg || e.dst.is_some()))
+                .map(|(_, e, _)| (e.text_body().unwrap_or_default(), e.src.clone(), e.dst.clone()))
+                .collect()
+        };
+        let expect = |me: [u8; 16]| {
+            vec![
+                ("mine".to_string(), me.to_vec(), None),
+                ("to me".to_string(), OTHER.to_vec(), Some(me.to_vec())),
+                ("theirs".to_string(), OTHER.to_vec(), None),
+                ("said before".to_string(), me.to_vec(), None),
+            ]
+        };
+        assert_eq!(seen(A), expect(USER));
+        assert_eq!(seen(D), expect(FRIEND));
     }
 
     fn records_of(room: &str, n: usize) -> Vec<Record> {

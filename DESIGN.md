@@ -358,6 +358,13 @@ of time in, commands to the upstream session and envelopes for client links out)
   - Any other identity gets `ERROR` `"identity not allowed on this hub"` (`K_SRC` the local hub,
     no room) and its link is closed 1 s later (`REFUSE_CLOSE_DELAY`), so the ERROR goes out first.
     It is counted in `refused_links`; its packets are ignored.
+  - A client of an allowed identity other than the user's sees its own identity wherever the
+    user's would be: its link's sender rewrites `K_SRC` and `K_DST` equal to the user's identity
+    to the client's (`LinkTask::as_seen`), in live envelopes, replays and RESOURCE_ENVELOPEs
+    alike. weechat-rrc (`rrc.c:791`) and rBrowser2 (`rrc.py:1859`) drop the hub's echo of a
+    line they sent only when `K_SRC` is their own identity, and weechat-rrc takes a direct notice
+    as its own only when `K_DST` is (`rrc.c:799-800`); without it such a client drew each of its
+    own lines twice and missed direct notices to the user (found in a live test, 2026-11-14).
   - A link that has not identified 30 s after it was established (`IDENTIFY_TIMEOUT`) is closed;
     until then its packets are ignored.
 - **HELLO.** Answered with WELCOME: `K_SRC` the local hub, hub name
