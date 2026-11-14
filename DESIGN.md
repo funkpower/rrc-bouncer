@@ -43,9 +43,10 @@ Source of truth: the spec at <https://rrc.kc1awv.net/> and the reference hub
   limits `{0: max_nick_bytes, 1: max_room_name_bytes, 2: max_msg_body_bytes,
   3: max_rooms_per_session, 4: rate_limit_msgs_per_minute}`; caps `{0: resource_envelope,
   1: action, 2: direct_notice}`.
-- A whole envelope fits one Link packet (about 481 bytes). Bigger hub text (greeting, MOTD, long
-  notices) comes as `RESOURCE_ENVELOPE` (body `{0: id, 1: kind, 2: size, 3: sha256, 4: encoding}`,
-  kinds `notice`, `motd`, `blob`) followed by a Reticulum Resource on the same link.
+- A whole envelope fits one Link packet (about 481 bytes). Longer text can come as
+  `RESOURCE_ENVELOPE` (body `{0: id, 1: kind, 2: size, 3: sha256, 4: encoding}`, kinds `notice`,
+  `motd`, `blob`) followed by a Reticulum Resource on the same link. Stock rrcd 0.3.2 sends only
+  its greeting this way, when it is over 512 bytes ([Resources](#resources)).
 - rrcd defaults: body 350 bytes, nick 32, room name 64, 32 rooms per session, 240 messages a minute
   per link (`rrcd/config.py:29-34`). Use the limits the upstream WELCOME gives.
 - Nicks are advisory and not unique ([optional](https://rrc.kc1awv.net/5-RRC-optional.html#nicknames)).
@@ -276,7 +277,8 @@ send out; unit-tested), and `run`, the task per hub that owns the link and feeds
   session keeps the same bucket (`src/rate.rs`) at 90 % of the limit (240 a minute until the
   WELCOME) and holds a packet until there is a token instead of losing it. Its own envelopes
   (PONG, PING, JOIN, PART) go first.
-- **Client envelopes** (`Command::Send`, from M3):
+- **Client envelopes** (`Command::Send`, from M3; `Command::SendPart` for the parts of a client's
+  long notice, paced by the hub's echo, [Resources](#resources)):
   - No link up: dropped at once.
   - Link up but not welcomed yet, or its room is in the room set but not joined yet (JOIN pending
     or waiting to try again): held, in arrival order, in a queue of at most 256
@@ -580,10 +582,10 @@ sends that upstream as ordinary NOTICEs, never as a Resource.
 - **Bounds**, rrcd's, on both sides: a Resource is 1 to 262144 bytes (`MAX_RESOURCE_BYTES`,
   rrcd's `max_resource_bytes`), in one segment, not a request or response, and sent uncompressed
   (`auto_compress = false`, as rrcd sends). rrcd takes a size of 0 in an envelope; the bouncer
-  refuses it as malformed (`resource::check`, the ERROR names the size), since a Resource of no
-  bytes cannot be sent. At most 8 announced and not yet whole per link (`MAX_EXPECTED`, rrcd's
-  `max_pending_resource_expectations`). A local hub receives at most 32 client Resources at once
-  over all its links (`HUB_RESOURCES`).
+  refuses it as malformed (`resource::check`, with rrcd's text `resource envelope invalid size`),
+  since a Resource of no bytes cannot be sent. At most 8 announced and not yet whole per link
+  (`MAX_EXPECTED`, rrcd's `max_pending_resource_expectations`). A local hub receives at most 32
+  client Resources at once over all its links (`HUB_RESOURCES`).
 - **Counting.** A `RESOURCE_ENVELOPE` is never counted. Each Resource is counted once, when it
   ends: taken whole and matched (`*_in`, or `client_resources_out` when a client took it), or
   dropped (`*_drops`): refused, failed, unannounced, a sha256 that is not the announced one, a
@@ -670,7 +672,12 @@ sends that upstream as ordinary NOTICEs, never as a Resource.
     `ERROR "notice too long: <n> bytes > <m>"`, `<m>` 16 times the most one part holds.
   - The parts go through the path of a client's NOTICE (`message`), each in turn: membership, the
     rate limit, command handling, the session's queue and `CLIENT_HOLD` before the WELCOME, ERROR
-    blame, echo and history. What the hub would refuse each part for is answered once, and the
+    blame, echo and history. They go upstream as `Command::SendPart`: rrcd handles each packet on a
+    thread of its own (`service.py:450`, `_on_packet`), and parts sent back to back reached the
+    room out of order in the e2e test. So once a part is sent, the next client envelope of its room
+    waits until the hub echoes the part (rrcd forwards it to the room, the bouncer's link included,
+    with its `K_ID`) or 2 s (`ECHO_WAIT`) have passed; other rooms go on meanwhile. 16 parts the hub
+    never echoes take 32 s, inside `CLIENT_HOLD`. What the hub would refuse each part for is answered once, and the
     parts go all or none: if the relay's queue to the session has no room for all of them the
     sender gets `ERROR "not sent to the hub: the bouncer's queue is full"`. Before the upstream's
     first WELCOME a client's `RESOURCE_ENVELOPE` is taken like a short NOTICE: the parts are queued
@@ -1124,26 +1131,32 @@ rrc-bouncer status (updated 12 s ago)
     more went than had to); `hist` and `hist2`, newer, are kept whole.
   - A second `run` on the same `state_dir` exits 1 with `another rrc-bouncer is running`; the
     first runs on, and `status` works beside it.
-  The Resource phases follow, on rrcd restarted through `tests/rrcd_shim.py`
-  ([Resources](#resources)) with a greeting of 24 lines and 1871 bytes (UTF-8 with `ü` and `✓`),
-  the bouncer in `lobby` and `res`:
-  - The bouncer takes the greeting as a Resource (`hub_resources_in` 1). RA (cap `0` on) and RN
-    (no caps) link afterwards: RA gets the `RESOURCE_ENVELOPE` (kind `motd`, `K_SRC` the local hub)
-    and a Resource byte-identical to the greeting whose sha256 is the envelope's; RN gets the
-    greeting's 24 lines as NOTICEs from the local hub. rrcd restarted, both get it live the same
-    way. `client_resources_out` 2 and `client_resources_split` 2.
-  - RD joins `res` directly on rrcd. RA sends a 30-line, 1889-byte NOTICE to `res` as an envelope
-    and Resource: RD gets it as a Resource with `K_SRC` the user, RN gets the 30 lines as NOTICEs
-    with `K_SRC` the user, RA gets no copy; `client_resources_in` and `hub_resources_out` go up by
-    one.
-  - RA2 (cap on) links later and gets the greeting from the cache, then joins `res`. RD sends a
-    long NOTICE: RA and RA2 get it as a Resource with `K_SRC` RD, RN as NOTICEs.
-  - The history of `res` holds both long notices as split NOTICEs.
-  - From RA: an envelope announcing 262145 bytes gets `ERROR "resource too large: 262145 >
-    262144"` and its Resource is refused; a Resource whose sha256 is not the announced one is
-    dropped with no ERROR. `client_resource_drops` goes up by three; neither reaches rrcd or RD,
-    and RA's next MSG reaches RD. `status` prints both Resource lines, and the bouncer stops
-    cleanly.
+  The Resource phases follow, on stock rrcd restarted with a greeting of 24 lines and 1871 bytes
+  (UTF-8 with `ü` and `✓`), the bouncer in `lobby` and `res`. The driven peers number each packet
+  as it comes off the link (`RNS.Link.receive`, before Python RNS hands it to a thread of its own),
+  so order is checked as it was on the wire:
+  - rrcd sends the greeting as a Resource (its log: `kind=motd size=1871`) and the bouncer takes it
+    (`hub_resources_in` 1, no drops). RA (cap `0` on) and RN (no caps) link afterwards and get it
+    from the cache: RA the `RESOURCE_ENVELOPE` (kind `motd`, room-less, `K_SRC` the local hub,
+    size and sha256 of the greeting) and then a Resource byte-identical to the greeting; RN the
+    greeting's 24 lines as NOTICEs from the local hub, in order, and no envelope or Resource. rrcd
+    restarted, both get it live the same way. `client_resources_out` 2 and
+    `client_resources_split` 2.
+  - RD joins `res` directly on rrcd. RA sends a 30-line, 1799-byte NOTICE to `res` as an envelope
+    and Resource. RD gets it as 6 NOTICEs of at most 350 bytes from the user, in order, each with
+    an id of its own and the bouncer's nick, and no envelope or Resource; rrcd forwarded 6 NOTICEs
+    and logged no resource expectation. RA and RN get the 6 NOTICEs at the hub's echo, in order;
+    RA gets no Resource back. The history of `res` holds the 6 NOTICEs in order.
+    `client_resources_in` goes up by exactly one, `relayed_in` by exactly 6, no drops.
+  - RA sends a 6299-byte notice, more than 16 parts hold: it gets
+    `ERROR "notice too long: 6299 bytes > 5600"` from the local hub; RD gets nothing, rrcd forwards
+    nothing, `client_resource_drops` goes up by exactly one and nothing is relayed.
+  - From RA: an envelope of size 0 gets `ERROR "resource envelope invalid size"`; one announcing
+    262145 bytes gets `ERROR "resource too large: 262145 > 262144"` and its Resource is refused;
+    a Resource whose sha256 is not the announced one reaches the bouncer and is dropped with no
+    ERROR. `client_resource_drops` goes up by exactly two (envelopes are not counted); nothing is
+    relayed and RD sees nothing, and RA's next MSG reaches RD. `status` prints both Resource
+    lines, the bouncer stops cleanly, and its status at shutdown shows no later drop.
   The phases' start waits are generous (Python peers 180 s, rrcd 120 s) so a loaded host does not
   fail them.
   `RRC_BOUNCER_PING_SECS` (the idle PING and the PONG wait) and `RRC_BOUNCER_BACKOFF_SECS` (the
@@ -1171,7 +1184,8 @@ instance with no interfaces to the outside, so nothing reaches a real network).
 4. **M4: history.** Store, retention, replay on JOIN, `/history N`. e2e: messages said while no
    client is linked are replayed, in order, with their original ids, to a client that joins later;
    after a bouncer restart too (done: [History](#history)).
-5. **M5: finish.** `RESOURCE_ENVELOPE` relay (MOTD and long notices both ways), `status`,
+5. **M5: finish.** `RESOURCE_ENVELOPE` relay (the hub's greeting and long notices to clients, a
+   client's long notice to the hub as NOTICEs), `status`,
    README (setup, every client's settings, limits), `contrib/` unit and example config final.
    A manual check list for NomadNet, weechat-rrc and rBrowser2 against the bouncer goes in the README
    (done: [Resources](#resources), [`status`](#status)).

@@ -666,7 +666,21 @@ impl EventReceiver {
 }
 
 /// Client envelopes on their way to the hub, and when they came.
-type ClientQueue = VecDeque<(Envelope, Instant)>;
+/// Client envelopes, when each came, and whether it is a part to pace
+/// ([`Command::SendPart`]).
+type ClientQueue = VecDeque<(Envelope, Instant, bool)>;
+
+/// A part sent and not yet echoed: the room it was queued for, its id, and
+/// until when the room's next client envelope waits.
+type Echo = (Option<String>, Vec<u8>, Instant);
+
+/// The first client envelope that may go: its room may be sent to and has
+/// no part waiting for its echo. Envelopes of one room go in order.
+fn next_client(client: &ClientQueue, echoes: &[Echo], may_send: impl Fn(Option<&str>) -> bool) -> Option<usize> {
+    client
+        .iter()
+        .position(|(e, _, _)| may_send(e.room.as_deref()) && !echoes.iter().any(|(room, _, _)| *room == e.room))
+}
 
 /// What the rest of the bouncer can ask of an upstream session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -678,6 +692,12 @@ pub enum Command {
     /// envelope is counted in `dropped_sends` and reported as
     /// [`UpstreamEvent::SendDropped`].
     Send(Envelope),
+    /// One part of a client's long notice, sent as [`Command::Send`] is.
+    /// rrcd handles each packet on a thread of its own, so parts sent back
+    /// to back can reach the room out of order: once a part is sent, the
+    /// next client envelope of its room waits until the hub echoes the
+    /// part (its `K_ID` back) or `ECHO_WAIT` has passed.
+    SendPart(Envelope),
     /// Add a room to the hub's room set (saved) and join it.
     Join(String),
     /// Take a room out of the room set and leave it. A room from the config
@@ -821,6 +841,10 @@ pub const CLIENT_QUEUE: usize = 256;
 /// A client envelope held this long (its room not joined yet) is dropped:
 /// a chat line sent much later than it was written is worse than none.
 pub const CLIENT_HOLD: Duration = Duration::from_secs(60);
+/// How long the next client envelope of a room waits for the hub's echo of
+/// a part ([`Command::SendPart`]) before it goes anyway. 16 parts the hub
+/// never echoes then take 32 s, inside `CLIENT_HOLD`.
+pub const ECHO_WAIT: Duration = Duration::from_secs(2);
 /// The longest local hub name, in bytes. The announce app data
 /// `{"proto": "rrc", "v": 1, "hub": name}` is then at most 120 bytes,
 /// well inside an announce's room for it.
@@ -940,12 +964,12 @@ impl Upstream {
     }
 
     /// Queue a client envelope for the hub.
-    fn queue_client(&self, client: &mut ClientQueue, env: Envelope) {
+    fn queue_client(&self, client: &mut ClientQueue, env: Envelope, paced: bool) {
         if client.len() >= CLIENT_QUEUE {
             tracing::warn!("upstream {}: client queue full, dropped a {:?}", self.tag(), env.t);
             self.drop_send(env, "the queue is full");
         } else {
-            client.push_back((env, Instant::now()));
+            client.push_back((env, Instant::now(), paced));
         }
     }
 
@@ -978,7 +1002,7 @@ impl Upstream {
     /// A command while there is no session: the room set still changes.
     fn command_offline(&mut self, command: Command) {
         match command {
-            Command::Send(env) => self.drop_send(env, "not connected"),
+            Command::Send(env) | Command::SendPart(env) => self.drop_send(env, "not connected"),
             Command::Join(room) => {
                 self.add_room(&room);
             }
@@ -1059,6 +1083,9 @@ impl Upstream {
         let mut control: VecDeque<Envelope> = VecDeque::new();
         // Client envelopes and when they came.
         let mut client: ClientQueue = VecDeque::new();
+        // Parts sent and not yet echoed: the room they were queued for,
+        // their id, and until when the room's next envelope waits.
+        let mut echoes: Vec<Echo> = Vec::new();
         // RESOURCE_ENVELOPEs from the hub waiting for their Resource (and
         // finished Resources waiting for theirs); offers waiting for their
         // RESOURCE_ENVELOPE (the two come on different channels); the
@@ -1080,17 +1107,18 @@ impl Upstream {
             // its front.
             while client
                 .front()
-                .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= CLIENT_HOLD)
+                .is_some_and(|(_, at, _)| now.saturating_duration_since(*at) >= CLIENT_HOLD)
             {
-                if let Some((env, _)) = client.pop_front() {
+                if let Some((env, _, _)) = client.pop_front() {
                     self.drop_send(env, "held too long: its room was not joined");
                 }
             }
+            echoes.retain(|(_, _, until)| now < *until);
             // Send what the bucket allows: the bouncer's own envelopes
             // first, then the clients' that may go (in order per room).
             while send_at.is_none_or(|at| now >= at) {
                 let pick = if control.is_empty() {
-                    match client.iter().position(|(e, _)| session.may_send(e.room.as_deref())) {
+                    match next_client(&client, &echoes, |room| session.may_send(room)) {
                         Some(pos) => Some(pos),
                         None => break,
                     }
@@ -1102,13 +1130,20 @@ impl Upstream {
                     break;
                 }
                 send_at = None;
-                let env = match pick {
-                    None => control.pop_front(),
-                    Some(pos) => client.remove(pos).map(|(env, _)| env),
+                let (env, paced) = match pick {
+                    None => (control.pop_front(), false),
+                    Some(pos) => client
+                        .remove(pos)
+                        .map_or((None, false), |(env, _, paced)| (Some(env), paced)),
                 };
                 let Some(env) = env else { break };
                 match link.handle.send_packet(env.encode()).await {
-                    Ok(_) => tracing::debug!("upstream {tag}: sent {:?} room={:?}", env.t, env.room),
+                    Ok(_) => {
+                        tracing::debug!("upstream {tag}: sent {:?} room={:?}", env.t, env.room);
+                        if paced {
+                            echoes.push((env.room.clone(), env.id.clone(), now + ECHO_WAIT));
+                        }
+                    }
                     Err(LinkSessionError::PayloadTooLarge { actual, max }) => {
                         tracing::warn!(
                             "upstream {tag}: dropped a {:?} of {actual} bytes (link MDU {max})",
@@ -1138,6 +1173,7 @@ impl Upstream {
                                 continue;
                             }
                         };
+                        echoes.retain(|(_, id, _)| *id != env.id);
                         if env.t == MessageType::ResourceEnvelope {
                             session.handle(&env, Instant::now());
                             // An envelope is not counted: its Resource is,
@@ -1218,7 +1254,8 @@ impl Upstream {
                     }
                 }
                 command = commands.recv(), if commands_open => match command {
-                    Some(Command::Send(env)) => self.queue_client(&mut client, env),
+                    Some(Command::Send(env)) => self.queue_client(&mut client, env, false),
+                    Some(Command::SendPart(env)) => self.queue_client(&mut client, env, true),
                     Some(Command::Join(room)) => {
                         self.add_room(&room);
                         if let Some(room) = crate::config::normalize_room(&room) {
@@ -1280,7 +1317,7 @@ impl Upstream {
             link.handle.close().await;
             drain_until_closed(&mut link).await;
         }
-        for (env, _) in client {
+        for (env, _, _) in client {
             self.drop_send(env, "the link ended");
         }
         // Resources still on the way go with the link; the counts say so.
@@ -2064,5 +2101,25 @@ mod tests {
         }
         assert_eq!(n, EVENT_QUEUE + 2);
         assert!(tx.send(traffic()));
+    }
+
+    #[test]
+    fn a_room_waits_for_the_echo_of_its_part_and_others_go_on() {
+        let now = Instant::now();
+        let notice = |room: &str| Envelope::new(MessageType::Notice, &USER).with_room(room);
+        let client: ClientQueue = [
+            (notice("a"), now, true),
+            (notice("a"), now, false),
+            (notice("b"), now, false),
+        ]
+        .into();
+        let all = |_: Option<&str>| true;
+        assert_eq!(next_client(&client, &[], all), Some(0));
+        // The first part went and is not echoed: room a waits, b goes.
+        let echoes = vec![(Some("a".to_string()), client[0].0.id.clone(), now + ECHO_WAIT)];
+        let client: ClientQueue = client.into_iter().skip(1).collect();
+        assert_eq!(next_client(&client, &echoes, all), Some(1));
+        // Room b may not be sent to either: nothing goes.
+        assert_eq!(next_client(&client, &echoes, |room| room != Some("b")), None);
     }
 }

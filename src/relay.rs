@@ -817,7 +817,7 @@ impl Relay {
             MessageType::Part => self.part(link, identity, &env, &mut out),
             MessageType::Msg if self.history_command(link, &env, now, &mut out) => {}
             MessageType::Msg | MessageType::Action | MessageType::Notice => {
-                self.message(link, env, now, &mut out);
+                self.message(link, env, now, &mut out, false);
             }
             other => tracing::debug!("client {}: ignored a {other:?}", hex::encode(link)),
         }
@@ -1077,7 +1077,7 @@ impl Relay {
         }
     }
 
-    fn message(&mut self, link: Link, mut env: Envelope, now: Instant, out: &mut Vec<Output>) {
+    fn message(&mut self, link: Link, mut env: Envelope, now: Instant, out: &mut Vec<Output>, part: bool) {
         let kind = kind_of(&env);
         let room = match self.check(&env, kind) {
             Ok(room) => room,
@@ -1100,7 +1100,12 @@ impl Relay {
             copy.src = self.user.to_vec();
             copy
         });
-        if self.commands.try_send(Command::Send(env)).is_err() {
+        let command = if part {
+            Command::SendPart(env)
+        } else {
+            Command::Send(env)
+        };
+        if self.commands.try_send(command).is_err() {
             self.tally(|s| s.relay_drops += 1);
             return out.push(Output::Client(
                 link,
@@ -1296,7 +1301,7 @@ impl Relay {
         );
         self.tally(|s| s.client_resources_in += 1);
         for part in parts {
-            self.message(link, part, now, out);
+            self.message(link, part, now, out, true);
         }
     }
 
@@ -3599,7 +3604,7 @@ mod tests {
         commands
             .iter()
             .map(|c| match c {
-                Command::Send(env) => env.clone(),
+                Command::SendPart(env) => env.clone(),
                 other => panic!("{other:?}"),
             })
             .collect()
@@ -3735,7 +3740,7 @@ mod tests {
             .with_room("lobby")
             .with_body(Raw::text("hi"));
         assert!(f.packet(A, &short).is_empty());
-        assert_eq!(sends(&f.commands_sent()).len(), 1);
+        assert!(matches!(&f.commands_sent()[..], [Command::Send(_)]));
     }
 
     #[test]

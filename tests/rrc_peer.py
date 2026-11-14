@@ -15,7 +15,8 @@ breath as the identify, as NomadNet does), answers PING, and carries out
 the JSON commands appended to --commands (join, part, send, resource). It
 does not link again. With --resource-cap its HELLO carries the
 resource_envelope cap; either way it takes every Resource the hub offers
-and reports it.
+and reports it. Each envelope it reports carries `seq`, the order in which
+its packet came off the link.
 """
 
 import argparse
@@ -38,6 +39,23 @@ T_PING, T_PONG = 30, 31
 T_RESOURCE_ENVELOPE = 50
 
 lock = threading.Lock()
+
+# Python RNS hands each link packet to a thread of its own (RNS/Link.py:1044),
+# so packet callbacks can run out of order. Link.receive runs in order on the
+# transport's thread: number each packet there, and report that number.
+# Packet has __slots__, so the number is kept by the packet object's id; a
+# packet's entry is set before its callback and replaced if the id comes again.
+_arrivals = iter(range(1, 1 << 62))
+_seq = {}
+_receive = RNS.Link.receive
+
+
+def _numbered_receive(self, packet):
+    _seq[id(packet)] = next(_arrivals)
+    return _receive(self, packet)
+
+
+RNS.Link.receive = _numbered_receive
 
 
 def emit(path, **event):
@@ -211,14 +229,14 @@ def driven(args, identity):
     def send(env):
         RNS.Packet(link, cbor2.dumps(env)).send()
 
-    def handle(data):
+    def handle(data, seq):
         try:
             env = cbor2.loads(data)
         except Exception as e:
             emit(args.events, event="bad_packet", error=str(e))
             return
         t = env.get(K_T)
-        emit(args.events, event="env", session=1, t=t, id=plain(env.get(K_ID)), ts=env.get(K_TS),
+        emit(args.events, event="env", session=1, seq=seq, t=t, id=plain(env.get(K_ID)), ts=env.get(K_TS),
              room=env.get(K_ROOM), nick=env.get(K_NICK), src=plain(env.get(K_SRC)), dst=plain(env.get(K_DST)),
              body=plain(env.get(K_BODY)), fmt=plain(env.get(K_FMT)))
         if t == T_PING:
@@ -226,7 +244,7 @@ def driven(args, identity):
 
     def on_packet(data, packet):
         try:
-            handle(data)
+            handle(data, _seq.pop(id(packet), None))
         except Exception:
             emit(args.events, event="error", error=traceback.format_exc())
 
