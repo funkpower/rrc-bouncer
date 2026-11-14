@@ -61,6 +61,15 @@ pub fn now() -> f64 {
         .as_secs_f64()
 }
 
+/// How long until the next whole second of wall time. An announce carries
+/// its emission time in whole seconds, and rnsd takes a new one for a path
+/// it already has only when that time is later (`Transport.py:2519`): one
+/// sent in the same second as the last is dropped. 10 ms past the boundary,
+/// so rounding never lands the wake just short of it.
+fn until_next_second(now: f64) -> Duration {
+    Duration::from_secs_f64((now.floor() + 1.0 - now).clamp(0.0, 1.0) + 0.01)
+}
+
 /// Write `data` to `path` through a temporary file and a rename.
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -469,8 +478,10 @@ pub async fn run(settings: Settings) -> Result<(), String> {
                 status_writer.write(&status);
             }
             // A local hub took its upstream hub's name: tell the network
-            // now rather than at the next announce or refresh.
+            // now rather than at the next announce or refresh, in a later
+            // second than the announce or path response with the old name.
             _ = renamed.notified() => {
+                tokio::time::sleep(until_next_second(now())).await;
                 if settings.announce {
                     announce(&announced).await;
                 } else if uplink {
@@ -561,6 +572,19 @@ async fn futures_join_all(tasks: Vec<tokio::task::JoinHandle<()>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rename_waits_for_the_next_whole_second() {
+        assert_eq!(until_next_second(100.25), Duration::from_millis(760));
+        assert_eq!(until_next_second(100.0), Duration::from_millis(1010));
+        let wait = until_next_second(100.999_999);
+        assert!(wait > Duration::from_millis(10) && wait < Duration::from_millis(11));
+        // Whatever was sent before the wait has an earlier whole second.
+        for now in [5.0, 5.5, 5.999] {
+            let after = now + until_next_second(now).as_secs_f64();
+            assert!(after.floor() > f64::floor(now));
+        }
+    }
 
     #[test]
     fn the_lock_file_keeps_a_second_bouncer_out() {

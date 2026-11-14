@@ -203,7 +203,11 @@ rsReticulum (`deps/rsReticulum` at 14241a3), from the code and on a private netw
   (`DestinationHandle::set_default_app_data`), and announces and path responses are sent without
   app data of their own, so both carry it. A WELCOME with a new name sets it and, at once, announces
   the hubs (`announce = true`) or sends the uplink its path responses (`tcp`), so the network does
-  not wait for the next announce or refresh to learn the name. The name is not saved: after a
+  not wait for the next announce or refresh to learn the name. That send waits for the next whole
+  second first: an announce carries its emission time in whole seconds (rsReticulum stamps `now as
+  u64`, `rns-identity/src/destination.rs:966`), and rnsd replaces a path it has only with a later
+  one (`Transport.py:2519`), so a WELCOME in the same second as the first path response would
+  leave rnsd with the placeholder until the next refresh or announce. The name is not saved: after a
   restart it is the placeholder until the WELCOME. e2e phase "rrcd": a client asking rnsd for the
   local hub's path after the WELCOME gets `e2e hub (via rrc-bouncer)`.
 
