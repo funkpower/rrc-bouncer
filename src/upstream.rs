@@ -327,6 +327,26 @@ impl Session {
             || self.rooms.over_limit.contains(&room)
     }
 
+    /// Why the parts of a long notice for `room` may not go, if they may
+    /// not: each part waits for the echo of the one before, and the hub
+    /// echoes only into a room the bouncer is in. Parts go to a room of the
+    /// room set the bouncer is in or is joining (now, or again after a
+    /// refusal it may outlive: no answer, rate limited); not to one the
+    /// hub refused on this link, one over the hub's room limit, or one
+    /// left.
+    pub fn refuses_parts(&self, room: Option<&str>) -> Option<String> {
+        let room = room.and_then(crate::config::normalize_room)?;
+        if let Some(reason) = self.rooms.failed.get(&room) {
+            Some(format!("{room} not joined: {reason}"))
+        } else if self.rooms.over_limit.contains(&room) {
+            Some(format!("{room} not joined: over the hub's room limit"))
+        } else if !self.rooms.wanted.contains(&room) {
+            Some(format!("the bouncer left {room}"))
+        } else {
+            None
+        }
+    }
+
     /// Stay in `room` from now on (it is joined at the next `tick`).
     pub fn want(&mut self, room: &str) {
         if !self.rooms.wanted.iter().any(|r| r == room) {
@@ -705,6 +725,21 @@ fn next_client(client: &ClientQueue, echoes: &[Echo], may_send: impl Fn(Option<&
         .position(|(e, _, _)| may_send(e.room.as_deref()) && !waits_for_echo(echoes, e.room.as_deref()))
 }
 
+/// The first part of a long notice in the queue whose room takes no
+/// parts (`refuses` says why), taken out of the queue, with why.
+fn refused_part(
+    client: &mut ClientQueue,
+    refuses: impl Fn(Option<&str>) -> Option<String>,
+) -> Option<(Envelope, Part, String)> {
+    let (pos, reason) = client
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, part))| part.is_some())
+        .find_map(|(pos, (env, _, _))| refuses(env.room.as_deref()).map(|why| (pos, why)))?;
+    let (env, _, part) = client.remove(pos)?;
+    Some((env, part?, reason))
+}
+
 /// Mark a long notice cut short from its part `from` on, and take its
 /// parts out of the queue: how many were taken out, and how many of its
 /// parts are not sent.
@@ -766,9 +801,10 @@ pub enum Command {
     /// to back can reach the room out of order: once a part is sent, the
     /// next client envelope of its room waits until the hub echoes the
     /// part (its `K_ID` back). A part not echoed in `ECHO_WAIT`, or not
-    /// sent, cuts the notice short: its parts not yet sent are dropped,
-    /// counted in `dropped_sends`, and reported once, as
-    /// [`UpstreamEvent::PartsDropped`].
+    /// sent (its room refused, over the limit or left while it waited:
+    /// [`Session::refuses_parts`]), cuts the notice short: its parts not
+    /// yet sent are dropped, counted in `dropped_sends`, and reported
+    /// once, as [`UpstreamEvent::PartsDropped`].
     SendPart(Envelope, Part),
     /// The hub refused this part of a long notice: the parts after it are
     /// dropped as above, and its room waits no more.
@@ -1245,6 +1281,13 @@ impl Upstream {
                 if let Some((env, _, part)) = client.remove(pos) {
                     self.drop_client(&mut client, cut, env, part, "held too long: its room was not joined");
                 }
+            }
+            // A notice whose room was refused, went over the limit or was
+            // left while its parts waited is cut short from its first part
+            // waiting; a part of it sent is not waited for any more.
+            while let Some((env, part, reason)) = refused_part(&mut client, |room| session.refuses_parts(room)) {
+                echoes.retain(|e| e.part.notice != part.notice);
+                self.drop_client(&mut client, cut, env, Some(part), &reason);
             }
             let (late, waiting): (Vec<Echo>, Vec<Echo>) = echoes.drain(..).partition(|e| now >= e.until);
             echoes = waiting;
@@ -2340,6 +2383,93 @@ mod tests {
             cut.add(n);
         }
         assert!(!cut.has(7) && cut.has(100) && cut.has(99 + CUT_MEMORY as u64));
+    }
+
+    #[test]
+    fn parts_go_only_to_a_room_the_bouncer_is_in_or_joining() {
+        let t0 = Instant::now();
+        let mut s = session(&["a", "b", "c", "d"], t0);
+        // Before the WELCOME the room set is being joined.
+        assert_eq!(s.refuses_parts(Some("a")), None);
+        assert_eq!(s.refuses_parts(Some("other")), Some("the bouncer left other".into()));
+        s.handle(&welcome(2), t0);
+        s.tick(t0).unwrap();
+        // A JOIN pending.
+        assert_eq!(s.refuses_parts(Some(" A")), None);
+        s.handle(&from_hub(MessageType::Joined).with_room("a"), t0);
+        s.tick(t0).unwrap();
+        s.handle(&error(Some("b"), "invite-only (+i)"), t0);
+        s.tick(t0).unwrap();
+        s.handle(&from_hub(MessageType::Joined).with_room("c"), t0);
+        s.tick(t0).unwrap();
+        assert_eq!(s.rooms().over_limit, ["d"]);
+        assert_eq!(s.refuses_parts(Some("a")), None);
+        assert_eq!(
+            s.refuses_parts(Some("b")),
+            Some("b not joined: invite-only (+i)".into())
+        );
+        assert_eq!(s.refuses_parts(Some("c")), None);
+        assert_eq!(
+            s.refuses_parts(Some("d")),
+            Some("d not joined: over the hub's room limit".into())
+        );
+        // Asked for again: being joined again.
+        s.want("b");
+        assert_eq!(s.refuses_parts(Some("b")), None);
+        // Left: its PARTED not come yet.
+        s.unwant("a", t0);
+        assert_eq!(s.refuses_parts(Some("a")), Some("the bouncer left a".into()));
+        // A JOIN not answered is tried again: the room is still being joined.
+        s.handle(&from_hub(MessageType::Parted).with_room("a"), t0);
+        s.tick(t0).unwrap();
+        assert_eq!(
+            types(&s.take_outbox()).last(),
+            Some(&(MessageType::Join, Some("b".into())))
+        );
+        s.tick(t0 + timings().join_timeout).unwrap();
+        assert!(s.rooms().retrying.contains_key("b"), "{:?}", s.rooms());
+        assert_eq!(s.refuses_parts(Some("b")), None);
+    }
+
+    #[test]
+    fn a_notice_whose_room_is_left_while_its_parts_wait_is_cut_once() {
+        let t0 = Instant::now();
+        let mut s = joined_session(&["a", "c"], t0);
+        let notice = |room: &str| Envelope::new(MessageType::Notice, &USER).with_room(room);
+        let mut client: ClientQueue = [
+            (notice("a"), t0, part(1, 1, 3)),
+            (notice("a"), t0, None),
+            (notice("a"), t0, part(1, 2, 3)),
+            (notice("c"), t0, part(2, 0, 2)),
+        ]
+        .into();
+        let mut cut = Cut::default();
+        let sweep = |s: &Session, client: &mut ClientQueue, cut: &mut Cut| {
+            let mut reports = Vec::new();
+            while let Some((_, p, why)) = refused_part(client, |room| s.refuses_parts(room)) {
+                let (_, unsent) = cut_queue(client, cut, p, p.index);
+                reports.push((p.notice, unsent, why));
+            }
+            reports
+        };
+        assert!(sweep(&s, &mut client, &mut cut).is_empty());
+        assert_eq!(client.len(), 4);
+        s.unwant("a", t0);
+        assert_eq!(
+            sweep(&s, &mut client, &mut cut),
+            [(1, 2, "the bouncer left a".to_string())]
+        );
+        assert!(cut.has(1));
+        // The short NOTICE stays (the hub answers it), and so does the
+        // other room's notice.
+        assert_eq!(
+            client
+                .iter()
+                .map(|(e, _, p)| (e.room.clone(), p.map(|p| p.notice)))
+                .collect::<Vec<_>>(),
+            [(Some("a".into()), None), (Some("c".into()), Some(2))]
+        );
+        assert!(sweep(&s, &mut client, &mut cut).is_empty());
     }
 
     #[test]

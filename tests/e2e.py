@@ -1073,16 +1073,22 @@ def notice_parts(text):
 def resource_phases(run, args, port_r, upstream, user, local, env, found):
     print("resource: rrcd H greets with a text too long for one packet", flush=True)
     run.stop("H")
+    # A registered invite-only room, not +n: rrcd refuses the bouncer's
+    # JOIN but would take a NOTICE from it and forward it to the members.
+    with open(run.path("rrcd", "rooms.toml"), "a") as f:
+        f.write("\n[rooms.inv]\ninvite_only = true\n")
     run.rrcd(args.rrcd, port_r, max_rooms=16, greeting=GREETING)
     reticulum = f'tcp = "127.0.0.1:{port_r}"'
-    config = run.config("resource", reticulum, upstream=upstream, nick="bnc", rooms=("lobby", "res"))
+    config = run.config("resource", reticulum, upstream=upstream, nick="bnc", rooms=("lobby", "res", "inv"))
     greeting = GREETING.encode()
     greeting_sha = hashlib.sha256(greeting).hexdigest()
     run.start("BR", [args.bouncer, "--config", config, "run"], env=env)
     hub = run.wait_status(upstream, lambda h: h["state"] == "connected" and "res" in h["rooms_joined"]
-                          and h["hub_resources_in"] >= 1, 60)
+                          and "inv" in h["rooms_failed"] and h["hub_resources_in"] >= 1, 60)
     found["resource_status_greeting"] = hub
     check(hub["state"] == "connected" and "res" in hub["rooms_joined"], "the bouncer is in res")
+    check(hub["rooms_failed"].get("inv") == "invite-only (+i)",
+          f"the hub refused inv: rooms_failed {hub['rooms_failed']}")
     check(f"kind=motd size={len(greeting)}" in run.log("H"), f"rrcd sent its {len(greeting)}-byte greeting as a Resource")
     check(hub["hub_resources_in"] == 1 and hub["hub_resource_drops"] == 0,
           "status.json: the bouncer took it whole (hub_resources_in 1, no drops)")
@@ -1301,6 +1307,32 @@ def resource_phases(run, args, port_r, upstream, user, local, env, found):
     check(hub["client_resource_drops"] == before["client_resource_drops"] + 1
           and hub["relayed_in"] == before["relayed_in"],
           "status.json: client_resource_drops one more, nothing relayed")
+
+    print("resource: a long notice to a room in the room set the hub refused", flush=True)
+    hub = run.wait_status(upstream, lambda h: h["state"] == "connected" and "inv" in h["rooms_failed"], 30)
+    check(hub["rooms_failed"].get("inv") == "invite-only (+i)" and "inv" in hub["rooms"]
+          and "inv" not in hub["rooms_joined"], "inv is in the room set, refused (+i), not joined")
+    before = hub
+    forwarded = run.log("H").count("Forwarded t=21")
+    since = time.time()
+    command(run, "RA", op="resource", room="inv", text=LONG)
+    error = run.wait_event("RA", lambda e: e["event"] == "env" and e["t"] == 40 and e["at"] >= since, 30)
+    found["resource_refused_room"] = error
+    check(error is not None and error["src"] == hub_id and error["room"] == "inv"
+          and error["body"] == "notice not sent: a long notice goes only to a room the bouncer is in"
+          and error["at"] - since < ECHO_WAIT,
+          f"RA gets ERROR \"{error and error['body']}\" in inv at once")
+    time.sleep(ECHO_WAIT + 2)
+    errors = [e for e in envs(run, "RA", t=40) if e["at"] >= since]
+    check(len(errors) == 1, f"and no other ERROR in the next {ECHO_WAIT + 2} s ({len(errors)} in all)")
+    log = run.log("H")
+    check(log.count("Forwarded t=21") == forwarded
+          and not [line for line in log.splitlines() if "Forwarded" in line and "room=inv" in line],
+          "rrcd forwarded nothing, to inv or anywhere")
+    hub = run.wait_status(upstream, lambda h: h["client_resource_drops"] > before["client_resource_drops"], STATUS_TICK)
+    check(hub["client_resource_drops"] == before["client_resource_drops"] + 1
+          and hub["relayed_in"] == before["relayed_in"] and hub["dropped_sends"] == before["dropped_sends"],
+          "status.json: client_resource_drops one more, nothing relayed, no dropped_sends")
 
     print("resource: Resources from a client that do not hold up", flush=True)
     before = run.status(upstream)

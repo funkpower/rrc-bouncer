@@ -711,6 +711,21 @@ impl Relay {
             .is_ok_and(|s| s.rooms_over_limit.iter().any(|r| r == room))
     }
 
+    /// Whether a long notice's parts may go to `room`: the bouncer is in
+    /// it upstream or about to be. The room is in the room set (wanted, or
+    /// added by a client's JOIN), not over the hub's room limit, and not
+    /// refused on this link unless a client's JOIN asks for it again. A
+    /// room only joined is being left, and is not.
+    fn takes_parts(&self, room: &str) -> bool {
+        let (wanted, failed) = self
+            .session
+            .lock()
+            .map(|s| (s.rooms.iter().any(|r| r == room), s.rooms_failed.contains_key(room)))
+            .unwrap_or_default();
+        let rejoining = || self.clients.values().any(|c| c.pending.contains(room));
+        (wanted || self.added.contains(room)) && !self.over_limit(room) && (!failed || rejoining())
+    }
+
     pub fn link_established(&mut self, link: Link, now: Instant) {
         self.clients.entry(link).or_insert_with(|| Client::new(now));
     }
@@ -1277,7 +1292,7 @@ impl Relay {
         let room = envelope.room.as_deref().and_then(normalize_room);
         // Each part waits for the echo of the one before it, and the hub
         // echoes only into a room the bouncer is in.
-        if room.as_ref().is_some_and(|r| !self.room_set().contains(r)) {
+        if room.as_ref().is_some_and(|r| !self.takes_parts(r)) {
             drop(self, "the bouncer is not in its room");
             let error = self.error(
                 room.as_deref(),
@@ -3729,7 +3744,11 @@ mod tests {
         /// A client's notice Resource: its RESOURCE_ENVELOPE, then the
         /// Resource.
         fn client_notice(&mut self, link: Link, text: &str) -> Vec<Output> {
-            let env = resource::announce(&USER, resource::KIND_NOTICE, Some("lobby"), text.as_bytes());
+            self.client_notice_to(link, "lobby", text)
+        }
+
+        fn client_notice_to(&mut self, link: Link, room: &str, text: &str) -> Vec<Output> {
+            let env = resource::announce(&USER, resource::KIND_NOTICE, Some(room), text.as_bytes());
             let mut out = self.packet(link, &env);
             out.extend(self.relay.client_resource(link, text.as_bytes().to_vec(), self.now));
             out
@@ -3838,6 +3857,78 @@ mod tests {
         );
         assert!(f.command().is_none());
         assert_eq!(f.counts(), (0, 0, 1));
+    }
+
+    #[test]
+    fn a_long_notice_to_a_room_refused_over_the_limit_or_being_left_is_refused() {
+        let mut f = fixture();
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.with_resources(A, &["lobby"]);
+        if let Ok(mut s) = f.session.lock() {
+            s.rooms.extend(["locked".into(), "full".into()]);
+            s.rooms_failed.insert("locked".into(), "invite-only (+i)".into());
+            s.rooms_over_limit = vec!["full".into()];
+            // Joined, and out of the room set: being left.
+            s.rooms_joined = vec!["lobby".into(), "going".into()];
+        }
+        for room in ["locked", "full", "going"] {
+            let sent = sent_to(&f.client_notice_to(A, room, &long_text(20)));
+            assert_eq!(sent.len(), 1, "{room}");
+            assert_eq!(
+                (sent[0].0, sent[0].1.t, sent[0].1.room.as_deref()),
+                (A, MessageType::Error, Some(room))
+            );
+            assert_eq!(
+                sent[0].1.text_body().as_deref(),
+                Some("notice not sent: a long notice goes only to a room the bouncer is in")
+            );
+            assert!(f.command().is_none(), "{room}");
+        }
+        assert_eq!(f.counts(), (0, 0, 3));
+        // An ordinary NOTICE to the refused room still goes to the session.
+        let short = client(MessageType::Notice)
+            .with_room("locked")
+            .with_body(Raw::text("hi"));
+        assert!(f.packet(A, &short).is_empty());
+        assert!(matches!(f.command(), Some(Command::Send(env)) if env.room.as_deref() == Some("locked")));
+    }
+
+    #[test]
+    fn a_long_notice_waits_for_a_join_pending_or_asked_for_again() {
+        let mut f = fixture();
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.with_resources(A, &["lobby"]);
+        if let Ok(mut s) = f.session.lock() {
+            s.rooms.push("locked".into());
+            s.rooms_failed.insert("locked".into(), "invite-only (+i)".into());
+        }
+        // A client asks for the refused room again: its JOIN goes upstream,
+        // and a long notice to it goes after the JOIN.
+        assert!(f.packet(A, &client(MessageType::Join).with_room("locked")).is_empty());
+        assert_eq!(f.command(), Some(Command::Join("locked".into())));
+        assert!(sent_to(&f.client_notice_to(A, "locked", &long_text(20))).is_empty());
+        let parts = sends(&f.commands_sent());
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|p| p.room.as_deref() == Some("locked")));
+        // A room a client's JOIN added, not answered yet.
+        assert!(f.packet(A, &client(MessageType::Join).with_room("fresh")).is_empty());
+        assert_eq!(f.command(), Some(Command::Join("fresh".into())));
+        assert!(sent_to(&f.client_notice_to(A, "fresh", &long_text(20))).is_empty());
+        assert!(sends(&f.commands_sent()).len() > 1);
+        // A room of the room set after a reconnect, not joined yet.
+        f.relay.upstream(UpstreamEvent::Down, f.now);
+        f.commands_sent();
+        if let Ok(mut s) = f.session.lock() {
+            s.rooms = vec!["lobby".into()];
+            s.rooms_joined.clear();
+            s.rooms_failed.clear();
+        }
+        f.up();
+        assert!(sent_to(&f.client_notice_to(A, "lobby", &long_text(20))).is_empty());
+        assert!(sends(&f.commands_sent()).len() > 1);
+        assert_eq!(f.counts().2, 0);
     }
 
     #[test]

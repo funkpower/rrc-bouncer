@@ -690,10 +690,26 @@ sends that upstream as ordinary NOTICEs, never as a Resource.
     strip it, so the part is relayed, and clients show it as nothing. That is the smallest change
     rrcd does not parse; a leading space would be stripped. A client's short MSG or NOTICE is not
     touched: one that starts with `/` is a command, as the user meant.
-  - A long notice goes only to a room in the bouncer's room set (joined or being joined): each
-    part waits for the echo of the one before, and the hub echoes only into a room the bouncer is
-    in. To another room the sender gets `ERROR "notice not sent: a long notice goes only to a room
-    the bouncer is in"` and nothing is sent.
+  - A long notice goes only to a room the bouncer is in upstream or is about to be in: each part
+    waits for the echo of the one before, and the hub echoes only into a room the bouncer is in
+    (rrcd takes a NOTICE from a non-member of a room that is not `+n` and forwards it to the
+    members only, `rooms.py:144`, `router.py:828`, so the members would get part 1 and the sender
+    would wait 10 s for an echo that never comes). The relay (`Relay::takes_parts`) takes a room
+    of the room set (the session's, or one a client's JOIN added) that the hub has not refused on
+    this link (`rooms_failed`: `+i`, `+k`, banned, a name too long) and that is not over the hub's
+    room limit (`rooms_over_limit`). A room joined, being joined, waiting for a JOIN retry, or of
+    the room set before the WELCOME after a reconnect goes; so does a refused room a client's
+    JOIN asks for again while that JOIN is pending (the session forgets the refusal when it takes
+    the JOIN, before the parts). A room only joined, out of the room set, is being left and does
+    not. To any other room the sender gets `ERROR "notice not sent: a long notice goes only to a
+    room the bouncer is in"` and nothing is sent. The joined rooms alone would refuse a notice
+    while its room is joined again after a reconnect or a client's JOIN.
+  - The session checks again before each part goes (`Session::refuses_parts`): a part whose room
+    the hub refused, that went over the limit, or that the bouncer left (a PART) while the part
+    waited cuts its notice short from that part on, as below, with the reason
+    `<room> not joined: <the hub's text>`, `<room> not joined: over the hub's room limit` or
+    `the bouncer left <room>`; a part of it already sent is not waited for any more. A short MSG
+    or NOTICE is not checked: it goes, and the hub's answer is for its sender.
   - The parts go through the path of a client's NOTICE (`message`), each in turn: membership, the
     rate limit, the session's queue and `CLIENT_HOLD` before the WELCOME, ERROR blame, echo and
     history. They go upstream as `Command::SendPart`, each with the relay's number for the notice,
@@ -719,7 +735,7 @@ sends that upstream as ordinary NOTICEs, never as a Resource.
       that part itself reached the room is not known;
     - the session does not send it (held past `CLIENT_HOLD`, larger than the link carries, the
       queue full, not connected, the link ended): that part and the rest, with the reason a short
-      NOTICE would get.
+      NOTICE would get; or its room takes no parts any more (above): that part and the rest.
 
     The session drops the notice's parts it holds and remembers the last 64 notices cut short, so
     parts that come later are dropped too; each dropped part counts in `dropped_sends`, and the
@@ -1221,6 +1237,11 @@ rrc-bouncer status (updated 12 s ago)
   - RA sends the notice to `elsewhere`, a room the bouncer is not in: it gets
     `ERROR "notice not sent: a long notice goes only to a room the bouncer is in"` in `elsewhere`,
     rrcd forwards nothing, `client_resource_drops` goes up by exactly one and nothing is relayed.
+  - RD founds `inv` and sets it `+i`; RA asks the bouncer to join it and gets the hub's
+    `ERROR "invite-only (+i)"`. The bouncer keeps `inv` in its room set (`rooms_failed` names it)
+    until `status` shows it, and RA sends the notice to `inv`: it gets the same one ERROR in `inv`
+    at once and nothing more in the next 12 s, RD (in `inv`) gets no part, rrcd forwards nothing,
+    `client_resource_drops` goes up by exactly one and nothing is relayed.
   - From RA: an envelope of size 0 gets `ERROR "resource envelope invalid size"`; one announcing
     262145 bytes gets `ERROR "resource too large: 262145 > 262144"` and its Resource is refused;
     a Resource whose sha256 is not the announced one reaches the bouncer and is dropped with no

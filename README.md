@@ -246,8 +246,11 @@ your other clients too, and they go into the history. A text that needs more
 than 16 notices is refused with `ERROR "notice too long: …"` and nothing is
 sent. One that is too large, or announced with a size of 0 (rrcd takes that),
 is refused with an ERROR; one whose sha256 doesn't match is dropped. It goes
-only to a room the bouncer is in; to any other room it is refused with an
-ERROR.
+only to a room the bouncer is in or is joining; to any other room, a room the
+hub refused (invite-only, a bad key, banned) or one over the hub's room limit,
+it is refused with an ERROR. If the bouncer leaves the room, or the hub
+refuses or has no room for it, while notices wait to go, the rest are not sent
+and you get one ERROR saying how many.
 
 rrcd runs a notice that starts with `/` as a command, so no notice cut from a
 long one does: the cuts avoid it, and a notice that would start with `/` all
