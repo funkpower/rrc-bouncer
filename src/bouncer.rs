@@ -269,18 +269,20 @@ async fn uplink_path_responses(
 /// the latest status: a slow disk (an fsync can take seconds) never holds
 /// up the run loop, or the signal that stops it.
 struct StatusWriter {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: watch::Sender<Option<Vec<u8>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl StatusWriter {
     fn start(path: std::path::PathBuf) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // One slot: a snapshot replaces the one not written yet.
+        let (tx, mut rx) = watch::channel::<Option<Vec<u8>>>(None);
         let task = tokio::spawn(async move {
-            while let Some(mut data) = rx.recv().await {
-                while let Ok(newer) = rx.try_recv() {
-                    data = newer;
-                }
+            // changed() still yields a value set before the sender went.
+            while rx.changed().await.is_ok() {
+                let Some(data) = rx.borrow_and_update().clone() else {
+                    continue;
+                };
                 let path = path.clone();
                 let written = tokio::task::spawn_blocking(move || {
                     write_atomic(&path, &data).map_err(|e| format!("{}: {e}", path.display()))
@@ -299,7 +301,7 @@ impl StatusWriter {
     fn write(&self, status: &Status) {
         match serde_json::to_vec_pretty(status) {
             Ok(data) => {
-                let _ = self.tx.send(data);
+                self.tx.send_replace(Some(data));
             }
             Err(e) => tracing::warn!("status: {e}"),
         }
@@ -587,6 +589,29 @@ async fn futures_join_all(tasks: Vec<tokio::task::JoinHandle<()>>) {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn the_status_writer_writes_the_latest_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        let writer = StatusWriter::start(path.clone());
+        let status = |n: u32| Status {
+            pid: n,
+            started_at: 0.0,
+            updated_at: f64::from(n),
+            identity_hash: String::new(),
+            announce: false,
+            hubs: Vec::new(),
+        };
+        // Snapshots come faster than they are written: each replaces the
+        // one not written yet, and the last is what stays.
+        for n in 0..1000 {
+            writer.write(&status(n));
+        }
+        assert!(writer.stop(&status(1000), Duration::from_secs(10)).await);
+        let read: Status = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read.pid, 1000);
+    }
+
     #[test]
     fn every_status_field_has_a_key_of_its_own() {
         // The parts are flattened into one object: a name in two of them
@@ -596,7 +621,6 @@ mod tests {
             local_hub: "l".into(),
             link: UpstreamStatus {
                 hub_resources_in: 1,
-                hub_resources_out: 2,
                 hub_resource_drops: 3,
                 ..Default::default()
             },

@@ -222,9 +222,10 @@ the hub is reachable. It stays on the bouncer and never reaches the hub.
 
 ## Long messages
 
-A text too long for one packet (a long greeting, a long notice) travels as an
-RRC `RESOURCE_ENVELOPE` followed by a Reticulum Resource. The bouncer takes
-them from the hub up to 256 KiB, checks the size and sha256, and passes them
+A text too long for one packet travels as an RRC `RESOURCE_ENVELOPE` followed
+by a Reticulum Resource. Stock rrcd sends only its greeting this way, when it
+is over 512 bytes; the bouncer takes long notices from a hub that sends them
+too. It takes them up to 256 KiB, checks the size and sha256, and passes them
 on:
 
 - to a client that says it takes them (weechat-rrc, rBrowser2 and NomadNet
@@ -237,14 +238,16 @@ long one too. weechat-rrc shows a long notice in its room with its sender;
 rBrowser2 and NomadNet show it in the room as the hub's, without one. A long
 greeting goes to rBrowser2's hub tab and becomes NomadNet's MOTD.
 
-A client may send a long notice to a room as a Resource too; the bouncer
-checks it (at most 256 KiB, sha256, room joined) and passes it to the hub,
-and to your other clients in the room. One that is too large is refused with
-an ERROR; one whose sha256 doesn't match is dropped. weechat-rrc, rBrowser2
-and NomadNet never send one: they refuse a line over the hub's message limit
-or split it themselves. A hub has to take Resources from clients for this to
-work: rrcd 0.3.2 under RNS 1.6 doesn't, and the client gets
-`ERROR "not sent to the hub: the resource was not sent: …"`.
+A client may send a long notice to a room as a Resource too. The bouncer
+checks it (1 byte to 256 KiB, sha256, room joined) and sends it to the hub as
+ordinary notices, in order, each within the hub's message limit, cut at a
+newline or a space where it can. Everyone in the room sees them as notices,
+your other clients too, and they go into the history. A text that needs more
+than 16 notices is refused with `ERROR "notice too long: …"` and nothing is
+sent. One that is too large, or announced with a size of 0 (rrcd takes that),
+is refused with an ERROR; one whose sha256 doesn't match is dropped.
+weechat-rrc, rBrowser2 and NomadNet never send one: they refuse a line over
+the hub's message limit or split it themselves.
 
 ## Running under systemd
 
@@ -268,7 +271,14 @@ there), change or add `ReadWritePaths=` to match.
 One bouncer runs per `state_dir`: a second one started on the same directory
 exits with "another rrc-bouncer is running". `rrc-bouncer status` and
 `rrc-bouncer hashes` still work while it runs. On SIGTERM it closes its links,
-writes its history to disk and exits within about 25 s.
+writes its history to disk and exits within 24 s. A disk that stalls while
+the history is written can hold it longer; systemd then kills it after
+`TimeoutStopSec` (90 s by default), and records not yet on disk are lost.
+
+The unit has no `After=rnsd.service`: rnsd is usually run by hand or as a
+system service, which a user unit can't order itself after. With
+`shared_instance = true` the bouncer exits while rnsd is down and systemd
+restarts it; with `tcp` it reconnects by itself.
 
 ## Status
 
@@ -287,7 +297,7 @@ rrc-bouncer status (updated 12 s ago)
     connects         1 (0 reconnects), 0 failed attempts
     clients          2 (<identity hash>, <identity hash>)
     relayed          120 in, 2400 out
-    hub resources    1 received, 0 sent, 0 dropped
+    hub resources    1 received, 0 dropped
     client resources 0 received, 2 sent, 1 as notices, 0 dropped
     history          88950 bytes in 2 rooms
     history written  630 records, 0 dropped
@@ -308,8 +318,8 @@ Per hub:
 | `relayed` | Client messages passed to the hub, messages sent to clients |
 | `relay drops` | Messages to a client dropped because its link does not keep up |
 | `refused links` | Links of identities not allowed |
-| `hub resources` | Long messages from the hub received whole; your long notices the hub took; ones from the hub dropped |
-| `client resources` | Long notices from your clients received; Resources sent to clients whole; times one went to a client as notices; ones dropped (too large, bad hash, not taken in time) |
+| `hub resources` | Long messages from the hub received whole; ones dropped |
+| `client resources` | Long notices from your clients sent to the hub as notices; Resources sent to clients whole; times one went to a client as notices; ones dropped (too large, bad hash, not taken in time) |
 | `history` | Size on disk and rooms (as of the last write or hourly prune) |
 | `history written` | Records written since start; records dropped (disk too slow or failing) |
 | `history syncs` | Writes to disk that failed |
@@ -332,7 +342,8 @@ Lines that would say nothing (no drops, no error) are left out.
 - **History is unencrypted** on the bouncer's disk, and it holds only what
   was said while the bouncer was in the room.
 - **Long messages** are relayed up to 256 KiB; the hub's binary Resources
-  (`blob`) are not relayed.
+  (`blob`) are not relayed. A client's long notice reaches the hub as at most
+  16 ordinary notices.
 - **NomadNet** can't ask for `/history`. NomadNet and rBrowser2 show long
   notices without their sender.
 - **`shared_instance` mode can announce the local hubs** when rnsd or the
@@ -393,9 +404,9 @@ itself under another identity.
 4. `/history 5` gets "Unknown command" from NomadNet itself, and nothing
    reaches the bouncer.
 5. `/who lobby`. The answer comes to NomadNet only, not to the other clients.
-6. Have a direct client send a notice longer than one packet to `lobby`
-   (rrcd sends it on as a Resource). NomadNet shows it whole, without a
-   sender; weechat-rrc shows it with the sender.
+6. With a hub whose greeting is over 512 bytes, link NomadNet after the
+   bouncer has the greeting. NomadNet shows it whole as its MOTD, and
+   `client resources` counts one more sent.
 
 ### For every client
 

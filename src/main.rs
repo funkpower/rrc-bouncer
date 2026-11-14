@@ -129,8 +129,8 @@ fn print_relay(r: &rrc_bouncer::relay::RelayStatus) {
 
 fn print_resources(u: &rrc_bouncer::upstream::UpstreamStatus, r: &rrc_bouncer::relay::RelayStatus) {
     println!(
-        "    hub resources    {} received, {} sent, {} dropped",
-        u.hub_resources_in, u.hub_resources_out, u.hub_resource_drops
+        "    hub resources    {} received, {} dropped",
+        u.hub_resources_in, u.hub_resource_drops
     );
     println!(
         "    client resources {} received, {} sent, {} as notices, {} dropped",

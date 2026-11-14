@@ -9,10 +9,10 @@
 
 [Unit]
 Description=rrc-bouncer: one RRC identity for several RRC clients, with history
-# The bouncer reaches the network through rnsd. With shared_instance = true
-# it exits (and is restarted) while rnsd is down; with tcp it reconnects.
-After=rnsd.service network-online.target
-Wants=rnsd.service
+# The bouncer reaches the network through rnsd, which a user unit cannot
+# order itself after when rnsd is a system service or run by hand. With
+# shared_instance = true the bouncer exits (and is restarted) while rnsd is
+# down; with tcp it reconnects.
 
 [Service]
 Type=simple

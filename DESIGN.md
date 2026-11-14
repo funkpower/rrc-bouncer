@@ -323,7 +323,7 @@ send out; unit-tested), and `run`, the task per hub that owns the link and feeds
   Then every hub's history thread is stopped at once, each given 5 s to write and sync what it
   was given (a full queue is not waited on past that), the last `status.json` gets 2 s
   (`STATUS_STOP`), Reticulum is given 5 s to stop, and tasks still running get 2 s
-  (`Runtime::shutdown_timeout`): the process exits within about 24 s of the signal whatever does
+  (`Runtime::shutdown_timeout`): the process exits within 24 s of the signal whatever does
   not stop in user space. The bound does not cover a thread stuck in the kernel: an `fsync` or
   `write` on a stalled disk (a dead NFS mount, a failing drive) holds its thread, and the process
   with it, until the call returns, and no timeout in the bouncer can end it; systemd's
@@ -360,8 +360,8 @@ of time in, commands to the upstream session and envelopes for client links out)
     until then its packets are ignored.
 - **HELLO.** Answered with WELCOME: `K_SRC` the local hub, hub name
   `"<upstream name> (via rrc-bouncer)"`, the upstream's version, caps and limits: cap `0`
-  (`resource_envelope`) is on exactly when the hub's is (rrcd's default), since a client's
-  Resource can only go upstream to a hub that takes them. Before the upstream's first WELCOME: the
+  (`resource_envelope`) is on exactly when the hub's is (rrcd's default), and a client's
+  `RESOURCE_ENVELOPE` is refused while it is off, as rrcd refuses one. Before the upstream's first WELCOME: the
   local hub's name (`rrc-bouncer for <upstream hash>`), the bouncer's version, every cap on and
   rrcd's default limits. A
   later HELLO on the same link starts the client over with no rooms. Before its HELLO a client's
@@ -465,7 +465,8 @@ of time in, commands to the upstream session and envelopes for client links out)
   that answers the session's first JOIN comes next), or a client's command going upstream, ends
   it. A client's HELLO is answered with the WELCOME and then the kept greeting, `K_SRC` the local
   hub, as a client of rrcd gets it. A greeting rrcd sends as a Resource (over 512 bytes, with
-  resources on) is taken, sent and kept the same way ([Resources](#resources)).
+  resources on; a room-less kind `motd` Resource) is the greeting whenever its transfer ends, in
+  the window or after it, and is sent and kept the same way ([Resources](#resources)).
 - **Commands.** rrcd answers a slash command on the link it came from, with one NOTICE per line of
   the reply (`commands.py` `emit_notice`; `/list` and `/who` send one, with no room), or with an
   ERROR; some (`/mode`, `/topic`) also tell the room with a NOTICE naming it. Replies carry no
@@ -570,38 +571,57 @@ of time in, commands to the upstream session and envelopes for client links out)
 and the client side in `src/relay.rs`. A text too long for one link packet travels as a
 `RESOURCE_ENVELOPE` (`K_SRC`, `K_ROOM`, `K_NICK` as the NOTICE would have them; body
 `{0: id, 1: kind, 2: size, 3: sha256, 4: encoding}`) followed by a Reticulum Resource of the text's
-bytes on the same link. rrcd 0.3.2 sends one for a greeting over 512 bytes (kind `motd`, no
-room, `K_SRC` the hub; `session.py:296`, `messages.py` `send_text_smart`, `resources.py`
-`send_via_resource`) and for a long NOTICE it forwards to a room (kind `notice`), and takes one
-from a client for a room NOTICE (`router.py` `_handle_resource_envelope`, `resources.py`
-`_resource_advertised`, `_resource_concluded`).
+bytes on the same link. Stock rrcd 0.3.2 sends one only for its greeting, when it is over 512
+bytes (kind `motd`, no room, `K_SRC` the hub; `session.py:302`, `messages.py:207`
+`send_text_smart`, `resources.py` `send_via_resource`). The bouncer takes kind `notice` too, room
+or room-less, from a hub that sends one. It takes one from a client for a long room NOTICE and
+sends that upstream as ordinary NOTICEs, never as a Resource.
 
 - **Bounds**, rrcd's, on both sides: a Resource is 1 to 262144 bytes (`MAX_RESOURCE_BYTES`,
   rrcd's `max_resource_bytes`), in one segment, not a request or response, and sent uncompressed
-  (`auto_compress = false`, as rrcd sends). At most 8 announced and not yet whole per link
-  (`MAX_EXPECTED`, rrcd's `max_pending_resource_expectations`); an announcement waits at most 120 s
-  for its whole Resource (`RESOURCE_TIMEOUT`). A local hub receives at most 32 client Resources at
-  once over all its links (`HUB_RESOURCES`).
+  (`auto_compress = false`, as rrcd sends). rrcd takes a size of 0 in an envelope; the bouncer
+  refuses it as malformed (`resource::check`, the ERROR names the size), since a Resource of no
+  bytes cannot be sent. At most 8 announced and not yet whole per link (`MAX_EXPECTED`, rrcd's
+  `max_pending_resource_expectations`). A local hub receives at most 32 client Resources at once
+  over all its links (`HUB_RESOURCES`).
+- **Counting.** A `RESOURCE_ENVELOPE` is never counted. Each Resource is counted once, when it
+  ends: taken whole and matched (`*_in`, or `client_resources_out` when a client took it), or
+  dropped (`*_drops`): refused, failed, unannounced, a sha256 that is not the announced one, a
+  kind or text the bouncer does not relay, or left when its link closed or its session started
+  again.
 - **Matching.** An envelope's body is checked as rrcd checks it (`resource::check`): id bytes,
   kind a non-empty text, size from 1 to the limit, sha256 32 bytes when present. A Resource that
   comes whole is matched to a waiting envelope of the same link by size and sha256 (rrcd and the
-  clients match by size, then check the hash). The envelope and the Resource's advertisement come
-  on different channels, so either may be read first: an advertisement with no envelope yet waits
-  5 s (`OFFER_GRACE`) for one.
+  clients match by size, then check the hash), so two of one size sent together match whatever
+  order they end in. The envelope and the Resource come on different channels, so either may be
+  read first. A whole Resource with no envelope waits 5 s (`OFFER_GRACE`) for one, at most 8 and
+  512 KiB of them per link (`MAX_EARLY`, `MAX_EARLY_BYTES`); then it is dropped, and if an envelope
+  of its size waits, that envelope goes with it as a sha256 mismatch. An envelope whose Resource
+  has not come in 120 s (`RESOURCE_TIMEOUT`) is forgotten, uncounted, unless a Resource of its
+  size is still on the way on that link.
+- **Transfers are not cancelled.** rsReticulum's local hub (`DestinationHandle`) can neither cancel
+  a Resource it sends nor one it receives, and a link session's inbound handle cannot be cancelled
+  while its end is awaited (`concluded` takes it). So no transfer is given up by the bouncer: each
+  keeps its place (an inbound slot, a link's one outbound Resource) until it ends. rsReticulum ends
+  a stalled transfer with its watchdog, and every transfer of a link when the link closes, each
+  with `Concluded` failed. rsReticulum hands the local hub's resource events over a bounded
+  channel and drops one when it is full; a lost end leaves its slot taken, or its link's next
+  Resource waiting, until the link closes.
 - **From the hub** (the upstream session). The session's link takes advertisements itself
   (`ResourceStrategy::AcceptApp`, offers on `LinkSession::resource_offers`). An offer outside the
-  bounds, or with 8 already on the way, is rejected; one whose envelope is there is accepted; one
-  with none after 5 s is rejected. A whole Resource that matches its envelope is the event
-  `UpstreamEvent::Resource { envelope, data }` (counted in `hub_resources_in`). Dropped and counted
-  in `hub_resource_drops`, with a log line: a refused offer, an offer nobody announced, a Resource
-  whose sha256 is not the announced one or that matches no envelope, a transfer that failed or took
-  over 120 s, an envelope whose Resource never came, a malformed envelope. Transfers run in tasks of
-  their own; the session's loop only hands out and collects, so it never waits on one.
+  bounds, or with 8 already on the way, is refused. One whose envelope is there is accepted; one
+  with none waits 5 s for it, then is refused. A whole Resource that matches its envelope is the
+  event `UpstreamEvent::Resource { envelope, data }` (`hub_resources_in`). Dropped and counted in
+  `hub_resource_drops`, with a log line: a refused offer, an offer nobody announced, a Resource
+  whose sha256 is not the announced one or that matches no envelope in 5 s, a transfer that
+  failed, one left when the link ended. A malformed envelope, or one past the 8, is logged and
+  ignored. Transfers run in tasks of their own; the session's loop only hands out and collects, so
+  it never waits on one.
 - **To clients** (the relay). A Resource from the hub goes where the NOTICE with its text would
   ([Local hub](#local-hub): a room's clients; a room-less one is the greeting in its window, else
-  a command's answer, else every client), with `K_SRC` rewritten as for any hub envelope. A kind
-  other than `notice` or `motd` (`blob`) has nowhere to go and is dropped (counted in
-  `client_resource_drops`).
+  a command's answer, else every client), with `K_SRC` rewritten as for any hub envelope. A room-less kind `motd` Resource
+  is always the greeting (below), whenever it comes, and never answers a command. A kind other than
+  `notice` or `motd` (`blob`) has nowhere to go and is dropped (`client_resource_drops`).
   - A client whose HELLO had cap `0` true gets the `RESOURCE_ENVELOPE` (`K_ID` and body as the hub
     sent them) and then the Resource, byte for byte (`client_resources_out` when the client has it
     whole).
@@ -612,62 +632,69 @@ from a client for a room NOTICE (`router.py` `_handle_resource_envelope`, `resou
     greeting to everyone with resources off, and what any client can show.
   - Sends go through the client link's sender task and its queue, like every envelope, and are
     held during a replay of the room the same way. A link's Resources go one at a time (weechat-rrc
-    cancels the transfer it is taking when a second is advertised); envelopes go on meanwhile.
-    At most 8 wait per link (`LINK_RESOURCES`), the next is dropped; each is given 120 s to be
-    taken whole, and the sender learns the end from the hub destination's `LinkResourceEvent`
-    (`Concluded`, by resource hash). One not taken, refused or late counts in
-    `client_resource_drops`. The relay's task hands it over and goes on.
-- **The greeting.** A greeting Resource in the greeting window is kept with the greeting NOTICEs
-  (at most 16 items and 512 KiB of Resources, `MAX_GREETING_BYTES`) and given to every client that
-  says HELLO later, as a Resource or as NOTICEs by that client's cap. A greeting over those bounds
-  is still sent to the clients linked at the time; later clients get what was kept.
-- **History.** A room Resource is recorded as the NOTICEs the split makes of it, so every record
-  stays one packet's envelope and a replay sends packets only, to every client alike. The split
-  NOTICEs have new ids; a client that saw the Resource live sees the text again, split, in a
-  replay.
+    cancels the transfer it is taking when a second is advertised); envelopes go on meanwhile. At
+    most 8 wait per link (`LINK_RESOURCES`), the next is dropped. The sender learns the end from
+    the hub destination's `LinkResourceEvent` (`Concluded`, by resource hash) and only then offers
+    the next. One not taken, refused, or still waiting or held when the link closes counts in
+    `client_resource_drops`, once.
+- **The greeting.** A greeting Resource is kept with the greeting NOTICEs (at most 16 items and
+  512 KiB of Resources, `MAX_GREETING_BYTES`) and given to every client that says HELLO later, as a
+  Resource or as NOTICEs by that client's cap. A greeting over those bounds is still sent to the
+  clients linked at the time; later clients get what was kept.
+- **History.** A room Resource from the hub is recorded as the NOTICEs the split makes of it, so
+  every record stays one packet's envelope and a replay sends packets only, to every client alike.
+  The split NOTICEs have new ids; a client that saw the Resource live sees the text again, split,
+  in a replay.
 - **From clients.** A client may send a `RESOURCE_ENVELOPE` and a Resource for a long room NOTICE,
-  as rrcd takes one:
+  as rrcd takes one. The bouncer sends it upstream as ordinary NOTICEs:
   - The envelope is checked as rrcd checks it and answered with rrcd's ERROR texts:
     `resource transfer disabled` while the hub has cap `0` off, `resource too large: <n> > 262144`,
-    the malformed-body texts, `too many pending resource expectations` past 8. A refused one counts
-    in `client_resource_drops`.
+    the malformed-body texts, `too many pending resource expectations` past 8.
   - The local hub's destination decides on each advertisement on the link manager's task
     (`ResourceAcceptPolicy`, `ResourceStrategy::AcceptApp`): it takes one from a link of an
     allowed identity, within the bounds, while the link has fewer than 8 and the hub fewer than 32
     on the way, and refuses the rest (counted). Whether an envelope announced it is checked when
-    it is whole, in the relay's task.
-  - A whole Resource that matches an envelope of its link (`client_resources_in`) is a NOTICE: kind
-    `notice`, UTF-8, a room and no `K_DST`, as rrcd relays only that. It is checked as that NOTICE
-    would be (room name, joined), with `K_NICK` the hub's `nick` when one is set, and goes upstream
-    as `Command::SendResource`: the client's envelope (its `K_ID` kept) and then the bytes as a
-    Resource, through the session's queue and rate limit like `Command::Send`, held and dropped
-    under the same rules, one Resource at a time. A drop is a `SendDropped`, so the sender gets
-    `ERROR "not sent to the hub: …"`; a Resource the hub had whole counts in `hub_resources_out`.
-  - Dropped silently and counted in `client_resource_drops`: a Resource no envelope announced, one
-    whose sha256 is not the announced one (rrcd drops it silently too), a kind other than `notice`,
-    text that is not UTF-8, a NOTICE with `K_DST` or no room, an announcement whose Resource does
-    not come whole in 120 s, a transfer that fails.
-  - rrcd sends a room NOTICE that came as a Resource to the room's other links and not back to the
-    sender's (`resources.py` `_dispatch_received_resource`), so the bouncer's link gets no echo.
-    The relay gives a copy (`K_SRC` the user) to the user's other clients in the room, by each one's
-    cap, and records it in history, when the room is joined; the sender drew its own.
-- **rrcd 0.3.2 with RNS 1.6 takes no client Resource.** Its accept callback reads
-  `resource.total_size` or `resource.size` (`resources.py:253`), and RNS 1.6 hands it a
-  `ResourceAdvertisement`, which has neither: the callback raises, RNS neither accepts nor rejects,
-  and the sender's advertisement times out. The bouncer drops the Resource, counts it and the
-  client gets `ERROR "not sent to the hub: the resource was not sent: …"`. Its forward to the room
-  then calls `link.packet(payload)` (`resources.py:420`), and an `RNS.Link`'s `packet` attribute
-  is `None`, so no member would get it either. A client of rrcd directly fares the same. The e2e
-  test runs rrcd through `tests/rrcd_shim.py`, which mends both (the advertisement gets
-  `total_size`; the forward sends a packet, or an envelope and Resource for a long text, to the
-  room's other members), so the bouncer's side is checked against the hub rrcd means to be. Hubs
-  that take client Resources (a fixed rrcd, others) need nothing from the bouncer.
-- **Status.** Per hub: `hub_resources_in`, `hub_resources_out`, `hub_resource_drops` (the
-  upstream session) and `client_resources_in` (client Resources received whole and announced),
-  `client_resources_out` (Resources clients took whole), `client_resources_split` (Resources sent
-  to a client as NOTICEs) and `client_resource_drops` (the relay: client Resources and envelopes
-  refused or dropped, Resources to clients not taken, hub `blob`s). The keys are distinct across
-  the parts of a hub entry, which `status.json` flattens into one object (a unit test checks it).
+    it is whole, in the relay's task. A new HELLO on the link forgets its envelopes and the
+    Resources waiting for one (those are counted dropped); a transfer under way keeps its slot
+    until it ends.
+  - A whole Resource that matches an envelope of its link is a NOTICE: kind `notice`, UTF-8, a
+    room and no `K_DST`, as rrcd relays only that. Its text is cut into NOTICEs
+    (`resource::parts`): each body at most the hub's `max_msg_body_bytes` (350 before the first
+    WELCOME, rrcd's default) and each envelope, with the client's envelope fields and `K_NICK` the
+    hub's `nick` when one is set, within one packet (`LINK_MDU`). Cuts fall on UTF-8 boundaries,
+    at the last newline in the second half of a part, else the last whitespace, else as full as
+    the part goes; the separator is left out, and no part but the first starts with `/` (rrcd
+    takes a NOTICE whose text starts with `/` as a command). Parts are in order, each with a new
+    8-byte id. If 16 parts (`MAX_PARTS`) cannot hold the text cut that way, it is cut as full as
+    each part goes; if that still needs more than 16, nothing is sent and the sender gets
+    `ERROR "notice too long: <n> bytes > <m>"`, `<m>` 16 times the most one part holds.
+  - The parts go through the path of a client's NOTICE (`message`), each in turn: membership, the
+    rate limit, command handling, the session's queue and `CLIENT_HOLD` before the WELCOME, ERROR
+    blame, echo and history. What the hub would refuse each part for is answered once, and the
+    parts go all or none: if the relay's queue to the session has no room for all of them the
+    sender gets `ERROR "not sent to the hub: the bouncer's queue is full"`. Before the upstream's
+    first WELCOME a client's `RESOURCE_ENVELOPE` is taken like a short NOTICE: the parts are queued
+    for the session or dropped with the same ERROR a short NOTICE would get.
+  - rrcd echoes each NOTICE to the room, the bouncer's link included, so the user's clients in the
+    room (the sender too) get the parts at their echo, in order, as for any room NOTICE, and
+    history records them there. A direct client of rrcd gets the parts as ordinary NOTICEs.
+  - `client_resources_in` counts the text once when its parts go; `relayed_in` counts each part.
+    Dropped silently and counted in `client_resource_drops`: a Resource no envelope announced, one
+    whose sha256 is not the announced one (rrcd drops it silently too), a kind other than
+    `notice`, text that is not UTF-8, a NOTICE with `K_DST` or no room, a transfer that fails. A
+    refusal with an ERROR (too long, a full queue, a room the user is not in) counts it dropped
+    too.
+  - Sending the text on as NOTICEs keeps it readable to every client of the hub. rrcd 0.3.2 with
+    RNS 1.6 takes no client Resource: its accept callback reads `resource.total_size` or
+    `resource.size` (`resources.py:253`) of a `ResourceAdvertisement`, which has neither, so the
+    advertisement times out; and its forward to the room calls `link.packet(payload)`
+    (`resources.py:420`), which is `None` on an `RNS.Link`.
+- **Status.** Per hub: `hub_resources_in` and `hub_resource_drops` (the upstream session),
+  `client_resources_in` (client texts sent on as NOTICEs), `client_resources_out` (Resources
+  clients took whole), `client_resources_split` (Resources sent to a client as NOTICEs) and
+  `client_resource_drops` (the relay: client Resources dropped or refused, Resources to clients
+  not taken, hub `blob`s). The keys are distinct across the parts of a hub entry, which
+  `status.json` flattens into one object (a unit test checks it).
 
 ## History
 
@@ -704,7 +731,12 @@ from a client for a room NOTICE (`router.py` `_handle_resource_envelope`, `resou
   sync of it succeeds: one that fails is tried again 5 s later, counted in `history_sync_errors`
   and warned about at most once a minute.
 - **Damage.** A record counts only if it decodes as a record and its envelope decodes as an
-  envelope (a record cut short reads on into the next one, and its envelope then does not).
+  envelope (a record cut short reads on into the next one, and its envelope then mostly does
+  not), and if it ends at the end of the file, at the start of a record, or with no record
+  starting inside it. A record cut inside an envelope whose last field is a byte string can read
+  on into the next record and still decode; it does not end where a record starts, and a record
+  that reads starts inside it, so it is taken as damage and the record it ran into is kept, and
+  never rewritten away by a prune.
   - Before a room file is first appended to, it is read through and the thread knows its good
     length: where its last whole record ends. Before each append the file's length is checked
     against that; bytes past it that are no record (a write cut short by a crash or a full disk,
@@ -760,13 +792,24 @@ from a client for a room NOTICE (`router.py` `_handle_resource_envelope`, `resou
     are held (up to 512, the rest dropped and counted in `relay_drops`) and sent after
     `--- end of replay ---`, so the client sees them in order and none twice: the query is queued
     when the client joins, before any live envelope that follows is recorded.
+  - What was held is let out one item per turn of the link's sender, so the link's other
+    envelopes and replay commands are not held up behind it. Until the last of it is out, the
+    room's new envelopes queue after it (at most 1024 together, `MAX_FLUSHING`, the rest dropped
+    and counted), and the link's next replay waits.
+  - A replay is asked for only if the client's JOINED for it was queued: when that was dropped
+    (the link's queue full) the replay is not run, nothing is said, and the relay is told it is
+    over. At most 32 replay commands wait for a link's sender (`CONTROL_QUEUE`); one more is not
+    run and the client gets `--- replay of <room> skipped: the link is busy ---` from the local
+    hub. The relay keeps at most one replay per client and room, so a JOIN repeated while one runs
+    asks for none; an end of a replay is never refused, and drops the waiting replays of its room.
   - The bouncer's own notices (the `/history` usage, `--- a replay of <room> is running ---`) are
     never held. A replay with nothing to send says `--- no history in <room> ---` at once, without
     waiting for the link's other replays.
   - Each replay has an id. A replay still running 120 s after it was asked is ended: what is left
     of it is not sent, what was held is (logged). Its late end is told apart by the id and does
     not end a newer replay of the room.
-  - A PART of the room ends the client's replay of it and drops what was held for it, and the
+  - A PART of the room ends the client's replay of it and drops what was held for it or is still
+    being let out (its Resources counted in `client_resource_drops`), and the
     PARTED goes out at once, before any later line of the room; a JOIN after that starts a fresh
     replay. A HELLO ends all of the link's replays (before its WELCOME). A link that closes stops
     its sender and everything queued for it.
@@ -825,6 +868,9 @@ the default `state_dir` (`ReadWritePaths`), which holds the `state_dir/lock` flo
 daemon that writes only its state directory. `ProtectSystem=strict` alone leaves `/home` writable
 in a user unit (systemd 262), hence `ProtectHome`. The flock was checked under these settings in a
 transient unit: taken in the state directory, refused while another process holds it.
+The unit has no `After=` or `Wants=` on `rnsd.service`: a user unit cannot order itself after a
+system unit, and rnsd is often run by hand. `Restart=always` covers a bouncer in
+`shared_instance` mode that exits while rnsd is down; in `tcp` mode it reconnects by itself.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -915,10 +961,11 @@ As of M4:
 
 As of M5:
 
-- `run` relays Resources both ways ([Resources](#resources)).
-- Each `hubs` entry adds `hub_resources_in`, `hub_resources_out`, `hub_resource_drops`,
-  `client_resources_in`, `client_resources_out`, `client_resources_split` and
-  `client_resource_drops`. A file without these fields still reads.
+- `run` relays Resources from the hub to clients, and sends a client's long notice upstream as
+  NOTICEs ([Resources](#resources)).
+- Each `hubs` entry adds `hub_resources_in`, `hub_resource_drops`, `client_resources_in`,
+  `client_resources_out`, `client_resources_split` and `client_resource_drops`. A file without
+  these fields still reads, and so does one with fields it does not know.
 
 ### `status`
 
@@ -948,7 +995,7 @@ rrc-bouncer status (updated 12 s ago)
     relayed          120 in, 2400 out
    [relay drops      <n>]
    [refused links    <n>]
-    hub resources    1 received, 0 sent, 0 dropped
+    hub resources    1 received, 0 dropped
     client resources 0 received, 2 sent, 1 as notices, 0 dropped
     history          88950 bytes in 2 rooms
     history written  630 records, 0 dropped
@@ -968,7 +1015,7 @@ rrc-bouncer status (updated 12 s ago)
 | `last_connected_at`, `last_disconnected_at`, `last_error`, `next_attempt_at` | The link's history |
 | `connects`, `reconnects`, `failed_attempts` | Welcomed links, welcomed links after the first, attempts with no WELCOME |
 | `unhandled`, `dropped_sends`, `dropped_events` | Hub envelopes nothing took (by type), client envelopes not sent upstream, events the relay did not take |
-| `hub_resources_in`, `hub_resources_out`, `hub_resource_drops` | Resources from the hub taken whole, client Resources the hub took whole, Resources and envelopes from the hub dropped |
+| `hub_resources_in`, `hub_resource_drops` | Resources from the hub taken whole and matched, Resources from the hub dropped ([Resources](#resources)) |
 | `clients`, `client_identities`, `refused_links` | Client links, their identities, links of other identities refused |
 | `relayed_in`, `relayed_out`, `relay_drops` | Client envelopes passed upstream, envelopes sent to clients, envelopes dropped |
 | `client_resources_in`, `client_resources_out`, `client_resources_split`, `client_resource_drops` | [Resources](#resources) |

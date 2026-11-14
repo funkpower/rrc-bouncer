@@ -38,7 +38,7 @@ use crate::config::normalize_room;
 use crate::envelope::{Caps, Envelope, Hello, Limits, MessageType, Raw, ResourceEnvelope, Welcome, now_ms};
 use crate::history::{self, History, Query, Record};
 use crate::identity::hub_address;
-use crate::resource::{self, Expectations, LINK_MDU, MAX_RESOURCE_BYTES, Matched};
+use crate::resource::{self, Expectations, Expected, LINK_MDU, MAX_RESOURCE_BYTES};
 use crate::upstream::{CLIENT_HOLD, Command, EventReceiver, Inbound, SharedStatus, UpstreamEvent, local_name};
 
 /// A link that has not identified this long after it was established is
@@ -230,18 +230,19 @@ pub struct RelayStatus {
     /// Client envelopes the session's queue had no room for, and envelopes
     /// a client link could not take.
     pub relay_drops: u64,
-    /// Client Resources received whole and matching their
-    /// RESOURCE_ENVELOPE.
+    /// Client Resources received whole, matching their RESOURCE_ENVELOPE,
+    /// and sent upstream as NOTICEs.
     pub client_resources_in: u64,
     /// Resources a client received whole, one per client.
     pub client_resources_out: u64,
     /// Resources sent as NOTICEs to a client without the
     /// `resource_envelope` cap, one per client.
     pub client_resources_split: u64,
-    /// Resources dropped: from clients (refused, unannounced, a size or
-    /// sha256 other than announced, not a room notice, failed, timed out,
-    /// announced and never sent), and to clients (not taken in time, too
-    /// many waiting); and the hub's `blob` Resources.
+    /// Resources dropped, each once, when it ended: from clients (refused,
+    /// failed, announced by no RESOURCE_ENVELOPE, a sha256 other than
+    /// announced, not a room notice, refused as its NOTICEs would be, too
+    /// long), to clients (not taken, too many waiting, the link closed
+    /// first), and the hub's `blob` Resources.
     pub client_resource_drops: u64,
 }
 
@@ -307,9 +308,6 @@ enum Kind {
     Room,
     /// A direct NOTICE.
     Direct,
-    /// A room notice sent as a Resource: never echoed, and never what a
-    /// hub ERROR answers.
-    Resource,
     /// A MSG or NOTICE whose body, trimmed, starts with `/`: rrcd's slash
     /// command, whatever its room or K_DST.
     Command,
@@ -711,7 +709,9 @@ impl Relay {
 
     pub fn link_closed(&mut self, link: Link) {
         if let Some(client) = self.clients.remove(&link) {
-            let waiting = client.expected.len() as u64;
+            // A Resource that came whole and waits for its envelope; an
+            // envelope alone is not a Resource.
+            let waiting = client.expected.early() as u64;
             if waiting > 0 {
                 self.tally(|s| s.client_resource_drops += waiting);
             }
@@ -782,11 +782,18 @@ impl Relay {
             MessageType::Pong => {}
             MessageType::Hello => {
                 let caps = env.body.as_ref().map(|b| Hello::from_body(b).caps).unwrap_or_default();
+                let mut forgotten = 0;
                 if let Some(client) = self.clients.get_mut(&link) {
                     client.welcomed = true;
                     client.rooms.clear();
                     client.pending.clear();
                     client.resources = caps.resource_envelope;
+                    // The old session's envelopes, and its Resources still
+                    // waiting for theirs, go with it.
+                    forgotten = client.expected.clear() as u64;
+                }
+                if forgotten > 0 {
+                    self.tally(|s| s.client_resource_drops += forgotten);
                 }
                 // A new session on the link: it is in no room, so its
                 // replays end.
@@ -1144,7 +1151,9 @@ impl Relay {
     }
 
     /// A client's RESOURCE_ENVELOPE, checked as rrcd checks one: kept
-    /// until its Resource comes, or refused with rrcd's ERROR.
+    /// until its Resource comes (or matched with one that came first), or
+    /// refused with rrcd's ERROR. An envelope is not counted: its
+    /// Resource is, when it ends.
     fn resource_envelope(&mut self, link: Link, env: Envelope, now: Instant, out: &mut Vec<Output>) {
         let checked = if self.welcome.as_ref().is_some_and(|w| !w.caps.resource_envelope) {
             Err("resource transfer disabled".to_string())
@@ -1153,37 +1162,33 @@ impl Relay {
         };
         let refused = match checked {
             Ok(body) => match self.clients.get_mut(&link) {
-                Some(client) => {
-                    if client.expected.add(env.clone(), body, now) {
-                        None
-                    } else {
-                        Some("too many pending resource expectations".to_string())
-                    }
-                }
+                Some(client) => match client.expected.add(env.clone(), body, now) {
+                    Ok(None) => None,
+                    Ok(Some((expected, data))) => return self.announced_resource(link, expected, data, now, out),
+                    Err(resource::TooMany) => Some("too many pending resource expectations".to_string()),
+                },
                 None => return,
             },
             Err(text) => Some(text),
         };
         if let Some(text) = refused {
             tracing::info!("client {}: refused a RESOURCE_ENVELOPE: {text}", hex::encode(link));
-            self.tally(|s| s.client_resource_drops += 1);
             out.push(Output::Client(link, self.error(env.room.as_deref(), &text)));
         }
     }
 
-    /// A Resource a client link sent, whole. One that a RESOURCE_ENVELOPE
-    /// of the link announced (its size and sha256) is a `notice` for a
-    /// room: it is checked as the NOTICE with its text would be, and goes
-    /// upstream as a RESOURCE_ENVELOPE and Resource. It is never a command
-    /// (rrcd reads none in a Resource). rrcd sends it to no other link of
-    /// the user, so the user's other clients in the room get a copy, and
-    /// it is kept in the room's history. Anything else is dropped and
-    /// counted.
+    /// A Resource a client link sent, whole. One a RESOURCE_ENVELOPE of
+    /// the link announced (its size and sha256) goes on as
+    /// [`Self::announced_resource`]; one that came before its envelope
+    /// waits for it `OFFER_GRACE`; anything else is dropped and counted.
     pub fn client_resource(&mut self, link: Link, data: Vec<u8>, now: Instant) -> Vec<Output> {
         let mut out = Vec::new();
-        let tag = hex::encode(link);
+        let size = data.len();
         let drop = |relay: &Self, why: &str| {
-            tracing::info!("client {tag}: dropped a resource of {} bytes: {why}", data.len());
+            tracing::info!(
+                "client {}: dropped a resource of {size} bytes: {why}",
+                hex::encode(link)
+            );
             relay.tally(|s| s.client_resource_drops += 1);
         };
         let Some(client) = self.clients.get_mut(&link) else {
@@ -1194,24 +1199,44 @@ impl Relay {
             drop(self, "the link said no HELLO");
             return out;
         }
-        let expected = match client.expected.take(&data) {
-            Matched::Verified(e) => e,
-            Matched::Mismatch(_) => {
-                drop(self, "its sha256 is not the one announced");
-                return out;
-            }
-            Matched::Unmatched => {
-                drop(self, "no RESOURCE_ENVELOPE announced it");
-                return out;
-            }
+        match client.expected.take(data, now) {
+            Ok(Some((expected, data))) => self.announced_resource(link, expected, data, now, &mut out),
+            Ok(None) => tracing::debug!(
+                "client {}: a resource of {size} bytes waits for its envelope",
+                hex::encode(link)
+            ),
+            Err(why) => drop(self, &why),
+        }
+        out
+    }
+
+    /// A client's Resource and the RESOURCE_ENVELOPE that announced it: a
+    /// `notice` for a room, in UTF-8. Its text is not sent upstream as a
+    /// Resource: it goes as the NOTICEs [`resource::parts`] cuts it into,
+    /// each as a client's NOTICE goes ([`Self::message`]), at most
+    /// `MAX_PARTS`; a longer text is refused with an ERROR and nothing is
+    /// sent. Counted once: in when its NOTICEs go, or dropped.
+    fn announced_resource(
+        &mut self,
+        link: Link,
+        expected: Expected,
+        data: Vec<u8>,
+        now: Instant,
+        out: &mut Vec<Output>,
+    ) {
+        let drop = |relay: &Self, why: &str| {
+            tracing::info!(
+                "client {}: dropped a resource of {} bytes: {why}",
+                hex::encode(link),
+                data.len()
+            );
+            relay.tally(|s| s.client_resource_drops += 1);
         };
-        self.tally(|s| s.client_resources_in += 1);
         if expected.body.kind != resource::KIND_NOTICE {
-            drop(
+            return drop(
                 self,
                 &format!("a {:?} resource: only notices are relayed", expected.body.kind),
             );
-            return out;
         }
         if expected
             .body
@@ -1219,78 +1244,60 @@ impl Relay {
             .as_deref()
             .is_some_and(|e| !e.eq_ignore_ascii_case("utf-8") && !e.eq_ignore_ascii_case("utf8"))
         {
-            drop(self, "not UTF-8");
-            return out;
+            return drop(self, "not UTF-8");
         }
-        let Ok(text) = String::from_utf8(data.clone()) else {
-            drop(self, "not UTF-8");
-            return out;
+        let Ok(text) = std::str::from_utf8(&data) else {
+            return drop(self, "not UTF-8");
         };
-        let mut envelope = expected.envelope;
+        let envelope = expected.envelope;
         if envelope.dst.is_some() || envelope.room.as_deref().is_none_or(str::is_empty) {
-            drop(self, "rrcd relays only a room notice");
-            return out;
+            return drop(self, "rrcd relays only a room notice");
         }
-        let notice = resource::notice_of(&envelope, &text);
-        let room = match self.check(&notice, Kind::Room) {
-            Ok(Some(room)) => room,
-            Ok(None) | Err(None) => {
-                drop(self, "no room");
-                return out;
-            }
-            Err(Some(text)) => {
-                self.tally(|s| s.client_resource_drops += 1);
-                out.push(Output::Client(link, self.error(None, &text)));
-                return out;
-            }
-        };
+        let mut notice = resource::notice_of(&envelope, text);
+        // The nick goes on before the cut, so each part still fits.
         if let Some(nick) = &self.nick {
-            envelope.nick = Some(nick.clone());
+            notice.nick = Some(nick.clone());
         }
-        let data = Arc::new(data);
-        let id = envelope.id.clone();
-        let mut copy = envelope.clone();
-        copy.src = self.user.to_vec();
-        let sent = Command::SendResource {
-            envelope,
-            data: data.clone(),
-        };
-        if self.commands.try_send(sent).is_err() {
-            self.tally(|s| s.relay_drops += 1);
-            out.push(Output::Client(
-                link,
-                self.error(Some(&room), "not sent to the hub: the bouncer's queue is full"),
-            ));
-            return out;
-        }
-        self.tally(|s| s.relayed_in += 1);
-        if self.sent.len() >= MAX_SENT {
-            self.sent.pop_front();
-        }
-        self.sent.push_back(Sent {
-            id,
-            link,
-            t: MessageType::Notice,
-            room: Some(room.clone()),
-            kind: Kind::Resource,
-            at: now,
-            wait: ANSWER_WAIT,
-            stale: false,
-        });
-        if self.connected() && self.joined.contains_key(&room) {
-            let notice = resource::notice_of(&copy, &text);
-            for chunk in resource::split(&notice) {
-                self.record(&room, &chunk);
+        let max = usize::try_from(self.limits().max_msg_body_bytes).unwrap_or(usize::MAX);
+        let room = envelope.room.as_deref().and_then(normalize_room);
+        let parts = match resource::parts(&notice, max) {
+            (Some(parts), _) if !parts.is_empty() => parts,
+            (Some(_), _) => return drop(self, "no text"),
+            (None, most) => {
+                drop(self, "too long");
+                let error = self.error(
+                    room.as_deref(),
+                    &format!("notice too long: {} bytes > {most}", text.len()),
+                );
+                return out.push(Output::Client(link, error));
             }
-            let links: Vec<Link> = self.in_room(&room).into_iter().filter(|l| *l != link).collect();
-            let item = Item::Resource {
-                envelope: copy,
-                notice: Box::new(notice),
-                data,
-            };
-            self.deliver_item(&mut out, &links, &item);
+        };
+        // What the hub would refuse every part for is answered once, and
+        // the parts go all or none.
+        match self.check(&parts[0], kind_of(&parts[0])) {
+            Ok(_) => {}
+            Err(None) => return drop(self, "no room"),
+            Err(Some(text)) => {
+                drop(self, &text);
+                return out.push(Output::Client(link, self.error(None, &text)));
+            }
         }
-        out
+        if self.commands.capacity() < parts.len() {
+            drop(self, "the bouncer's queue is full");
+            self.tally(|s| s.relay_drops += 1);
+            let error = self.error(room.as_deref(), "not sent to the hub: the bouncer's queue is full");
+            return out.push(Output::Client(link, error));
+        }
+        tracing::debug!(
+            "client {}: a notice of {} bytes goes as {} NOTICEs",
+            hex::encode(link),
+            text.len(),
+            parts.len()
+        );
+        self.tally(|s| s.client_resources_in += 1);
+        for part in parts {
+            self.message(link, part, now, out);
+        }
     }
 
     /// A Resource from a client link that will not come whole (it failed,
@@ -1376,9 +1383,10 @@ impl Relay {
         out
     }
 
-    /// A Resource from the hub: a `notice` or `motd` goes where the NOTICE
-    /// with its text would, and is kept as NOTICEs in history (each fits a
-    /// history record). A `blob` has nowhere to go: dropped and counted.
+    /// A Resource from the hub: a `notice` goes where the NOTICE with its
+    /// text would, and is kept as NOTICEs in history (each fits a history
+    /// record); a room-less `motd` is the greeting. A `blob` has nowhere
+    /// to go: dropped and counted.
     fn hub_resource(&mut self, envelope: Envelope, data: Arc<Vec<u8>>, now: Instant, out: &mut Vec<Output>) {
         let Some(body) = envelope.body.as_ref().and_then(ResourceEnvelope::from_body) else {
             return;
@@ -1392,10 +1400,18 @@ impl Relay {
             return;
         }
         let notice = resource::notice_of(&envelope, &resource::text(&data));
-        if !(notice.room.is_none() && notice.dst.is_none()) {
+        let roomless = notice.room.is_none() && notice.dst.is_none();
+        if !roomless {
             self.greeting_until = None;
         }
-        let (links, record, greeting) = self.route(&notice, now);
+        // rrcd sends a long greeting as a room-less `motd` Resource and
+        // nothing else so: it is the greeting whenever it ends, and no
+        // command's answer.
+        let (links, record, greeting) = if roomless && body.kind == resource::KIND_MOTD {
+            (self.welcomed(), None, true)
+        } else {
+            self.route(&notice, now)
+        };
         if let Some(room) = record {
             for chunk in resource::split(&notice) {
                 self.record(&room, &chunk);
@@ -1654,6 +1670,12 @@ impl Relay {
     /// Time passing: close links that never identified, forget old sends,
     /// end replays that never said they were done.
     pub fn tick(&mut self, now: Instant) -> Vec<Output> {
+        self.tick_busy(now, &std::collections::HashSet::new())
+    }
+
+    /// [`Self::tick`], given the sizes of the client Resources each link
+    /// is still sending: their envelopes wait on.
+    pub fn tick_busy(&mut self, now: Instant, busy: &std::collections::HashSet<(Link, u64)>) -> Vec<Output> {
         let stuck: Vec<(Link, String)> = self
             .replaying
             .iter()
@@ -1681,10 +1703,22 @@ impl Relay {
         for link in &late {
             self.clients.remove(link);
         }
-        let expired: u64 = self.clients.values_mut().map(|c| c.expected.expire(now) as u64).sum();
-        if expired > 0 {
-            tracing::info!("{expired} announced client resources did not come in time");
-            self.tally(|s| s.client_resource_drops += expired);
+        let mut dropped = Vec::new();
+        let mut forgotten = 0;
+        for (link, client) in &mut self.clients {
+            let (gone, envelopes) = client.expected.expire(now, |size| busy.contains(&(*link, size)));
+            dropped.extend(gone.into_iter().map(|why| (*link, why)));
+            forgotten += envelopes;
+        }
+        if forgotten > 0 {
+            tracing::info!("{forgotten} announced client resources did not come in time");
+        }
+        for (link, why) in &dropped {
+            tracing::info!("client {}: dropped a resource: {why}", hex::encode(link));
+        }
+        if !dropped.is_empty() {
+            let n = dropped.len() as u64;
+            self.tally(|s| s.client_resource_drops += n);
         }
         self.sent.retain(|s| now.saturating_duration_since(s.at) < s.wait);
         self.pending_commands
@@ -1746,8 +1780,18 @@ pub struct LocalHub {
 }
 
 /// The client Resources a local hub accepted and is receiving, by link and
-/// resource hash, since when.
-pub type ResourceSlots = Arc<Mutex<HashMap<(Link, [u8; 32]), Instant>>>;
+/// resource hash, with their size. One is kept until its transfer ends
+/// (rsReticulum ends a stalled one with its watchdog, and all of a link's
+/// with the link): the local hub cannot cancel a transfer.
+pub type ResourceSlots = Arc<Mutex<HashMap<(Link, [u8; 32]), u64>>>;
+
+/// The sizes of the client Resources each link is sending.
+fn busy_sizes(slots: &ResourceSlots) -> std::collections::HashSet<(Link, u64)> {
+    slots
+        .lock()
+        .map(|slots| slots.iter().map(|((link, _), size)| (*link, *size)).collect())
+        .unwrap_or_default()
+}
 
 /// The most client Resources a local hub receives at once, all links.
 const HUB_RESOURCES: usize = 32;
@@ -1757,8 +1801,9 @@ const HUB_RESOURCES: usize = 32;
 /// takes a Resource of 1 to `MAX_RESOURCE_BYTES` bytes, in one segment,
 /// not a request or response, from an allowed identity, while that link
 /// receives fewer than `MAX_EXPECTED` and the hub fewer than
-/// `HUB_RESOURCES`; the rest are refused (and counted). Whether a
-/// RESOURCE_ENVELOPE announced it is checked when it is whole.
+/// `HUB_RESOURCES`; the rest are refused (and counted: rsReticulum tells
+/// nothing more of a refused advertisement). Whether a RESOURCE_ENVELOPE
+/// announced it is checked when it is whole.
 pub fn resource_policy(
     identities: LinkIdentities,
     allowed: Vec<[u8; 16]>,
@@ -1776,8 +1821,6 @@ pub fn resource_policy(
             Some("a request or response".to_string())
         } else {
             let Ok(mut slots) = slots.lock() else { return false };
-            let now = Instant::now();
-            slots.retain(|_, at| now.duration_since(*at) < resource::RESOURCE_TIMEOUT);
             if slots.contains_key(&(link, adv.resource_hash)) {
                 return true;
             }
@@ -1787,7 +1830,7 @@ pub fn resource_policy(
             } else if slots.len() >= HUB_RESOURCES {
                 Some(format!("{} come already", slots.len()))
             } else {
-                slots.insert((link, adv.resource_hash), now);
+                slots.insert((link, adv.resource_hash), adv.data_size as u64);
                 None
             }
         };
@@ -1840,6 +1883,14 @@ impl ResourceWaiters {
             }
         }
         rx
+    }
+
+    /// A client link closed: nothing it was sent will be waited for.
+    fn forget(&self, link: Link) {
+        if let Ok(mut w) = self.0.lock() {
+            w.waiting.retain(|(l, _), _| *l != link);
+            w.early.retain(|(l, _), _| *l != link);
+        }
     }
 
     /// A Resource sent to a client link ended: taken whole, or not.
@@ -1945,6 +1996,25 @@ enum Held {
 /// A link's Resources waiting their turn.
 type ResourceQueue = VecDeque<(Envelope, Arc<Vec<u8>>)>;
 
+/// The room an item held for a link is for.
+fn held_room(item: &Held) -> Option<String> {
+    let env = match item {
+        Held::Env(env) | Held::Resource(env, _) => env,
+    };
+    env.room.as_deref().and_then(normalize_room)
+}
+
+/// The most replay commands (a replay asked for, or ended) waiting for a
+/// link's sender task; a replay asked for beyond it is refused.
+const CONTROL_QUEUE: usize = 32;
+
+/// The most items waiting to follow those released after a replay.
+const MAX_FLUSHING: usize = 2 * MAX_HELD;
+
+/// A link's count of Resources once the link has closed and what was left
+/// was counted (see [`Links::close`]).
+const CLOSED: usize = usize::MAX;
+
 /// What a sender task shares: who it is, what it tells, where it counts.
 #[derive(Clone)]
 struct LinkTask<S> {
@@ -1953,6 +2023,8 @@ struct LinkTask<S> {
     ids: ([u8; 16], [u8; 16]),
     status: SharedRelayStatus,
     done: mpsc::UnboundedSender<(Link, String, u64)>,
+    /// The Resources given to the task and not ended yet.
+    resources: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<S: LinkSink> LinkTask<S> {
@@ -1982,41 +2054,58 @@ impl<S: LinkSink> LinkTask<S> {
         }
     }
 
-    /// Send a RESOURCE_ENVELOPE, then its Resource, and wait (given
-    /// `RESOURCE_TIMEOUT`) until the link has it.
+    /// One of the link's Resources ended: the client took it, or it was
+    /// dropped. Counted under the status lock, so it is never counted
+    /// again by [`Links::close`].
+    fn resource_ended(&self, taken: bool) {
+        use std::sync::atomic::Ordering;
+        let Ok(mut s) = self.status.lock() else { return };
+        let left = self.resources.load(Ordering::Relaxed);
+        if left == CLOSED {
+            return;
+        }
+        self.resources.store(left.saturating_sub(1), Ordering::Relaxed);
+        if taken {
+            s.client_resources_out += 1;
+        } else {
+            s.client_resource_drops += 1;
+        }
+    }
+
+    /// Items held for the link that will not go: its Resources are
+    /// counted dropped.
+    fn forget(&self, items: impl IntoIterator<Item = Held>) {
+        for item in items {
+            if let Held::Resource(..) = item {
+                self.resource_ended(false);
+            }
+        }
+    }
+
+    /// Send a RESOURCE_ENVELOPE, then its Resource, and wait until the
+    /// transfer ends: the local hub cannot cancel one, so the next is not
+    /// offered while it runs (rsReticulum's watchdog ends a stalled one).
     async fn resource(&self, env: Envelope, data: Arc<Vec<u8>>) {
         let failure = if !self.send(&env).await {
             Some("its RESOURCE_ENVELOPE was not sent".to_string())
         } else {
-            match tokio::time::timeout(
-                resource::RESOURCE_TIMEOUT,
-                self.sink.send_resource(self.link, data.to_vec()),
-            )
-            .await
-            {
-                Ok(Ok(())) => None,
-                Ok(Err(e)) => Some(e),
-                Err(_) => Some(format!("not taken in {}s", resource::RESOURCE_TIMEOUT.as_secs())),
-            }
+            self.sink.send_resource(self.link, data.to_vec()).await.err()
         };
-        match failure {
-            None => self.tally(|s| s.client_resources_out += 1),
-            Some(e) => {
-                self.tally(|s| s.client_resource_drops += 1);
-                tracing::info!(
-                    "a resource of {} bytes to link {} was dropped: {e}",
-                    data.len(),
-                    hex::encode(self.link)
-                );
-            }
+        if let Some(e) = &failure {
+            tracing::info!(
+                "a resource of {} bytes to link {} was dropped: {e}",
+                data.len(),
+                hex::encode(self.link)
+            );
         }
+        self.resource_ended(failure.is_none());
     }
 
     /// Queue a Resource for the link, or drop it (counted) when
     /// `LINK_RESOURCES` wait already.
     fn queue(&self, resources: &mut ResourceQueue, env: Envelope, data: Arc<Vec<u8>>) {
         if resources.len() >= LINK_RESOURCES {
-            self.tally(|s| s.client_resource_drops += 1);
+            self.resource_ended(false);
             tracing::info!(
                 "link {}: {LINK_RESOURCES} resources wait: one dropped",
                 hex::encode(self.link)
@@ -2026,23 +2115,10 @@ impl<S: LinkSink> LinkTask<S> {
         }
     }
 
-    /// Send what was held for a room, in order; its Resources queue.
-    async fn release(&self, items: Vec<Held>, resources: &mut ResourceQueue) {
-        for item in items {
-            match item {
-                Held::Env(env) => {
-                    self.send(&env).await;
-                }
-                Held::Resource(env, data) => self.queue(resources, env, data),
-            }
-        }
-    }
-
-    /// A replay is over: what was held for its room follows, then the
-    /// relay is told.
-    async fn finish(&self, replay: LinkReplay, held: &mut BTreeMap<String, Vec<Held>>, resources: &mut ResourceQueue) {
-        self.release(held.remove(&replay.room).unwrap_or_default(), resources)
-            .await;
+    /// A replay is over: what was held for its room follows, one item a
+    /// turn, then the relay is told.
+    fn finish(&self, replay: LinkReplay, held: &mut BTreeMap<String, Vec<Held>>, flushing: &mut VecDeque<Held>) {
+        flushing.extend(held.remove(&replay.room).unwrap_or_default());
         let _ = self.done.send((self.link, replay.room, replay.id));
     }
 
@@ -2052,23 +2128,44 @@ impl<S: LinkSink> LinkTask<S> {
     }
 }
 
+/// Where a link's sender puts an envelope or Resource for a room: held
+/// while the room's replay runs, after what of the room is still being
+/// released, or out now.
+enum Place {
+    Held,
+    Flushing,
+    Now,
+}
+
+fn place(room: Option<&String>, held: &BTreeMap<String, Vec<Held>>, flushing: &VecDeque<Held>) -> Place {
+    match room {
+        Some(r) if held.contains_key(r) => Place::Held,
+        Some(r) if flushing.iter().any(|h| held_room(h).as_ref() == Some(r)) => Place::Flushing,
+        _ => Place::Now,
+    }
+}
+
 /// One client link's sender: sends what the relay's task gives it in
 /// order, never holding the relay's task up. Its replays go one after
 /// another, one envelope every `REPLAY_PACE`; while a room's replay waits
 /// or runs, the room's other envelopes are held (`MAX_HELD`, the rest
-/// dropped) and sent after it. The bouncer's own notices are never held.
-/// Resources go one at a time (a client takes one at a time: weechat-rrc
-/// cancels the one it is taking when another is offered); envelopes go on
-/// meanwhile.
+/// dropped) and released after it, one a turn, so a PART, a new HELLO or
+/// a replay's end is read in between. The bouncer's own notices are never
+/// held. Resources go one at a time (a client takes one at a time:
+/// weechat-rrc cancels the one it is taking when another is offered);
+/// envelopes go on meanwhile.
 async fn link_sender<S: LinkSink>(
     task: LinkTask<S>,
     mut rx: mpsc::UnboundedReceiver<ToLink>,
     queued: Arc<std::sync::atomic::AtomicUsize>,
+    controls: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     use std::sync::atomic::Ordering;
     let mut waiting: VecDeque<LinkReplay> = VecDeque::new();
     let mut current: Option<LinkReplay> = None;
     let mut held: BTreeMap<String, Vec<Held>> = BTreeMap::new();
+    // Released items, in order, sent one a turn.
+    let mut flushing: VecDeque<Held> = VecDeque::new();
     let mut resources: ResourceQueue = VecDeque::new();
     let mut sending: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = None;
     let mut next_at = tokio::time::Instant::now();
@@ -2097,12 +2194,13 @@ async fn link_sender<S: LinkSink>(
                 for env in task.envelopes(&replay, &[]) {
                     task.send(&env).await;
                 }
-                task.finish(replay, &mut held, &mut resources).await;
+                task.finish(replay, &mut held, &mut flushing);
             } else {
                 i += 1;
             }
         }
-        if current.is_none() {
+        // The next replay starts once the last one's held items are out.
+        if current.is_none() && flushing.is_empty() {
             current = waiting.pop_front();
         }
         if let Some(replay) = &mut current
@@ -2116,6 +2214,7 @@ async fn link_sender<S: LinkSink>(
             Records(Vec<Record>),
             Pace,
             Sent,
+            Flush,
         }
         let step = tokio::select! {
             message = rx.recv() => Step::Message(message),
@@ -2135,16 +2234,21 @@ async fn link_sender<S: LinkSink>(
                     _ => std::future::pending().await,
                 }
             } => step,
+            () = std::future::ready(()), if !flushing.is_empty() => Step::Flush,
         };
         match step {
             Step::Message(None) => return,
             Step::Message(Some(ToLink::Send(env))) => {
                 queued.fetch_sub(1, Ordering::Relaxed);
                 let room = env.room.as_deref().and_then(normalize_room);
-                match room.and_then(|r| held.get_mut(&r)) {
-                    Some(items) if items.len() < MAX_HELD => items.push(Held::Env(env)),
-                    Some(_) => task.tally(|s| s.relay_drops += 1),
-                    None => {
+                match place(room.as_ref(), &held, &flushing) {
+                    Place::Held => match room.and_then(|r| held.get_mut(&r)) {
+                        Some(items) if items.len() < MAX_HELD => items.push(Held::Env(env)),
+                        _ => task.tally(|s| s.relay_drops += 1),
+                    },
+                    Place::Flushing if flushing.len() < MAX_FLUSHING => flushing.push_back(Held::Env(env)),
+                    Place::Flushing => task.tally(|s| s.relay_drops += 1),
+                    Place::Now => {
                         task.send(&env).await;
                     }
                 }
@@ -2152,13 +2256,24 @@ async fn link_sender<S: LinkSink>(
             Step::Message(Some(ToLink::Resource(env, data))) => {
                 queued.fetch_sub(1, Ordering::Relaxed);
                 let room = env.room.as_deref().and_then(normalize_room);
-                match room.and_then(|r| held.get_mut(&r)) {
-                    Some(items) if items.len() < MAX_HELD => items.push(Held::Resource(env, data)),
-                    Some(_) => task.tally(|s| s.client_resource_drops += 1),
-                    None => task.queue(&mut resources, env, data),
+                match place(room.as_ref(), &held, &flushing) {
+                    Place::Held => match room.and_then(|r| held.get_mut(&r)) {
+                        Some(items) if items.len() < MAX_HELD => items.push(Held::Resource(env, data)),
+                        _ => task.resource_ended(false),
+                    },
+                    Place::Flushing if flushing.len() < MAX_FLUSHING => flushing.push_back(Held::Resource(env, data)),
+                    Place::Flushing => task.resource_ended(false),
+                    Place::Now => task.queue(&mut resources, env, data),
                 }
             }
             Step::Sent => sending = None,
+            Step::Flush => match flushing.pop_front() {
+                Some(Held::Env(env)) => {
+                    task.send(&env).await;
+                }
+                Some(Held::Resource(env, data)) => task.queue(&mut resources, env, data),
+                None => {}
+            },
             Step::Message(Some(ToLink::Now(env))) => {
                 queued.fetch_sub(1, Ordering::Relaxed);
                 task.send(&env).await;
@@ -2169,6 +2284,7 @@ async fn link_sender<S: LinkSink>(
                 say_empty,
                 records,
             })) => {
+                controls.fetch_sub(1, Ordering::Relaxed);
                 held.entry(room.clone()).or_default();
                 waiting.push_back(LinkReplay {
                     id,
@@ -2178,21 +2294,29 @@ async fn link_sender<S: LinkSink>(
                 });
             }
             Step::Message(Some(ToLink::End { room, flush })) => {
-                let ends = |r: &LinkReplay| room.as_ref().is_none_or(|room| *room == r.room);
-                waiting.retain(|r| !ends(r));
-                if current.as_ref().is_some_and(ends) {
+                controls.fetch_sub(1, Ordering::Relaxed);
+                let ends = |r: &str| room.as_deref().is_none_or(|room| room == r);
+                waiting.retain(|r| !ends(&r.room));
+                if current.as_ref().is_some_and(|r| ends(&r.room)) {
                     current = None;
                 }
-                let ended: Vec<String> = held
-                    .keys()
-                    .filter(|r| room.as_ref().is_none_or(|room| room == *r))
-                    .cloned()
-                    .collect();
+                let ended: Vec<String> = held.keys().filter(|r| ends(r)).cloned().collect();
                 for r in ended {
                     let items = held.remove(&r).unwrap_or_default();
                     if flush {
-                        task.release(items, &mut resources).await;
+                        flushing.extend(items);
+                    } else {
+                        task.forget(items);
                     }
+                }
+                // Not flushed: what of the room is still being released
+                // goes too.
+                if !flush {
+                    let (gone, kept): (VecDeque<Held>, VecDeque<Held>) = std::mem::take(&mut flushing)
+                        .into_iter()
+                        .partition(|h| held_room(h).as_deref().is_some_and(ends) || room.is_none());
+                    flushing = kept;
+                    task.forget(gone);
                 }
             }
             Step::Records(records) => {
@@ -2220,7 +2344,7 @@ async fn link_sender<S: LinkSink>(
                 if envelopes.is_empty()
                     && let Some(replay) = current.take()
                 {
-                    task.finish(replay, &mut held, &mut resources).await;
+                    task.finish(replay, &mut held, &mut flushing);
                 }
             }
         }
@@ -2230,7 +2354,12 @@ async fn link_sender<S: LinkSink>(
 /// A client link's sender task, and what is queued for it.
 struct LinkSender {
     tx: mpsc::UnboundedSender<ToLink>,
+    /// Envelopes and Resources in the channel.
     queued: Arc<std::sync::atomic::AtomicUsize>,
+    /// Replay commands in the channel.
+    controls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Resources given to the task and not ended.
+    resources: Arc<std::sync::atomic::AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -2262,51 +2391,97 @@ impl<S: LinkSink> Links<S> {
 
     fn sender(&mut self, link: Link) -> &LinkSender {
         self.senders.entry(link).or_insert_with(|| {
+            use std::sync::atomic::AtomicUsize;
             let (tx, rx) = mpsc::unbounded_channel();
-            let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let queued = Arc::new(AtomicUsize::new(0));
+            let controls = Arc::new(AtomicUsize::new(0));
+            let resources = Arc::new(AtomicUsize::new(0));
             let task = LinkTask {
                 sink: self.sink.clone(),
                 link,
                 ids: self.ids,
                 status: self.status.clone(),
                 done: self.done.clone(),
+                resources: resources.clone(),
             };
-            let task = tokio::spawn(link_sender(task, rx, queued.clone()));
-            LinkSender { tx, queued, task }
+            let task = tokio::spawn(link_sender(task, rx, queued.clone(), controls.clone()));
+            LinkSender {
+                tx,
+                queued,
+                controls,
+                resources,
+                task,
+            }
         })
     }
 
     /// Queue an envelope for a link, or drop it (counted) when
-    /// `LINK_QUEUE` wait already. Never waits.
-    fn envelope(&mut self, link: Link, message: ToLink) {
+    /// `LINK_QUEUE` wait already. Never waits. False if it was dropped.
+    fn envelope(&mut self, link: Link, message: ToLink) -> bool {
         use std::sync::atomic::Ordering;
         let status = self.status.clone();
         let sender = self.sender(link);
+        let resource = matches!(message, ToLink::Resource(..));
+        let count = |s: &mut RelayStatus| {
+            if resource {
+                s.client_resource_drops += 1;
+            } else {
+                s.relay_drops += 1;
+            }
+        };
         if sender.queued.load(Ordering::Relaxed) >= LINK_QUEUE {
             if let Ok(mut s) = status.lock() {
-                if matches!(message, ToLink::Resource(..)) {
-                    s.client_resource_drops += 1;
-                } else {
-                    s.relay_drops += 1;
-                }
+                count(&mut s);
             }
             tracing::debug!("link {}: {LINK_QUEUE} envelopes wait: one dropped", hex::encode(link));
-            return;
+            return false;
         }
         sender.queued.fetch_add(1, Ordering::Relaxed);
+        if resource {
+            sender.resources.fetch_add(1, Ordering::Relaxed);
+        }
         if sender.tx.send(message).is_err() {
             sender.queued.fetch_sub(1, Ordering::Relaxed);
+            if resource {
+                sender.resources.fetch_sub(1, Ordering::Relaxed);
+            }
+            if let Ok(mut s) = status.lock() {
+                count(&mut s);
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Whether a link's sender has `CONTROL_QUEUE` replay commands
+    /// waiting.
+    fn controls_full(&mut self, link: Link) -> bool {
+        self.sender(link).controls.load(std::sync::atomic::Ordering::Relaxed) >= CONTROL_QUEUE
+    }
+
+    /// Hand a link's sender a replay command. An end of a replay is never
+    /// refused (there is at most one for each replay the relay asked for);
+    /// see [`Self::controls_full`] for a new replay.
+    fn control(&mut self, link: Link, message: ToLink) {
+        let sender = self.sender(link);
+        sender.controls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if sender.tx.send(message).is_err() {
+            sender.controls.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
-    /// Hand a link's sender something that is never dropped.
-    fn control(&mut self, link: Link, message: ToLink) {
-        let _ = self.sender(link).tx.send(message);
-    }
-
+    /// Stop a link's sender. The Resources it had not ended (waiting, held
+    /// or being sent) are counted dropped; a transfer under way ends with
+    /// the link.
     fn close(&mut self, link: &Link) {
         if let Some(sender) = self.senders.remove(link) {
             sender.task.abort();
+            if let Ok(mut s) = self.status.lock() {
+                let left = sender.resources.swap(CLOSED, std::sync::atomic::Ordering::Relaxed);
+                if left != CLOSED {
+                    s.client_resource_drops += left as u64;
+                }
+            }
         }
     }
 }
@@ -2320,7 +2495,11 @@ impl<S: LinkSink> Drop for Links<S> {
 }
 
 /// Hand the relay's outputs on: envelopes and replays to the links'
-/// sender tasks. Never waits; the links to close now are returned.
+/// sender tasks. Never waits; the links to close now are returned. A
+/// replay goes only if the envelope before it for the link (its JOINED)
+/// was queued, and while fewer than `CONTROL_QUEUE` replay commands wait
+/// for the link; otherwise the relay is told it is over, and in the
+/// second case the client is told it was skipped.
 fn dispatch<S: LinkSink>(
     outputs: Vec<Output>,
     relay: &Relay,
@@ -2328,11 +2507,29 @@ fn dispatch<S: LinkSink>(
     close_later: impl Fn(Link),
 ) -> Vec<Link> {
     let mut close = Vec::new();
+    // Links whose last envelope in this batch was dropped.
+    let mut dropped: std::collections::HashSet<Link> = std::collections::HashSet::new();
+    let queued = |dropped: &mut std::collections::HashSet<Link>, link: Link, ok: bool| {
+        if ok {
+            dropped.remove(&link);
+        } else {
+            dropped.insert(link);
+        }
+    };
     for output in outputs {
         match output {
-            Output::Client(link, env) => links.envelope(link, ToLink::Send(env)),
-            Output::Now(link, env) => links.envelope(link, ToLink::Now(env)),
-            Output::Resource(link, env, data) => links.envelope(link, ToLink::Resource(env, data)),
+            Output::Client(link, env) => {
+                let ok = links.envelope(link, ToLink::Send(env));
+                queued(&mut dropped, link, ok);
+            }
+            Output::Now(link, env) => {
+                let ok = links.envelope(link, ToLink::Now(env));
+                queued(&mut dropped, link, ok);
+            }
+            Output::Resource(link, env, data) => {
+                let ok = links.envelope(link, ToLink::Resource(env, data));
+                queued(&mut dropped, link, ok);
+            }
             Output::Close(link) => {
                 links.close(&link);
                 close.push(link);
@@ -2340,16 +2537,40 @@ fn dispatch<S: LinkSink>(
             Output::CloseLater(link) => close_later(link),
             // Asked now, before the next event is recorded.
             Output::Replay(replay) => {
-                let records = relay.history.query(replay.query.clone());
-                links.control(
-                    replay.link,
-                    ToLink::Replay {
-                        id: replay.id,
-                        room: replay.query.room,
-                        say_empty: replay.say_empty,
-                        records,
-                    },
-                );
+                let link = replay.link;
+                let room = replay.query.room.clone();
+                let refused = if dropped.contains(&link) {
+                    Some("the envelope before it was dropped")
+                } else if links.controls_full(link) {
+                    Some("too many replay commands wait")
+                } else {
+                    None
+                };
+                match refused {
+                    None => {
+                        let records = relay.history.query(replay.query);
+                        links.control(
+                            link,
+                            ToLink::Replay {
+                                id: replay.id,
+                                room,
+                                say_empty: replay.say_empty,
+                                records,
+                            },
+                        );
+                    }
+                    Some(why) => {
+                        tracing::info!("link {}: replay of {room} skipped: {why}", hex::encode(link));
+                        let _ = links.done.send((link, room.clone(), replay.id));
+                        if !dropped.contains(&link) {
+                            let mut env = relay.own(MessageType::Notice).with_body(Raw::text(&format!(
+                                "--- replay of {room} skipped: the link is busy ---"
+                            )));
+                            env.room = Some(room);
+                            links.envelope(link, ToLink::Now(env));
+                        }
+                    }
+                }
             }
             Output::EndReplay { link, room, flush } => links.control(link, ToLink::End { room, flush }),
         }
@@ -2459,7 +2680,7 @@ pub async fn run(hub: LocalHub) {
                 tracing::info!("hub {tag}: link {} closed", hex::encode(link));
                 out
             }
-            _ = ticker.tick() => relay.tick(now),
+            _ = ticker.tick() => relay.tick_busy(now, &busy_sizes(&slots)),
             Some((link, room, id)) = replays_done.recv() => {
                 relay.replay_done(link, &room, id);
                 Vec::new()
@@ -2517,6 +2738,7 @@ pub async fn run(hub: LocalHub) {
         // A closed link's sender stops, with what was left for it.
         if let Some(link) = closed {
             links.close(&link);
+            waiters.forget(link);
         }
         if relay.take_changed() {
             changed.notify_one();
@@ -3352,64 +3574,197 @@ mod tests {
         assert_eq!(notices.join("\n"), text);
     }
 
+    impl Fixture {
+        /// Every command handed to the session so far.
+        fn commands_sent(&mut self) -> Vec<Command> {
+            std::iter::from_fn(|| self.command()).collect()
+        }
+
+        /// A client's notice Resource: its RESOURCE_ENVELOPE, then the
+        /// Resource.
+        fn client_notice(&mut self, link: Link, text: &str) -> Vec<Output> {
+            let env = resource::announce(&USER, resource::KIND_NOTICE, Some("lobby"), text.as_bytes());
+            let mut out = self.packet(link, &env);
+            out.extend(self.relay.client_resource(link, text.as_bytes().to_vec(), self.now));
+            out
+        }
+
+        fn counts(&self) -> (u64, u64, u64) {
+            let s = self.status.lock().unwrap();
+            (s.client_resources_in, s.relayed_in, s.client_resource_drops)
+        }
+    }
+
+    fn sends(commands: &[Command]) -> Vec<Envelope> {
+        commands
+            .iter()
+            .map(|c| match c {
+                Command::Send(env) => env.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
     #[test]
-    fn a_client_resource_is_checked_and_goes_upstream() {
+    fn a_client_resource_goes_upstream_as_ordered_notices() {
         let mut f = fixture();
         f.up();
         f.joined_upstream("lobby", &[&USER]);
         f.with_resources(A, &["lobby"]);
         f.in_rooms(B, &["lobby"]);
+        f.connect(C, USER);
+        f.hello(C); // not in the room
         let text = long_text(20);
-        let env = resource::announce(&USER, resource::KIND_NOTICE, Some("lobby"), text.as_bytes());
-        assert!(f.packet(A, &env).is_empty());
-        let out = f.relay.client_resource(A, text.clone().into_bytes(), f.now);
-        match f.command() {
-            Some(Command::SendResource { envelope, data }) => {
-                assert_eq!(envelope.id, env.id);
-                assert_eq!(envelope.room.as_deref(), Some("lobby"));
-                assert_eq!(data.as_slice(), text.as_bytes());
-            }
-            other => panic!("{other:?}"),
+        // Nothing to any client until the hub echoes the NOTICEs.
+        assert!(f.client_notice(A, &text).is_empty());
+        let parts = sends(&f.commands_sent());
+        assert!(parts.len() > 1 && parts.len() <= resource::MAX_PARTS, "{}", parts.len());
+        for p in &parts {
+            assert_eq!(
+                (p.t, p.room.as_deref(), p.dst.as_deref()),
+                (MessageType::Notice, Some("lobby"), None)
+            );
+            assert!(p.text_body().unwrap().len() <= 350);
+            assert!(p.encode().len() <= LINK_MDU);
         }
-        // The user's other client in the room gets a copy.
-        let copy: Vec<String> = sent_to(&out)
-            .iter()
-            .filter(|(l, _)| *l == B)
-            .filter_map(|(_, e)| e.text_body())
-            .collect();
-        assert_eq!(copy.join("\n"), text);
-        assert!(sent_to(&out).iter().all(|(l, e)| *l == B && e.src == USER.to_vec()));
-        let status = f.status.lock().unwrap().clone();
-        assert_eq!(
-            (
-                status.client_resources_in,
-                status.relayed_in,
-                status.client_resource_drops
-            ),
-            (1, 1, 0)
+        let texts: Vec<String> = parts.iter().filter_map(Envelope::text_body).collect();
+        assert_eq!(texts.join("\n"), text);
+        assert_eq!(f.counts(), (1, parts.len() as u64, 0));
+        // Each part waits for its echo like any room NOTICE, and the echoes
+        // go to every client in the room, in order.
+        assert!(
+            parts
+                .iter()
+                .all(|p| f.relay.sent.iter().any(|s| s.id == p.id && s.kind == Kind::Room))
         );
-        // An echo is never waited for: a hub ERROR is not blamed on it.
-        assert!(f.relay.sent.iter().any(|s| s.kind == Kind::Resource));
+        let mut seen: Vec<(Link, String)> = Vec::new();
+        for p in &parts {
+            for (link, env) in sent_to(&f.hub(p.clone(), Inbound::Relay)) {
+                seen.push((link, env.text_body().unwrap()));
+            }
+        }
+        for link in [A, B] {
+            let got: Vec<String> = seen
+                .iter()
+                .filter(|(l, _)| *l == link)
+                .map(|(_, t)| t.clone())
+                .collect();
+            assert_eq!(got, texts, "{link:?}");
+        }
+        assert!(seen.iter().all(|(l, _)| *l != C));
+        assert!(f.relay.sent.is_empty());
     }
 
     #[test]
-    fn client_resources_that_do_not_match_are_dropped_and_counted() {
+    fn a_client_resource_before_its_envelope_waits_for_it() {
+        let mut f = fixture();
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.with_resources(A, &["lobby"]);
+        let text = long_text(10);
+        let env = resource::announce(&USER, resource::KIND_NOTICE, Some("lobby"), text.as_bytes());
+        assert!(f.relay.client_resource(A, text.clone().into_bytes(), f.now).is_empty());
+        assert!(f.command().is_none());
+        assert!(f.packet(A, &env).is_empty());
+        let texts: Vec<String> = sends(&f.commands_sent())
+            .iter()
+            .filter_map(Envelope::text_body)
+            .collect();
+        assert_eq!(texts.join("\n"), text);
+        assert_eq!(f.counts().0, 1);
+        assert_eq!(f.counts().2, 0);
+    }
+
+    #[test]
+    fn a_notice_of_more_than_sixteen_parts_is_refused_and_nothing_goes() {
+        let mut f = fixture();
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.with_resources(A, &["lobby"]);
+        let text = "y".repeat(350 * resource::MAX_PARTS + 1);
+        let sent = sent_to(&f.client_notice(A, &text));
+        assert_eq!(sent.len(), 1);
+        assert_eq!((sent[0].0, sent[0].1.t), (A, MessageType::Error));
+        let (_, most) = resource::parts(
+            &client(MessageType::Notice)
+                .with_room("lobby")
+                .with_body(Raw::text(&text)),
+            350,
+        );
+        assert_eq!(
+            sent[0].1.text_body().unwrap(),
+            format!("notice too long: {} bytes > {most}", text.len())
+        );
+        assert!(f.command().is_none());
+        assert_eq!(f.counts(), (0, 0, 1));
+    }
+
+    #[test]
+    fn a_client_resource_goes_all_or_nothing_when_the_queue_is_short() {
+        let mut f = fixture_with(false, 2);
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.with_resources(A, &["lobby"]);
+        let sent = sent_to(&f.client_notice(A, &long_text(20)));
+        assert_eq!(
+            sent[0].1.text_body().as_deref(),
+            Some("not sent to the hub: the bouncer's queue is full")
+        );
+        assert!(f.command().is_none());
+        assert_eq!(f.counts(), (0, 0, 1));
+        assert_eq!(f.status.lock().unwrap().relay_drops, 1);
+    }
+
+    #[test]
+    fn a_client_resource_before_the_upstream_welcome_goes_as_a_short_notice_does() {
+        // No session yet: the NOTICEs go to the session (which holds them
+        // or reports them dropped) as a short NOTICE would, cut to the
+        // default max_msg_body_bytes.
+        let mut f = fixture();
+        f.with_resources(A, &[]);
+        let text = long_text(10);
+        assert!(f.client_notice(A, &text).is_empty());
+        let parts = sends(&f.commands_sent());
+        assert!(parts.len() > 1);
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.text_body().unwrap().len() as u64 <= Limits::default().max_msg_body_bytes)
+        );
+        let short = client(MessageType::Notice)
+            .with_room("lobby")
+            .with_body(Raw::text("hi"));
+        assert!(f.packet(A, &short).is_empty());
+        assert_eq!(sends(&f.commands_sent()).len(), 1);
+    }
+
+    #[test]
+    fn client_resources_that_do_not_match_are_dropped_and_counted_once() {
         let mut f = fixture();
         f.up();
         f.joined_upstream("lobby", &[&USER]);
         f.with_resources(A, &["lobby"]);
         let text = long_text(20);
-        // Unannounced.
+        // Unannounced: it waits OFFER_GRACE for an envelope, then goes.
         assert!(f.relay.client_resource(A, text.clone().into_bytes(), f.now).is_empty());
+        assert_eq!(f.drops(), 0);
+        f.relay.tick(f.now + resource::OFFER_GRACE);
         assert_eq!(f.drops(), 1);
-        // The announced size, another sha256.
+        f.relay.tick(f.now + resource::OFFER_GRACE * 2);
+        assert_eq!(f.drops(), 1);
+        // The announced size, another sha256: dropped once, at OFFER_GRACE,
+        // and the envelope with it.
         let env = resource::announce(&USER, resource::KIND_NOTICE, Some("lobby"), text.as_bytes());
         f.packet(A, &env);
         let mut other = text.clone().into_bytes();
         other[0] = b'L';
         assert!(f.relay.client_resource(A, other, f.now).is_empty());
+        f.relay.tick(f.now + resource::OFFER_GRACE);
         assert_eq!(f.drops(), 2);
-        // Too big: refused with rrcd's ERROR.
+        assert!(f.relay.clients[&A].expected.is_empty());
+        // Too big: refused with rrcd's ERROR. The envelope is not a
+        // Resource: not counted (the policy refuses and counts the
+        // Resource if it is offered).
         let mut big = env.clone();
         let mut body = ResourceEnvelope::from_body(env.body.as_ref().unwrap()).unwrap();
         body.size = MAX_RESOURCE_BYTES + 1;
@@ -3420,21 +3775,56 @@ mod tests {
             sent[0].1.text_body().as_deref(),
             Some(format!("resource too large: {} > {MAX_RESOURCE_BYTES}", MAX_RESOURCE_BYTES + 1).as_str())
         );
-        assert_eq!(f.drops(), 3);
+        assert_eq!(f.drops(), 2);
         // A blob, announced and sent: not relayed.
         let blob = resource::announce(&USER, "blob", Some("lobby"), b"data");
         f.packet(A, &blob);
         f.relay.client_resource(A, b"data".to_vec(), f.now);
-        assert_eq!(f.drops(), 4);
+        assert_eq!(f.drops(), 3);
         assert!(f.command().is_none());
-        // Announced and never sent: dropped at the timeout.
+        // Announced and never sent: the envelope is forgotten, uncounted;
+        // not while its Resource is on its way.
         f.packet(A, &env);
+        let busy: std::collections::HashSet<(Link, u64)> = [(A, text.len() as u64)].into();
+        f.relay.tick_busy(f.now + resource::RESOURCE_TIMEOUT, &busy);
+        assert_eq!(f.relay.clients[&A].expected.len(), 1);
         f.relay.tick(f.now + resource::RESOURCE_TIMEOUT);
-        assert_eq!(f.drops(), 5);
+        assert_eq!(f.relay.clients[&A].expected.len(), 0);
+        assert_eq!(f.drops(), 3);
+        // A failed transfer is counted once, by its end.
+        f.relay.client_resource_failed(A, "Failed");
+        assert_eq!(f.drops(), 4);
         // The relay goes on.
+        assert!(f.client_notice(A, &text).is_empty());
+        assert!(!sends(&f.commands_sent()).is_empty());
+        assert_eq!(f.counts().0, 1);
+        assert_eq!(f.drops(), 4);
+    }
+
+    #[test]
+    fn a_new_hello_or_a_closed_link_drops_only_the_resources_that_came() {
+        let mut f = fixture();
+        f.up();
+        f.joined_upstream("lobby", &[&USER]);
+        f.with_resources(A, &["lobby"]);
+        let env = resource::announce(&USER, resource::KIND_NOTICE, Some("lobby"), b"text");
         f.packet(A, &env);
-        f.relay.client_resource(A, text.into_bytes(), f.now);
-        assert!(matches!(f.command(), Some(Command::SendResource { .. })));
+        f.relay.client_resource(A, b"early one".to_vec(), f.now);
+        f.relay.client_resource(A, b"early two".to_vec(), f.now);
+        // A new HELLO: the old session's envelopes and early Resources go.
+        f.packet(A, &hello_with_resources());
+        assert_eq!(f.drops(), 2);
+        assert!(f.relay.clients[&A].expected.is_empty());
+        // The Resource of the old envelope, if it comes, is unannounced.
+        f.relay.client_resource(A, b"text".to_vec(), f.now);
+        assert!(f.command().is_none());
+        // A closed link: its early Resource counts, its envelopes do not.
+        f.packet(
+            A,
+            &resource::announce(&USER, resource::KIND_NOTICE, Some("lobby"), b"other text"),
+        );
+        f.relay.link_closed(A);
+        assert_eq!(f.drops(), 3);
     }
 
     #[test]
@@ -3454,6 +3844,7 @@ mod tests {
         let env = resource::announce(&USER, resource::KIND_NOTICE, Some("lobby"), b"text");
         let sent = sent_to(&f.packet(A, &env));
         assert_eq!(sent[0].1.text_body().as_deref(), Some("resource transfer disabled"));
+        assert_eq!(f.drops(), 0);
     }
 
     #[test]
@@ -3473,7 +3864,31 @@ mod tests {
             Some("too many pending resource expectations")
         );
         f.relay.link_closed(A);
-        assert_eq!(f.drops(), 1 + resource::MAX_EXPECTED as u64);
+        assert_eq!(f.drops(), 0);
+    }
+
+    #[test]
+    fn a_greeting_resource_after_the_window_is_still_the_greeting() {
+        let mut f = fixture();
+        f.up();
+        f.in_rooms(A, &[]);
+        // A command waits for its answer.
+        let who = client(MessageType::Msg).with_body(Raw::text("/who"));
+        f.packet(A, &who);
+        assert_eq!(f.relay.pending_commands.len(), 1);
+        f.now += GREETING_WINDOW + Duration::from_secs(1);
+        let motd = long_text(12);
+        let out = f.hub_resource(resource::KIND_MOTD, None, &motd);
+        assert!(!links(&out).is_empty() && links(&out).iter().all(|l| *l == A));
+        // It answered no command, and is kept for a later client.
+        assert_eq!(f.relay.pending_commands.len(), 1);
+        f.connect(B, USER);
+        let out = f.packet(B, &hello_with_resources());
+        assert_eq!(resources_to(&out)[0].2.as_slice(), motd.as_bytes());
+        // A room-less `notice` Resource then is a command's answer.
+        let out = f.hub_resource(resource::KIND_NOTICE, None, "who: you");
+        assert!(links(&out).iter().all(|l| *l == A));
+        assert!(f.relay.pending_commands.is_empty());
     }
 
     #[test]
@@ -4222,6 +4637,96 @@ mod tests {
         // One was sending when the rest came: one more than the queue holds.
         assert_eq!(status.client_resource_drops, 1);
         assert_eq!(status.client_resources_out, 1 + LINK_RESOURCES as u64 + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_links_resources_are_counted_dropped_once() {
+        let mut s = senders();
+        for i in 0..3 {
+            let data = vec![b'x'; 1000 + i];
+            let env = resource::announce(&HUB, resource::KIND_NOTICE, Some("lobby"), &data);
+            assert!(s.links.envelope(A, ToLink::Resource(env, Arc::new(data))));
+        }
+        // The first is under way, two wait.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        s.links.close(&A);
+        settle().await;
+        let status = s.status.lock().unwrap().clone();
+        assert_eq!((status.client_resources_out, status.client_resource_drops), (0, 3));
+        assert!(s.sink.resources.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn held_items_go_in_order_and_an_unflushed_end_drops_them() {
+        let mut s = senders();
+        let _stuck = s.replay_waiting(A, 0, "lobby");
+        for t in ["a", "b", "c"] {
+            s.links.envelope(A, ToLink::Send(room_msg("lobby", t)));
+        }
+        let data = vec![b'x'; 1000];
+        let env = resource::announce(&HUB, resource::KIND_NOTICE, Some("lobby"), &data);
+        s.links.envelope(A, ToLink::Resource(env, Arc::new(data.clone())));
+        s.end(A, Some("lobby"), true);
+        // Sent while the held ones are let out: after them.
+        s.links.envelope(A, ToLink::Send(room_msg("lobby", "d")));
+        settle().await;
+        let texts: Vec<String> = s.to(A).into_iter().filter(|t| t.len() == 1).collect();
+        assert_eq!(texts, ["a", "b", "c", "d"]);
+        assert_eq!(s.sink.resources.lock().unwrap().len(), 1);
+        // Parted while its replay waits: what was held goes nowhere, and
+        // its Resource is counted dropped.
+        let _stuck = s.replay_waiting(B, 1, "side");
+        s.links.envelope(B, ToLink::Send(room_msg("side", "x")));
+        let env = resource::announce(&HUB, resource::KIND_NOTICE, Some("side"), &data);
+        s.links.envelope(B, ToLink::Resource(env, Arc::new(data.clone())));
+        s.end(B, Some("side"), false);
+        settle().await;
+        assert!(s.to(B).is_empty());
+        let status = s.status.lock().unwrap().clone();
+        assert_eq!((status.client_resources_out, status.client_resource_drops), (1, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_goes_only_after_its_joined_and_while_the_link_has_room() {
+        let f = fixture();
+        let mut s = senders();
+        let replay = |id: u64| {
+            Output::Replay(Replay {
+                id,
+                link: A,
+                query: history::Query {
+                    room: "lobby".into(),
+                    since_ms: None,
+                    max: 10,
+                },
+                say_empty: true,
+            })
+        };
+        let joined = |text: &str| Output::Client(A, room_msg("lobby", text));
+        // Its JOINED dropped (the link's queue is full): no replay, the
+        // relay is told it is over, and nothing is said on the link.
+        for i in 0..LINK_QUEUE {
+            assert!(s.links.envelope(A, ToLink::Send(room_msg("side", &i.to_string()))));
+        }
+        dispatch(vec![joined("joined"), replay(1)], &f.relay, &mut s.links, |_| {});
+        assert_eq!(s.done(), done_of(&[(A, "lobby", 1)]));
+        settle().await;
+        assert!(!s.to(A).iter().any(|t| t.contains("replay")));
+        // Its JOINED queued: it runs.
+        dispatch(vec![joined("joined"), replay(2)], &f.relay, &mut s.links, |_| {});
+        settle().await;
+        assert_eq!(s.done(), done_of(&[(A, "lobby", 2)]));
+        assert!(s.to(A).iter().any(|t| t.contains("no history") || t.contains("replay")));
+        // Too many replay commands wait: skipped, and the client is told.
+        // (Counted until the link's sender takes them in.)
+        for i in 0..CONTROL_QUEUE {
+            let _ = s.replay_waiting(A, 10 + i as u64, &format!("r{i}"));
+        }
+        let before = s.to(A).len();
+        dispatch(vec![joined("joined"), replay(3)], &f.relay, &mut s.links, |_| {});
+        assert!(s.done().contains(&(A, "lobby".to_string(), 3)));
+        settle().await;
+        assert!(s.to(A)[before..].contains(&"--- replay of lobby skipped: the link is busy ---".to_string()));
     }
 
     #[test]

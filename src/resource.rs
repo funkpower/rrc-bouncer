@@ -22,9 +22,16 @@ pub const MAX_EXPECTED: usize = 8;
 /// How long an announced Resource may take to arrive, from its
 /// RESOURCE_ENVELOPE to its last byte.
 pub const RESOURCE_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long an advertised Resource waits for the RESOURCE_ENVELOPE that
-/// announces it, which comes on another channel and may be read later.
+/// How long an advertised Resource, or a finished one that matches no
+/// RESOURCE_ENVELOPE, waits for the envelope that announces it, which
+/// comes on another channel and may be read later.
 pub const OFFER_GRACE: Duration = Duration::from_secs(5);
+/// Finished Resources of one link waiting for their envelope, most, and
+/// their bytes, most.
+pub const MAX_EARLY: usize = MAX_EXPECTED;
+pub const MAX_EARLY_BYTES: usize = 2 * MAX_RESOURCE_BYTES as usize;
+/// The most NOTICEs a client's long notice is sent upstream as.
+pub const MAX_PARTS: usize = 16;
 /// The kinds a RESOURCE_ENVELOPE names.
 pub const KIND_NOTICE: &str = "notice";
 pub const KIND_MOTD: &str = "motd";
@@ -132,6 +139,97 @@ pub fn split(notice: &Envelope) -> Vec<Envelope> {
     out
 }
 
+/// Text cut into parts of at most `max` bytes, in order, on character
+/// boundaries. A part ends at the last newline of its second half, or
+/// else at its last whitespace, or else where it is full; the newline or
+/// whitespace it ends at is left out, and so is a part that would be
+/// only whitespace. No part but the first starts (after whitespace) with
+/// "/", which the hub would take as a command, where another cut avoids
+/// it. `fill`: cut where each part is full, ignoring whitespace.
+pub fn split_text(text: &str, max: usize, fill: bool) -> Vec<String> {
+    let max = max.max(4);
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.len() <= max {
+            out.push(rest.to_string());
+            break;
+        }
+        let mut full = max;
+        while !rest.is_char_boundary(full) {
+            full -= 1;
+        }
+        let window = &rest[..full];
+        // (end of this part, start of the next), best first.
+        let mut cuts: Vec<(usize, usize)> = Vec::new();
+        if !fill {
+            cuts.extend(
+                window
+                    .char_indices()
+                    .rev()
+                    .filter(|(i, c)| *c == '\n' && *i >= max / 2)
+                    .map(|(i, _)| (i, i + 1)),
+            );
+            cuts.extend(
+                window
+                    .char_indices()
+                    .rev()
+                    .filter(|(i, c)| c.is_whitespace() && *i > 0)
+                    .map(|(i, c)| (i, i + c.len_utf8())),
+            );
+        }
+        cuts.push((full, full));
+        cuts.extend(window.char_indices().rev().filter(|(i, _)| *i > 0).map(|(i, _)| (i, i)));
+        let commandlike = |next: usize| rest[next..].trim_start().starts_with('/');
+        let (end, next) = cuts
+            .iter()
+            .copied()
+            .find(|(_, next)| !commandlike(*next))
+            .unwrap_or((full, full));
+        let part = rest[..end].strip_suffix('\r').unwrap_or(&rest[..end]);
+        if !part.trim().is_empty() {
+            out.push(part.to_string());
+        }
+        rest = &rest[next..];
+    }
+    out
+}
+
+/// The NOTICEs a client's long notice goes upstream as: each body at
+/// most `max_body` bytes and each NOTICE within one packet, in order,
+/// each with a new id; None when that takes more than `MAX_PARTS`. Also
+/// the most bytes `MAX_PARTS` NOTICEs carry.
+pub fn parts(notice: &Envelope, max_body: usize) -> (Option<Vec<Envelope>>, usize) {
+    let text = notice.text_body().unwrap_or_default();
+    let mut empty = notice.clone();
+    empty.id = vec![0; 8];
+    empty.body = Some(Raw::text(""));
+    // A text item's head grows from one byte to three past 23 bytes.
+    let room = LINK_MDU.saturating_sub(empty.encode().len() + 2).max(4);
+    let max = max_body.min(room).max(4);
+    let most = max * MAX_PARTS;
+    if text.len() > most {
+        return (None, most);
+    }
+    let mut texts = split_text(&text, max, false);
+    if texts.len() > MAX_PARTS {
+        texts = split_text(&text, max, true);
+    }
+    if texts.len() > MAX_PARTS {
+        return (None, most);
+    }
+    let parts = texts
+        .iter()
+        .map(|t| {
+            let mut part = notice.clone();
+            part.id = rand::random::<[u8; 8]>().to_vec();
+            part.body = Some(Raw::text(t));
+            part
+        })
+        .collect();
+    (Some(parts), most)
+}
+
 /// A RESOURCE_ENVELOPE waiting for its Resource.
 #[derive(Debug, Clone)]
 pub struct Expected {
@@ -140,47 +238,69 @@ pub struct Expected {
     pub at: Instant,
 }
 
-/// What a finished Resource was, matched against the envelopes that
-/// announced Resources on its link.
-#[derive(Debug)]
-pub enum Matched {
-    /// Its envelope; the size and sha256 agree.
-    Verified(Expected),
-    /// An envelope announced this size with another sha256: dropped with
-    /// the envelope.
-    Mismatch(Expected),
-    /// Nothing announced it.
-    Unmatched,
-}
-
 /// The RESOURCE_ENVELOPEs of one link that wait for their Resources, in
-/// the order they came.
+/// the order they came, and the finished Resources that wait (for
+/// `OFFER_GRACE`, within `MAX_EARLY` and `MAX_EARLY_BYTES`) for an
+/// envelope that matches them, which may be read after them.
 #[derive(Debug, Default)]
 pub struct Expectations {
     waiting: Vec<Expected>,
+    early: Vec<(Vec<u8>, Instant)>,
 }
 
+/// A finished Resource and the envelope that announced it.
+pub type Verified = (Expected, Vec<u8>);
+
+/// `MAX_EXPECTED` envelopes already wait for their Resources.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TooMany;
+
 impl Expectations {
+    /// Envelopes waiting.
     pub fn len(&self) -> usize {
         self.waiting.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.waiting.is_empty()
+        self.waiting.is_empty() && self.early.is_empty()
     }
 
-    /// Wait for an announced Resource: false (nothing kept) when
-    /// `MAX_EXPECTED` wait already.
-    pub fn add(&mut self, envelope: Envelope, body: ResourceEnvelope, now: Instant) -> bool {
+    /// Finished Resources waiting for their envelope.
+    pub fn early(&self) -> usize {
+        self.early.len()
+    }
+
+    /// Wait for an announced Resource: Err (nothing kept) when
+    /// `MAX_EXPECTED` wait already; a finished Resource it announced, if
+    /// one waits.
+    pub fn add(
+        &mut self,
+        envelope: Envelope,
+        body: ResourceEnvelope,
+        now: Instant,
+    ) -> Result<Option<Verified>, TooMany> {
         if self.waiting.len() >= MAX_EXPECTED {
-            return false;
+            return Err(TooMany);
         }
-        self.waiting.push(Expected {
+        let expected = Expected {
             envelope,
             body,
             at: now,
+        };
+        // Only the new envelope can match a Resource that waits.
+        let hit = self.early.iter().position(|(data, _)| {
+            data.len() as u64 == expected.body.size && expected.body.sha256.as_ref().is_none_or(|s| *s == sha256(data))
         });
-        true
+        match hit {
+            Some(pos) => {
+                let (data, _) = self.early.remove(pos);
+                Ok(Some((expected, data)))
+            }
+            None => {
+                self.waiting.push(expected);
+                Ok(None)
+            }
+        }
     }
 
     /// Whether an advertised Resource of `size` bytes is announced.
@@ -188,33 +308,72 @@ impl Expectations {
         self.waiting.iter().any(|e| e.body.size == size)
     }
 
-    /// The envelope a finished Resource belongs to, taken off the list:
-    /// the oldest of its size whose sha256 is the data's (or that gave
-    /// none).
-    pub fn take(&mut self, data: &[u8]) -> Matched {
+    /// The oldest envelope of the data's size whose sha256 is the data's
+    /// (or that gave none), taken off the list.
+    fn verified(&mut self, data: &[u8]) -> Option<Expected> {
         let size = data.len() as u64;
+        if !self.expects(size) {
+            return None;
+        }
         let hash = sha256(data);
-        let same_size = |e: &Expected| e.body.size == size;
-        if let Some(pos) = self
+        let pos = self
             .waiting
             .iter()
-            .position(|e| same_size(e) && e.body.sha256.as_ref().is_none_or(|s| *s == hash))
-        {
-            return Matched::Verified(self.waiting.remove(pos));
-        }
-        match self.waiting.iter().position(same_size) {
-            Some(pos) => Matched::Mismatch(self.waiting.remove(pos)),
-            None => Matched::Unmatched,
-        }
+            .position(|e| e.body.size == size && e.body.sha256.as_ref().is_none_or(|s| *s == hash))?;
+        Some(self.waiting.remove(pos))
     }
 
-    /// Forget envelopes whose Resource did not come in `RESOURCE_TIMEOUT`:
-    /// how many.
-    pub fn expire(&mut self, now: Instant) -> usize {
+    /// A finished Resource: Ok(Some) with the envelope that announced it;
+    /// Ok(None) when kept to wait for one; Err (with why) when it cannot
+    /// wait, which drops it.
+    pub fn take(&mut self, data: Vec<u8>, now: Instant) -> Result<Option<Verified>, String> {
+        if let Some(e) = self.verified(&data) {
+            return Ok(Some((e, data)));
+        }
+        let bytes: usize = self.early.iter().map(|(d, _)| d.len()).sum();
+        if self.early.len() >= MAX_EARLY || bytes + data.len() > MAX_EARLY_BYTES {
+            return Err(format!(
+                "{} resources wait for their RESOURCE_ENVELOPE already",
+                self.early.len()
+            ));
+        }
+        self.early.push((data, now));
+        Ok(None)
+    }
+
+    /// Time passing. Finished Resources that waited `OFFER_GRACE` are
+    /// dropped, with why: one an envelope of its size announced with
+    /// another sha256 takes that envelope with it. Envelopes whose
+    /// Resource has not come in `RESOURCE_TIMEOUT`, and is not on its way
+    /// (`busy`, by size), are forgotten: how many.
+    pub fn expire(&mut self, now: Instant, busy: impl Fn(u64) -> bool) -> (Vec<String>, usize) {
+        let mut dropped = Vec::new();
+        let (late, early): (Vec<_>, Vec<_>) = std::mem::take(&mut self.early)
+            .into_iter()
+            .partition(|(_, at)| now.saturating_duration_since(*at) >= OFFER_GRACE);
+        self.early = early;
+        for (data, _) in late {
+            let size = data.len() as u64;
+            match self.waiting.iter().position(|e| e.body.size == size) {
+                Some(pos) => {
+                    self.waiting.remove(pos);
+                    dropped.push(format!(
+                        "a resource of {size} bytes is not the sha256 its RESOURCE_ENVELOPE gave"
+                    ));
+                }
+                None => dropped.push(format!("no RESOURCE_ENVELOPE announced a resource of {size} bytes")),
+            }
+        }
         let before = self.waiting.len();
         self.waiting
-            .retain(|e| now.saturating_duration_since(e.at) < RESOURCE_TIMEOUT);
-        before - self.waiting.len()
+            .retain(|e| now.saturating_duration_since(e.at) < RESOURCE_TIMEOUT || busy(e.body.size));
+        (dropped, before - self.waiting.len())
+    }
+
+    /// Forget everything: how many finished Resources that drops.
+    pub fn clear(&mut self) -> usize {
+        self.waiting.clear();
+        std::mem::take(&mut self.early).len()
     }
 }
 
@@ -308,19 +467,142 @@ mod tests {
         let data = b"hello there".to_vec();
         let env = Envelope::new(MessageType::ResourceEnvelope, &SRC);
         let mut e = Expectations::default();
-        assert!(e.add(env.clone(), body(11, Some(sha256(b"other thing"))), now));
-        assert!(e.add(env.clone(), body(11, Some(sha256(&data))), now));
+        assert!(matches!(
+            e.add(env.clone(), body(11, Some(sha256(b"other thing"))), now),
+            Ok(None)
+        ));
+        assert!(matches!(
+            e.add(env.clone(), body(11, Some(sha256(&data))), now),
+            Ok(None)
+        ));
         assert!(e.expects(11) && !e.expects(12));
-        assert!(matches!(e.take(&data), Matched::Verified(_)));
-        assert!(matches!(e.take(&data), Matched::Mismatch(_)));
-        assert!(matches!(e.take(&data), Matched::Unmatched));
-        for _ in 0..MAX_EXPECTED {
-            assert!(e.add(env.clone(), body(5, None), now));
-        }
-        assert!(!e.add(env.clone(), body(5, None), now));
-        assert!(matches!(e.take(b"12345"), Matched::Verified(_)));
-        assert_eq!(e.expire(now + RESOURCE_TIMEOUT), MAX_EXPECTED - 1);
+        // The second envelope is the one whose sha256 matches.
+        let (got, back) = e.take(data.clone(), now).unwrap().unwrap();
+        assert_eq!(got.body.sha256, Some(sha256(&data)));
+        assert_eq!(back, data);
+        // The other is not this data's: it waits as an early Resource,
+        // and at OFFER_GRACE goes as a mismatch, taking the envelope.
+        assert!(matches!(e.take(data.clone(), now), Ok(None)));
+        assert_eq!((e.len(), e.early()), (1, 1));
+        let (dropped, forgotten) = e.expire(now + OFFER_GRACE, |_| false);
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].contains("sha256"), "{dropped:?}");
+        assert_eq!(forgotten, 0);
         assert!(e.is_empty());
+        for _ in 0..MAX_EXPECTED {
+            assert!(matches!(e.add(env.clone(), body(5, None), now), Ok(None)));
+        }
+        assert!(e.add(env.clone(), body(5, None), now).is_err());
+        assert!(e.take(b"12345".to_vec(), now).unwrap().is_some());
+        // An envelope whose Resource is on its way is not forgotten.
+        let (dropped, forgotten) = e.expire(now + RESOURCE_TIMEOUT, |size| size == 5);
+        assert_eq!((dropped.len(), forgotten), (0, 0));
+        let (dropped, forgotten) = e.expire(now + RESOURCE_TIMEOUT, |_| false);
+        assert_eq!((dropped.len(), forgotten), (0, MAX_EXPECTED - 1));
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn a_resource_that_comes_before_its_envelope_waits_for_it() {
+        let now = Instant::now();
+        let data = b"early bird".to_vec();
+        let env = Envelope::new(MessageType::ResourceEnvelope, &SRC);
+        let mut e = Expectations::default();
+        assert!(matches!(e.take(data.clone(), now), Ok(None)));
+        assert_eq!(e.early(), 1);
+        // An envelope of another size or sha256 does not take it.
+        assert!(matches!(e.add(env.clone(), body(3, None), now), Ok(None)));
+        assert!(matches!(
+            e.add(env.clone(), body(10, Some(sha256(b"other bird"))), now),
+            Ok(None)
+        ));
+        let (got, back) = e.add(env.clone(), body(10, Some(sha256(&data))), now).unwrap().unwrap();
+        assert_eq!((got.body.size, back), (10, data.clone()));
+        assert_eq!((e.len(), e.early()), (2, 0));
+        // Bounded by count and bytes; what does not fit is dropped.
+        let mut e = Expectations::default();
+        for i in 0..MAX_EARLY {
+            assert!(matches!(e.take(vec![i as u8; 4], now), Ok(None)));
+        }
+        assert!(e.take(vec![0; 4], now).is_err());
+        let mut e = Expectations::default();
+        assert!(matches!(e.take(vec![0; MAX_EARLY_BYTES - 1], now), Ok(None)));
+        assert!(e.take(vec![0; 2], now).is_err());
+        // One that waited OFFER_GRACE for nothing is dropped, once.
+        let (dropped, _) = e.expire(now + OFFER_GRACE, |_| false);
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].contains("no RESOURCE_ENVELOPE"), "{dropped:?}");
+        assert_eq!(e.expire(now + OFFER_GRACE, |_| false).0.len(), 0);
+        // clear() says how many finished Resources it dropped.
+        let mut e = Expectations::default();
+        e.add(env.clone(), body(7, None), now).unwrap();
+        e.take(vec![1; 3], now).unwrap();
+        assert_eq!(e.clear(), 1);
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn text_is_cut_on_whitespace_in_order() {
+        let text = "alpha beta gamma delta epsilon";
+        let parts = split_text(text, 12, false);
+        assert_eq!(parts, vec!["alpha beta", "gamma delta", "epsilon"]);
+        // A newline in the second half is the better cut.
+        let parts = split_text("one two six\nthree four", 16, false);
+        assert_eq!(parts, vec!["one two six", "three four"]);
+        // Without whitespace, or filling, a part is full; multi-byte
+        // characters are never cut.
+        let text = "ä".repeat(10);
+        let parts = split_text(&text, 7, false);
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [6, 6, 6, 2]);
+        assert_eq!(parts.concat(), text);
+        let parts = split_text("aaaa bbbb cccc", 6, true);
+        assert_eq!(parts.concat(), "aaaa bbbb cccc");
+        assert!(parts.iter().all(|p| p.len() <= 6));
+        // No part but the first starts with "/".
+        let parts = split_text("/me waves at /everyone /here and /there", 14, false);
+        assert!(parts[1..].iter().all(|p| !p.trim_start().starts_with('/')), "{parts:?}");
+        assert!(parts[0].starts_with("/me"));
+        // The whitespace a part is cut at is all that is lost.
+        let text = "word ".repeat(100);
+        let parts = split_text(text.trim_end(), 50, false);
+        assert_eq!(parts.join(" "), text.trim_end());
+    }
+
+    #[test]
+    fn a_long_notice_becomes_ordered_notices_or_none() {
+        let notice = |text: &str| {
+            Envelope::new(MessageType::Notice, &SRC)
+                .with_room("lobby")
+                .with_nick(Some("nick"))
+                .with_body(Raw::text(text))
+        };
+        let text = (0..200).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let (parts, most) = parts(&notice(&text), 350);
+        let parts = parts.unwrap();
+        assert!(parts.len() > 1 && parts.len() <= MAX_PARTS);
+        assert!((350 * MAX_PARTS - 350..=350 * MAX_PARTS).contains(&most), "{most}");
+        let mut ids = std::collections::HashSet::new();
+        for p in &parts {
+            assert!(p.text_body().unwrap().len() <= 350);
+            // Room for a 16-byte K_SRC other than the client's.
+            assert!(p.encode().len() <= LINK_MDU, "{}", p.encode().len());
+            assert_eq!((p.t, p.room.as_deref()), (MessageType::Notice, Some("lobby")));
+            assert!(ids.insert(p.id.clone()));
+        }
+        let joined: Vec<String> = parts.iter().map(|p| p.text_body().unwrap()).collect();
+        assert_eq!(joined.join(" "), text);
+        // A small max_msg_body_bytes makes smaller parts.
+        let (small, _) = super::parts(&notice(&text), 100);
+        assert!(small.unwrap().iter().all(|p| p.text_body().unwrap().len() <= 100));
+        // More than MAX_PARTS NOTICEs' worth: refused, with the most.
+        let long = "x".repeat(350 * MAX_PARTS + 1);
+        let (none, most) = super::parts(&notice(&long), 350);
+        assert!(none.is_none());
+        assert!(most <= 350 * MAX_PARTS && long.len() > most);
+        // Short words that do not pack into MAX_PARTS are cut full.
+        let dense = "ab ".repeat(most / 3);
+        let (filled, _) = super::parts(&notice(dense.trim_end()), 350);
+        assert!(filled.unwrap().len() <= MAX_PARTS);
     }
 
     #[test]

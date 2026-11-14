@@ -332,19 +332,48 @@ impl<R: Read + Seek> Counting<R> {
         self.pos = pos;
         Ok(())
     }
+
+    /// Go back to `pos`, keeping what a `BufReader` holds.
+    fn back_to(&mut self, pos: u64) -> std::io::Result<()> {
+        let by = i64::try_from(self.pos - pos).map_err(std::io::Error::other)?;
+        self.inner.seek_relative(-by)?;
+        self.pos = pos;
+        Ok(())
+    }
 }
 
-/// The record at the reader, if one reads there. A record counts only if
-/// its envelope reads too: a record cut short reads on into the next one,
-/// and its envelope, cut and run on, does not read.
-fn read_one<R: Read>(reader: &mut Counting<R>) -> Option<Record> {
-    let value = ciborium::from_reader::<Value, _>(reader.by_ref().take(MAX_RECORD)).ok()?;
-    decode_record(value).filter(|r| Envelope::decode(&r.envelope).is_ok())
+/// The record at the reader, if one reads there, and whether it ends
+/// where a record starts or the file (`len` bytes) does. A record counts
+/// only if its envelope reads too: a record cut short reads on into the
+/// next one, and its envelope, cut and run on, mostly does not read.
+fn read_one<R: Read + Seek>(reader: &mut Counting<R>, len: u64) -> std::io::Result<Option<(Record, bool)>> {
+    let Ok(value) = ciborium::from_reader::<Value, _>(reader.by_ref().take(MAX_RECORD)) else {
+        return Ok(None);
+    };
+    let Some(record) = decode_record(value).filter(|r| Envelope::decode(&r.envelope).is_ok()) else {
+        return Ok(None);
+    };
+    let end = reader.pos;
+    if end >= len {
+        return Ok(Some((record, true)));
+    }
+    let mut next = [0; MAGIC.len()];
+    let mut n = 0;
+    while n < next.len() {
+        match reader.read(&mut next[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    reader.back_to(end)?;
+    // A record cut short at the very end may follow: it starts as one.
+    let starts = next[..n] == MAGIC[..n] && (n == MAGIC.len() || end + n as u64 == len);
+    Ok(Some((record, starts)))
 }
 
 /// Where the next record that reads starts, at or after `from`; the reader
 /// is left there.
-fn resync<R: Read + Seek>(reader: &mut Counting<R>, from: u64) -> std::io::Result<Option<u64>> {
+fn resync<R: Read + Seek>(reader: &mut Counting<R>, from: u64, len: u64) -> std::io::Result<Option<u64>> {
     let mut at = from;
     loop {
         reader.seek_to(at)?;
@@ -365,7 +394,7 @@ fn resync<R: Read + Seek>(reader: &mut Counting<R>, from: u64) -> std::io::Resul
             base += keep as u64;
         };
         reader.seek_to(found)?;
-        if read_one(reader).is_some() {
+        if read_one(reader, len)?.is_some() {
             reader.seek_to(found)?;
             return Ok(Some(found));
         }
@@ -389,7 +418,20 @@ fn scan_file(path: &Path, mut each: impl FnMut(Entry, Vec<u8>)) -> std::io::Resu
     };
     while reader.pos < len {
         let start = reader.pos;
-        if let Some(record) = read_one(&mut reader) {
+        if let Some((record, starts)) = read_one(&mut reader, len)? {
+            let end = reader.pos;
+            // Followed by no record's start, it may have read on into a
+            // record (an envelope whose byte-string body takes up what
+            // follows still reads): if one starts inside it, it is no
+            // record, and the one it ran into is kept.
+            if !starts {
+                let inside = resync(&mut reader, start + 1, len)?.filter(|&next| next < end);
+                if let Some(next) = inside {
+                    scanned.skipped += next - start;
+                    continue;
+                }
+                reader.seek_to(end)?;
+            }
             let entry = Entry {
                 ts_ms: record.ts_ms,
                 offset: start,
@@ -399,7 +441,7 @@ fn scan_file(path: &Path, mut each: impl FnMut(Entry, Vec<u8>)) -> std::io::Resu
             scanned.good = reader.pos;
             continue;
         }
-        match resync(&mut reader, start + 1)? {
+        match resync(&mut reader, start + 1, len)? {
             Some(next) => scanned.skipped += next - start,
             None => break,
         }
@@ -1190,6 +1232,36 @@ mod tests {
             (scanned.good, scanned.skipped),
             (data.len() as u64, garbage.len() as u64)
         );
+    }
+
+    #[test]
+    fn a_cut_record_that_reads_on_into_the_next_does_not_take_it() {
+        let (_dir, hub) = hub_dir();
+        let path = hub.join("lobby.log");
+        let now = now_ms();
+        // A byte-string body, last in its envelope: cut inside it, the
+        // record reads on and takes up the start of the next one.
+        let blob = Envelope::new(MessageType::Msg, &[9; 16])
+            .with_room("lobby")
+            .with_body(crate::envelope::Raw::from_value(&Value::Bytes(vec![7; 40])))
+            .encode();
+        assert!(blob.ends_with(&[7; 40]));
+        let first = encode_record(now - 3, &blob);
+        let mut data = first[..first.len() - 5].to_vec();
+        let cut = data.len() as u64;
+        data.extend(encode_record(now - 2, &msg("second")));
+        data.extend(encode_record(now - 1, &msg("third")));
+        std::fs::write(&path, &data).unwrap();
+        let (records, scanned) = read_all(&path);
+        assert_eq!(records.iter().map(body).collect::<Vec<_>>(), ["second", "third"]);
+        assert_eq!((scanned.good, scanned.skipped), (data.len() as u64, cut));
+        // A prune rewrites the file with both, and without the cut one.
+        let (mut store, _) = store(&hub, 30, 1_000_000);
+        store.prune();
+        let got: Vec<String> = store.query(&all("lobby")).iter().map(body).collect();
+        assert_eq!(got, ["second", "third"]);
+        let (records, scanned) = read_all(&path);
+        assert_eq!((records.len(), scanned.skipped), (2, 0));
     }
 
     #[test]
