@@ -675,10 +675,11 @@ of time in, commands to the upstream session and envelopes for client links out)
     one `/` taken off.
   - rBrowser2 (`rrc.py:1563`, `:1463-1466`): a line starting with `/` that is not one of its own
     commands is sent to the hub as a MSG, so `/history 50` works as typed.
-  - NomadNet (`ui/textui/Channels.py:869`, `:982-989`, `:997-998`): every line that starts with
-    `/` is a command, and it sends to the hub only the commands in its own list, which has no
-    `history`. `/history 50` gets "Unknown command" and `//history 50` is the command `/history`,
-    unknown too. A NomadNet user cannot ask for history; the replay on JOIN still comes.
+  - NomadNet (`ui/textui/Channels.py:869`, `:982-989`, `:997-998`, `:1109-1118`): every line
+    that starts with `/` is a command, and it sends to the hub only the commands in its own list,
+    which has no `history`. `/history 50` gets "Unknown command" and `//history 50` is the
+    command `/history`, unknown too. A NomadNet user cannot ask for history; the replay on JOIN
+    still comes.
 - **Status.** Each `hubs` entry adds `history_bytes` and `history_rooms` (as of the last write or
   prune), `history_records` (records written since start), `history_drops` (records not
   written: queue full, disk error, a broken file, room name too long) and `history_sync_errors`

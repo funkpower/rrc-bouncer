@@ -738,9 +738,17 @@ def history_phases(run, args, port_r, upstream, user, local, env, found):
     reticulum = f'tcp = "127.0.0.1:{port_r}"'
     rooms = ("lobby", "hist")
 
-    def bouncer(**history):
+    def bouncer(pruned=False, **history):
         config = run.config("history", reticulum, upstream=upstream, nick="bnc", rooms=rooms, history=history)
+        mark = len(run.log("BR")) if os.path.exists(run.path("BR.log")) else 0
         run.start("BR", [args.bouncer, "--config", config, "run"], env=env)
+        if pruned:
+            # The prune at start runs on the history thread, beside the
+            # upstream session: the files are read only once it is done.
+            end = time.time() + 60
+            while "history: pruned" not in run.log("BR")[mark:] and time.time() < end:
+                time.sleep(0.3)
+            check("history: pruned" in run.log("BR")[mark:], "the prune at start is done")
         hub = run.wait_status(upstream, lambda h: h["state"] == "connected" and "hist" in h["rooms_joined"], 60)
         check(hub["state"] == "connected" and "hist" in hub["rooms_joined"],
               f"the bouncer is in hist ({', '.join(f'{k} = {v}' for k, v in history.items()) or 'defaults'})")
@@ -869,7 +877,7 @@ def history_phases(run, args, port_r, upstream, user, local, env, found):
     gone = history_file(run, upstream, "old")
     with open(gone, "wb") as f:
         f.write(history_record(now - 31 * day, 20, direct, "a month ago", "dee", "old")[0])
-    bouncer(replay_hours=1)
+    bouncer(pruned=True, replay_hours=1)
     records, whole = read_history(path)
     ids = [r["env"][2].hex() for r in records]
     check(whole and stale_id not in ids and earlier_id in ids and cut_id not in ids,
@@ -982,7 +990,7 @@ def history_phases(run, args, port_r, upstream, user, local, env, found):
         written[ident] = ts
     for f in files.values():
         f.close()
-    config = bouncer(max_mb=1)
+    config = bouncer(pruned=True, max_mb=1)
     hub_dir = os.path.dirname(history_file(run, upstream, "hist"))
     kept, size = {}, 0
     for name in os.listdir(hub_dir):
