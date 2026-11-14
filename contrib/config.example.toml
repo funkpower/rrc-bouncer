@@ -1,43 +1,81 @@
 # rrc-bouncer configuration. Relative paths are relative to this file; ~/ is
-# the home directory.
+# the home directory. Unknown keys are refused, so a typo is an error.
 
 # Your Reticulum identity (64 bytes): the one your RRC clients use, so the
-# hubs keep knowing you by it. Keep it private (chmod 600).
+# hubs keep knowing you by it. Keep it private (chmod 600). Required.
 identity = "~/.local/share/rrc-bouncer/identity"
+
+# Local hub identities, room sets, history, status.json and the Reticulum
+# config the bouncer writes for itself. Created mode 0700. One bouncer per
+# state_dir: a second one on the same directory does not start. Required.
 state_dir = "~/.local/share/rrc-bouncer"
+
+# error, warn, info, debug or trace, or a full tracing filter
+# ("info,rns_link=debug"). RUST_LOG overrides it. Default info.
 log_level = "info"
 
 # Announce the bouncer's local hubs. Off: clients reach them by the hashes
 # `rrc-bouncer hashes` prints, and nothing advertises them on the network.
+# Default false.
 announce = false
+# Minutes between announces, with announce = true. At least 1. Default 360.
 # announce_interval_minutes = 360
 
-# Identity hashes (not addresses) allowed to use the local hubs besides yours.
+# Identity hashes (32 hex characters; an identity hash, not a destination
+# address) allowed to use the local hubs besides yours. A link that
+# identifies as anyone else is refused. Default [].
 allowed_identities = []
+# allowed_identities = ["0123456789abcdef0123456789abcdef"]
 
 # A client's PART also leaves the room upstream. Off: the bouncer stays in
 # the room and keeps its history; only that client's view of it ends.
+# Default false.
 part_upstream = false
 
 [reticulum]
-# Exactly one of: attach to this host's rnsd shared instance, connect to an
-# rnsd TCPServerInterface, or use a complete Reticulum config directory.
-shared_instance = true
+# How to reach Reticulum: exactly one of tcp, shared_instance or config_dir.
+#
+# tcp: connect to a TCPServerInterface of this host's rnsd, as host:port.
+# Recommended: the local hubs reach the network as path responses only,
+# never as announces (see the README).
+tcp = "127.0.0.1:4242"
+#
+# shared_instance: attach to this host's rnsd as a shared-instance client.
+# rnsd may announce the local hubs to the network when it or the bouncer
+# restarts.
+# shared_instance = true
+# The shared instance's instance_name, with shared_instance = true.
+# Default "default".
 # instance_name = "default"
-# tcp = "127.0.0.1:4242"
+#
+# config_dir: a complete Reticulum config directory of your own, used as it
+# is; the bouncer runs its own Reticulum instance with those interfaces.
 # config_dir = "~/.config/rrc-bouncer/reticulum"
 
-# Room history, kept unencrypted under state_dir/history/. A client that joins
-# a room gets the last replay_hours of it, at most replay_max messages
-# (0 turns that off); /history N in a room asks for the last N.
+# Room history, kept unencrypted under state_dir/history/. A client that
+# joins a room gets the last replay_hours of it, at most replay_max messages;
+# /history N in a room asks for the last N.
 [history]
+# Days a room's history is kept. At least 1. Default 30.
 days = 30
+# Most history per upstream hub, in megabytes (1,000,000 bytes); the oldest
+# goes first. At least 1. Default 100.
 max_mb = 100
+# How far back the replay on JOIN reaches. 0 turns the replay off.
+# Default 24.
 replay_hours = 24
+# Most messages replayed on JOIN, at most 500. 0 turns the replay off.
+# Default 100.
 replay_max = 100
 
-# One table per upstream hub.
+# One table per upstream hub. At least one; each address once.
 [[hub]]
+# The hub's destination hash (rrc.hub), 32 hex characters. Required.
 address = "082f8e4293d19281108a5d4faa52dcbe"
+# Rooms to be in from the start. Rooms your clients join are added and kept
+# in state_dir. Lowercased and trimmed as rrcd does. Default [].
 rooms = ["lobby"]
+# The nick the hub sees on everything the bouncer sends. Unset or empty:
+# each client's own nick goes up, so your nick on the hub changes with
+# whichever client spoke last.
 nick = "yournick"

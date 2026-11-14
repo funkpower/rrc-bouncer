@@ -445,8 +445,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             s.rns,
-            RnsAccess::Shared {
-                instance_name: "default".into()
+            RnsAccess::Tcp {
+                host: "127.0.0.1".into(),
+                port: 4242
             }
         );
         assert_eq!(s.hubs.len(), 1);

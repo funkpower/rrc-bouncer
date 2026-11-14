@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: LicenseRef-Reticulum
 # systemd user unit. Install:
+#   install -dm700 ~/.local/share/rrc-bouncer
 #   cp rrc-bouncer.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now rrc-bouncer
@@ -8,8 +9,8 @@
 
 [Unit]
 Description=rrc-bouncer: one RRC identity for several RRC clients, with history
-# With shared_instance = true the bouncer needs rnsd running first; it
-# exits (and is restarted) while rnsd is down.
+# The bouncer reaches the network through rnsd. With shared_instance = true
+# it exits (and is restarted) while rnsd is down; with tcp it reconnects.
 After=rnsd.service network-online.target
 Wants=rnsd.service
 
@@ -20,6 +21,22 @@ Restart=always
 RestartSec=15
 # The history and identity are private.
 UMask=0077
+
+# Everything is read-only to the bouncer but its state_dir, which holds its
+# lock, history, status.json and generated Reticulum config. The directory
+# must exist. Another state_dir: change the path. [reticulum] config_dir:
+# add it too, as Reticulum writes its storage there.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/rrc-bouncer
+PrivateTmp=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+# Unix sockets reach a shared instance, IP an rnsd TCPServerInterface;
+# netlink is for interfaces in a config_dir of your own.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=default.target

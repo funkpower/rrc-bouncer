@@ -220,8 +220,9 @@ send out; unit-tested), and `run`, the task per hub that owns the link and feeds
   whole connect at most 60 s). A failed connect asks for the path again before the next try, in
   case it went stale. The first try is at once.
 - **HELLO.** Body `{0: "rrc-bouncer", 1: 1, 2: caps}` with the hub's `nick` as `K_NICK`. Caps:
-  `resource_envelope` false until M5 receives Resources; `action` and `direct_notice` true, as
-  the relay (M3) passes both on. rrcd keeps a client's caps without acting on them. No WELCOME in
+  `resource_envelope`, `action` and `direct_notice` all true: the session takes Resources
+  ([Resources](#resources)) and the relay passes the rest on. rrcd keeps a client's caps without
+  acting on them: it sends its long greeting as a Resource whatever they say. No WELCOME in
   30 s ends the link. A WELCOME is taken once per link; with no body, its limits are rrcd's
   defaults.
 - **JOIN, one at a time.** The room set is joined in order (config rooms first), the next JOIN
@@ -323,7 +324,10 @@ send out; unit-tested), and `run`, the task per hub that owns the link and feeds
   was given (a full queue is not waited on past that), the last `status.json` gets 2 s
   (`STATUS_STOP`), Reticulum is given 5 s to stop, and tasks still running get 2 s
   (`Runtime::shutdown_timeout`): the process exits within about 24 s of the signal whatever does
-  not stop.
+  not stop in user space. The bound does not cover a thread stuck in the kernel: an `fsync` or
+  `write` on a stalled disk (a dead NFS mount, a failing drive) holds its thread, and the process
+  with it, until the call returns, and no timeout in the bouncer can end it; systemd's
+  `TimeoutStopSec` and its SIGKILL are what end such a process.
 - **Signals and slow disks.** The kernel gives a signal sent to the process to its main thread
   first, and a thread in a blocking call such as an `fsync` on a busy disk takes it only when the
   call returns; until then the signal is not handled at all. So `run` runs on the runtime's
@@ -355,9 +359,11 @@ of time in, commands to the upstream session and envelopes for client links out)
   - A link that has not identified 30 s after it was established (`IDENTIFY_TIMEOUT`) is closed;
     until then its packets are ignored.
 - **HELLO.** Answered with WELCOME: `K_SRC` the local hub, hub name
-  `"<upstream name> (via rrc-bouncer)"`, the upstream's version, caps and limits, with cap `0`
-  (`resource_envelope`) false until M5. Before the upstream's first WELCOME: the local hub's name
-  (`rrc-bouncer for <upstream hash>`), the bouncer's version and rrcd's default caps and limits. A
+  `"<upstream name> (via rrc-bouncer)"`, the upstream's version, caps and limits: cap `0`
+  (`resource_envelope`) is on exactly when the hub's is (rrcd's default), since a client's
+  Resource can only go upstream to a hub that takes them. Before the upstream's first WELCOME: the
+  local hub's name (`rrc-bouncer for <upstream hash>`), the bouncer's version, every cap on and
+  rrcd's default limits. A
   later HELLO on the same link starts the client over with no rooms. Before its HELLO a client's
   envelopes get `ERROR` `"send HELLO first"`, as rrcd answers them, except PING.
 - **PING** is answered with PONG by the local hub, body echoed, before HELLO too: the M1 local hub
@@ -459,7 +465,7 @@ of time in, commands to the upstream session and envelopes for client links out)
   that answers the session's first JOIN comes next), or a client's command going upstream, ends
   it. A client's HELLO is answered with the WELCOME and then the kept greeting, `K_SRC` the local
   hub, as a client of rrcd gets it. A greeting rrcd sends as a Resource (over 512 bytes, with
-  resources on) is not relayed until M5.
+  resources on) is taken, sent and kept the same way ([Resources](#resources)).
 - **Commands.** rrcd answers a slash command on the link it came from, with one NOTICE per line of
   the reply (`commands.py` `emit_notice`; `/list` and `/who` send one, with no room), or with an
   ERROR; some (`/mode`, `/topic`) also tell the room with a NOTICE naming it. Replies carry no
@@ -513,8 +519,7 @@ of time in, commands to the upstream session and envelopes for client links out)
     the old link is answered on the next, so no ERROR is blamed on it, but a `SendDropped` for it
     (the session reports what it still held) still reaches its sender. A client link that closes
     takes its entries with it.
-- **RESOURCE_ENVELOPE**, either way, is logged and dropped until M5 relays Resources; the WELCOME's
-  cap `0` tells clients not to send one.
+- **RESOURCE_ENVELOPE**, either way, and the Resource it announces: [Resources](#resources).
 - **The task.** `relay::run` selects over the client links' events, the session's events and a 1 s
   tick, unbiased, so a busy source (a chatty room, a flood of client packets) cannot starve the
   others.
@@ -537,14 +542,17 @@ of time in, commands to the upstream session and envelopes for client links out)
   to one client), other members' JOINED and PARTED, and the ERROR that removes the bouncer from
   the room (kick, ban). It is not called for direct NOTICEs, room-less NOTICEs (greeting, command
   answers), ERRORs answering a client, the bouncer's own JOINED and PARTED (the session's), or the
-  `room <r>: …` NOTICE rrcd sends after a JOIN (it goes to the joiner alone).
+  `room <r>: …` NOTICE rrcd sends after a JOIN (it goes to the joiner alone). A room NOTICE that
+  came as a Resource, from the hub or from a client, is recorded as the NOTICEs it splits into
+  ([Resources](#resources)).
   The hub's echo of a client's envelope is a room envelope like any other, so each client
   envelope is recorded once, as the hub delivered it. `Relay::replay` is called after each JOINED
   a client gets; the history is asked at once, in the relay's task, and the link's sender is
   handed the answer to wait for.
 - **Status.** Each `hubs` entry in `status.json` adds `clients`, `client_identities` (one per
-  link, sorted), `refused_links`, `relayed_in`, `relayed_out` and `relay_drops`. A change of
-  clients writes the file at once.
+  link, sorted), `refused_links`, `relayed_in`, `relayed_out`, `relay_drops` and the
+  `client_resources_*` counters ([Resources](#resources)). A change of clients writes the file at
+  once.
 - **Limitations.**
   - A client's JOIN key (`+k`) is not passed upstream: the session joins with none.
   - A JOIN answered locally is not followed by the room status NOTICE rrcd sends after a JOIN.
@@ -555,6 +563,111 @@ of time in, commands to the upstream session and envelopes for client links out)
   - Two direct NOTICEs in flight from two clients: a refusal goes to the newer one's sender.
   - The greeting is taken by time and position; a hub that sends some other room-less NOTICE
     within 10 s of its WELCOME, before anything else, has it kept as greeting too.
+
+## Resources
+
+`src/resource.rs` (bounds, checks, matching, splitting), with the hub side in `src/upstream.rs`
+and the client side in `src/relay.rs`. A text too long for one link packet travels as a
+`RESOURCE_ENVELOPE` (`K_SRC`, `K_ROOM`, `K_NICK` as the NOTICE would have them; body
+`{0: id, 1: kind, 2: size, 3: sha256, 4: encoding}`) followed by a Reticulum Resource of the text's
+bytes on the same link. rrcd 0.3.2 sends one for a greeting over 512 bytes (kind `motd`, no
+room, `K_SRC` the hub; `session.py:296`, `messages.py` `send_text_smart`, `resources.py`
+`send_via_resource`) and for a long NOTICE it forwards to a room (kind `notice`), and takes one
+from a client for a room NOTICE (`router.py` `_handle_resource_envelope`, `resources.py`
+`_resource_advertised`, `_resource_concluded`).
+
+- **Bounds**, rrcd's, on both sides: a Resource is 1 to 262144 bytes (`MAX_RESOURCE_BYTES`,
+  rrcd's `max_resource_bytes`), in one segment, not a request or response, and sent uncompressed
+  (`auto_compress = false`, as rrcd sends). At most 8 announced and not yet whole per link
+  (`MAX_EXPECTED`, rrcd's `max_pending_resource_expectations`); an announcement waits at most 120 s
+  for its whole Resource (`RESOURCE_TIMEOUT`). A local hub receives at most 32 client Resources at
+  once over all its links (`HUB_RESOURCES`).
+- **Matching.** An envelope's body is checked as rrcd checks it (`resource::check`): id bytes,
+  kind a non-empty text, size from 1 to the limit, sha256 32 bytes when present. A Resource that
+  comes whole is matched to a waiting envelope of the same link by size and sha256 (rrcd and the
+  clients match by size, then check the hash). The envelope and the Resource's advertisement come
+  on different channels, so either may be read first: an advertisement with no envelope yet waits
+  5 s (`OFFER_GRACE`) for one.
+- **From the hub** (the upstream session). The session's link takes advertisements itself
+  (`ResourceStrategy::AcceptApp`, offers on `LinkSession::resource_offers`). An offer outside the
+  bounds, or with 8 already on the way, is rejected; one whose envelope is there is accepted; one
+  with none after 5 s is rejected. A whole Resource that matches its envelope is the event
+  `UpstreamEvent::Resource { envelope, data }` (counted in `hub_resources_in`). Dropped and counted
+  in `hub_resource_drops`, with a log line: a refused offer, an offer nobody announced, a Resource
+  whose sha256 is not the announced one or that matches no envelope, a transfer that failed or took
+  over 120 s, an envelope whose Resource never came, a malformed envelope. Transfers run in tasks of
+  their own; the session's loop only hands out and collects, so it never waits on one.
+- **To clients** (the relay). A Resource from the hub goes where the NOTICE with its text would
+  ([Local hub](#local-hub): a room's clients; a room-less one is the greeting in its window, else
+  a command's answer, else every client), with `K_SRC` rewritten as for any hub envelope. A kind
+  other than `notice` or `motd` (`blob`) has nowhere to go and is dropped (counted in
+  `client_resource_drops`).
+  - A client whose HELLO had cap `0` true gets the `RESOURCE_ENVELOPE` (`K_ID` and body as the hub
+    sent them) and then the Resource, byte for byte (`client_resources_out` when the client has it
+    whole).
+  - A client without the cap gets the text as NOTICEs that each fit a packet (`resource::split`,
+    counted once per client in `client_resources_split`): one per line, a line too long cut on
+    character boundaries, blank lines left out, each with a new 8-byte id and the rest of the
+    envelope (`K_SRC`, `K_ROOM`, `K_NICK`, `K_TS`) as the hub sent it. That is how rrcd sends its
+    greeting to everyone with resources off, and what any client can show.
+  - Sends go through the client link's sender task and its queue, like every envelope, and are
+    held during a replay of the room the same way. A link's Resources go one at a time (weechat-rrc
+    cancels the transfer it is taking when a second is advertised); envelopes go on meanwhile.
+    At most 8 wait per link (`LINK_RESOURCES`), the next is dropped; each is given 120 s to be
+    taken whole, and the sender learns the end from the hub destination's `LinkResourceEvent`
+    (`Concluded`, by resource hash). One not taken, refused or late counts in
+    `client_resource_drops`. The relay's task hands it over and goes on.
+- **The greeting.** A greeting Resource in the greeting window is kept with the greeting NOTICEs
+  (at most 16 items and 512 KiB of Resources, `MAX_GREETING_BYTES`) and given to every client that
+  says HELLO later, as a Resource or as NOTICEs by that client's cap. A greeting over those bounds
+  is still sent to the clients linked at the time; later clients get what was kept.
+- **History.** A room Resource is recorded as the NOTICEs the split makes of it, so every record
+  stays one packet's envelope and a replay sends packets only, to every client alike. The split
+  NOTICEs have new ids; a client that saw the Resource live sees the text again, split, in a
+  replay.
+- **From clients.** A client may send a `RESOURCE_ENVELOPE` and a Resource for a long room NOTICE,
+  as rrcd takes one:
+  - The envelope is checked as rrcd checks it and answered with rrcd's ERROR texts:
+    `resource transfer disabled` while the hub has cap `0` off, `resource too large: <n> > 262144`,
+    the malformed-body texts, `too many pending resource expectations` past 8. A refused one counts
+    in `client_resource_drops`.
+  - The local hub's destination decides on each advertisement on the link manager's task
+    (`ResourceAcceptPolicy`, `ResourceStrategy::AcceptApp`): it takes one from a link of an
+    allowed identity, within the bounds, while the link has fewer than 8 and the hub fewer than 32
+    on the way, and refuses the rest (counted). Whether an envelope announced it is checked when
+    it is whole, in the relay's task.
+  - A whole Resource that matches an envelope of its link (`client_resources_in`) is a NOTICE: kind
+    `notice`, UTF-8, a room and no `K_DST`, as rrcd relays only that. It is checked as that NOTICE
+    would be (room name, joined), with `K_NICK` the hub's `nick` when one is set, and goes upstream
+    as `Command::SendResource`: the client's envelope (its `K_ID` kept) and then the bytes as a
+    Resource, through the session's queue and rate limit like `Command::Send`, held and dropped
+    under the same rules, one Resource at a time. A drop is a `SendDropped`, so the sender gets
+    `ERROR "not sent to the hub: …"`; a Resource the hub had whole counts in `hub_resources_out`.
+  - Dropped silently and counted in `client_resource_drops`: a Resource no envelope announced, one
+    whose sha256 is not the announced one (rrcd drops it silently too), a kind other than `notice`,
+    text that is not UTF-8, a NOTICE with `K_DST` or no room, an announcement whose Resource does
+    not come whole in 120 s, a transfer that fails.
+  - rrcd sends a room NOTICE that came as a Resource to the room's other links and not back to the
+    sender's (`resources.py` `_dispatch_received_resource`), so the bouncer's link gets no echo.
+    The relay gives a copy (`K_SRC` the user) to the user's other clients in the room, by each one's
+    cap, and records it in history, when the room is joined; the sender drew its own.
+- **rrcd 0.3.2 with RNS 1.6 takes no client Resource.** Its accept callback reads
+  `resource.total_size` or `resource.size` (`resources.py:253`), and RNS 1.6 hands it a
+  `ResourceAdvertisement`, which has neither: the callback raises, RNS neither accepts nor rejects,
+  and the sender's advertisement times out. The bouncer drops the Resource, counts it and the
+  client gets `ERROR "not sent to the hub: the resource was not sent: …"`. Its forward to the room
+  then calls `link.packet(payload)` (`resources.py:420`), and an `RNS.Link`'s `packet` attribute
+  is `None`, so no member would get it either. A client of rrcd directly fares the same. The e2e
+  test runs rrcd through `tests/rrcd_shim.py`, which mends both (the advertisement gets
+  `total_size`; the forward sends a packet, or an envelope and Resource for a long text, to the
+  room's other members), so the bouncer's side is checked against the hub rrcd means to be. Hubs
+  that take client Resources (a fixed rrcd, others) need nothing from the bouncer.
+- **Status.** Per hub: `hub_resources_in`, `hub_resources_out`, `hub_resource_drops` (the
+  upstream session) and `client_resources_in` (client Resources received whole and announced),
+  `client_resources_out` (Resources clients took whole), `client_resources_split` (Resources sent
+  to a client as NOTICEs) and `client_resource_drops` (the relay: client Resources and envelopes
+  refused or dropped, Resources to clients not taken, hub `blob`s). The keys are distinct across
+  the parts of a hub entry, which `status.json` flattens into one object (a unit test checks it).
 
 ## History
 
@@ -701,7 +814,17 @@ of time in, commands to the upstream session and envelopes for client links out)
 ## Configuration
 
 TOML, like lxmf-bouncer's (relative paths relative to the config file, `~/` the home directory).
-See `contrib/config.example.toml`.
+See `contrib/config.example.toml`, which comments every key and uses `tcp`: the mode with no
+announce leak ([Announces](#announces)), and the one the README recommends. A unit test parses it.
+
+`contrib/rrc-bouncer.service` is a systemd user unit (`Restart=always`, `UMask=0077`) that makes
+the file system read-only to the bouncer (`ProtectSystem=strict`, `ProtectHome=read-only`) except
+the default `state_dir` (`ReadWritePaths`), which holds the `state_dir/lock` flock, and adds
+`PrivateTmp`, `NoNewPrivileges`, `RestrictSUIDSGID`, `LockPersonality`, `RestrictRealtime` and
+`RestrictAddressFamilies` (Unix, IP, netlink). lxmf-bouncer's unit has none of these; they fit a
+daemon that writes only its state directory. `ProtectSystem=strict` alone leaves `/home` writable
+in a user unit (systemd 262), hence `ProtectHome`. The flock was checked under these settings in a
+transient unit: taken in the state directory, refused while another process holds it.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -790,10 +913,71 @@ As of M4:
 - `run` holds `state_dir/lock` while it runs, so a second bouncer on the same `state_dir` does
   not start ([Upstream session](#upstream-session)).
 
+As of M5:
+
+- `run` relays Resources both ways ([Resources](#resources)).
+- Each `hubs` entry adds `hub_resources_in`, `hub_resources_out`, `hub_resource_drops`,
+  `client_resources_in`, `client_resources_out`, `client_resources_split` and
+  `client_resource_drops`. A file without these fields still reads.
+
+### `status`
+
+`status` reads `state_dir/status.json` and prints it; `status --json` prints the file as it is. The
+bouncer writes the file at start, at once on a change of link state, rooms or clients, every
+minute (`STATUS_INTERVAL`) and at shutdown, so the counters can be up to a minute old. `status`
+says `not running` when the pid in the file is gone or the file is over 3 minutes old. The output,
+per hub (lines in brackets only when they apply):
+
+```
+rrc-bouncer status (updated 12 s ago)
+  identity           <the user's identity hash>
+  started            3 h ago
+  announce           off
+  hub <upstream hash>  local hub <local hub hash>
+    upstream         connected to "<name>" (version v), since 3 h ago
+    rooms            lobby, side (joined 2 of 2)
+   [not joined       <room> (<reason>); …]
+    connects         1 (0 reconnects), 0 failed attempts
+   [last disconnect  <when>: <why>]
+   [last error       <text>]
+   [next attempt     in <n> s]
+   [not relayed      <type> <n>, …]
+   [dropped sends    <n>]
+   [dropped events   <n>]
+    clients          2 (<identity hash>, <identity hash>)
+    relayed          120 in, 2400 out
+   [relay drops      <n>]
+   [refused links    <n>]
+    hub resources    1 received, 0 sent, 0 dropped
+    client resources 0 received, 2 sent, 1 as notices, 0 dropped
+    history          88950 bytes in 2 rooms
+    history written  630 records, 0 dropped
+   [history syncs    <n> failed]
+```
+
+`status.json`:
+
+| Key | Meaning |
+|---|---|
+| `pid`, `started_at`, `updated_at` | The bouncer's process id; when it started and last wrote the file (seconds since the epoch) |
+| `identity_hash`, `announce` | The user's identity hash; whether the local hubs are announced |
+| `hubs[]` `upstream`, `local_hub` | The upstream hub's destination hash and the local hub's |
+| `state` | `starting`, `connecting`, `linked` (waiting for the WELCOME), `connected`, `waiting` (to connect again), `stopped` |
+| `hub_name`, `hub_version`, `hub_caps`, `hub_limits` | From the hub's WELCOME |
+| `rooms`, `rooms_joined`, `rooms_failed`, `rooms_retrying`, `rooms_over_limit` | The room set and how each room stands on the current link ([Upstream session](#upstream-session)) |
+| `last_connected_at`, `last_disconnected_at`, `last_error`, `next_attempt_at` | The link's history |
+| `connects`, `reconnects`, `failed_attempts` | Welcomed links, welcomed links after the first, attempts with no WELCOME |
+| `unhandled`, `dropped_sends`, `dropped_events` | Hub envelopes nothing took (by type), client envelopes not sent upstream, events the relay did not take |
+| `hub_resources_in`, `hub_resources_out`, `hub_resource_drops` | Resources from the hub taken whole, client Resources the hub took whole, Resources and envelopes from the hub dropped |
+| `clients`, `client_identities`, `refused_links` | Client links, their identities, links of other identities refused |
+| `relayed_in`, `relayed_out`, `relay_drops` | Client envelopes passed upstream, envelopes sent to clients, envelopes dropped |
+| `client_resources_in`, `client_resources_out`, `client_resources_split`, `client_resource_drops` | [Resources](#resources) |
+| `history_bytes`, `history_rooms`, `history_records`, `history_drops`, `history_sync_errors` | [History](#history) |
+
 ## Implementation notes
 
 - **Crate layout.** `src/lib.rs` (`config`, `identity`, `envelope`, `history`, `bouncer`,
-  `upstream`, `rate`, `rooms`, `relay`) and a thin
+  `upstream`, `rate`, `rooms`, `relay`, `resource`) and a thin
   `src/main.rs` (CLI, logging). The library split lets the codec and config be tested and used
   without the binary.
 - **Local hub identities.** `state_dir/hubs/<upstream hash>.identity`, 64 bytes as Python RNS
@@ -821,7 +1005,7 @@ As of M4:
   the tests decode each one, check its fields, and re-encode it to the same bytes.
 - **End-to-end test.** `tests/e2e.sh` (`RRC_TEST_VENV` = a venv with `rns`, `cbor2` and `rrcd`;
   `RRC_TEST_WORK`, default `/tmp/rrc-bouncer-e2e`; `--only rrcd` runs the rrcd phases alone,
-  `--only history` the history phases)
+  `--only history` the history phases, `--only resource` the Resource phases)
   builds the bouncer and runs `tests/e2e.py`: rnsd instances with unique instance names and
   TCPServerInterfaces on 127.0.0.1, ports 4370-4379, and Python peers (`tests/rrc_peer.py`) that
   watch announces, request paths, link, identify and PING, or act as an RRC client of a hub. It
@@ -843,7 +1027,7 @@ As of M4:
   4`, two driven Python clients A and B under the user's identity on the local hub (B says HELLO
   in the same breath as its identify, as NomadNet does) and one, D, directly on rrcd under an
   identity of its own, all in `lobby`. They check: A and B get the WELCOME with the upstream's
-  name `(via rrc-bouncer)` and its caps and limits (`resource_envelope` off), then rrcd's greeting
+  name `(via rrc-bouncer)` and its caps and limits (`resource_envelope` on, as rrcd's), then rrcd's greeting
   (`K_SRC` the local hub, no room), B though it linked after the greeting was sent; each JOIN gets a
   JOINED with the member list; MSG, ACTION and direct NOTICE from A, B and D, each reaching every
   client exactly once with its original `K_ID`, `K_FMT` kept, `K_SRC` the user or D, and the
@@ -893,6 +1077,26 @@ As of M4:
     more went than had to); `hist` and `hist2`, newer, are kept whole.
   - A second `run` on the same `state_dir` exits 1 with `another rrc-bouncer is running`; the
     first runs on, and `status` works beside it.
+  The Resource phases follow, on rrcd restarted through `tests/rrcd_shim.py`
+  ([Resources](#resources)) with a greeting of 24 lines and 1871 bytes (UTF-8 with `ü` and `✓`),
+  the bouncer in `lobby` and `res`:
+  - The bouncer takes the greeting as a Resource (`hub_resources_in` 1). RA (cap `0` on) and RN
+    (no caps) link afterwards: RA gets the `RESOURCE_ENVELOPE` (kind `motd`, `K_SRC` the local hub)
+    and a Resource byte-identical to the greeting whose sha256 is the envelope's; RN gets the
+    greeting's 24 lines as NOTICEs from the local hub. rrcd restarted, both get it live the same
+    way. `client_resources_out` 2 and `client_resources_split` 2.
+  - RD joins `res` directly on rrcd. RA sends a 30-line, 1889-byte NOTICE to `res` as an envelope
+    and Resource: RD gets it as a Resource with `K_SRC` the user, RN gets the 30 lines as NOTICEs
+    with `K_SRC` the user, RA gets no copy; `client_resources_in` and `hub_resources_out` go up by
+    one.
+  - RA2 (cap on) links later and gets the greeting from the cache, then joins `res`. RD sends a
+    long NOTICE: RA and RA2 get it as a Resource with `K_SRC` RD, RN as NOTICEs.
+  - The history of `res` holds both long notices as split NOTICEs.
+  - From RA: an envelope announcing 262145 bytes gets `ERROR "resource too large: 262145 >
+    262144"` and its Resource is refused; a Resource whose sha256 is not the announced one is
+    dropped with no ERROR. `client_resource_drops` goes up by three; neither reaches rrcd or RD,
+    and RA's next MSG reaches RD. `status` prints both Resource lines, and the bouncer stops
+    cleanly.
   The phases' start waits are generous (Python peers 180 s, rrcd 120 s) so a loaded host does not
   fail them.
   `RRC_BOUNCER_PING_SECS` (the idle PING and the PONG wait) and `RRC_BOUNCER_BACKOFF_SECS` (the
@@ -922,7 +1126,8 @@ instance with no interfaces to the outside, so nothing reaches a real network).
    after a bouncer restart too (done: [History](#history)).
 5. **M5: finish.** `RESOURCE_ENVELOPE` relay (MOTD and long notices both ways), `status`,
    README (setup, every client's settings, limits), `contrib/` unit and example config final.
-   A manual check list for NomadNet, weechat-rrc and rBrowser2 against the bouncer goes in the README.
+   A manual check list for NomadNet, weechat-rrc and rBrowser2 against the bouncer goes in the README
+   (done: [Resources](#resources), [`status`](#status)).
 
 ## Out of scope for 0.1
 
